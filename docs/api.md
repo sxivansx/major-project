@@ -102,6 +102,13 @@ Persisted to `core/config.json`.
 | GET | `/scan/snapshot.csv` | `?rotations=1..20` | CSV `rotation,t,phi,angle,range,quality` of the next N raw rotations at the current tilt |
 | GET | `/metrics` | `?cell=&z_min=&z_max=` | `{points, steps, points_per_step, duration_s, grid:{cell_m,cells,filled,coverage_pct,points_per_filled_cell}, floor:{points,rms_mm,tilt_deg,offset_mm}\|null}` (floor = plane fit to points within ±10 cm of z=0) |
 | GET | `/grid` | `?cell=0.05&layer=max&z_min=&z_max=` | binary grid frame (kind 3 payload) |
+| GET | `/ops/findings` | `?cell=0.1&max_step=0.15&max_slope=25` | Findings JSON (below) for the live cloud |
+| GET | `/ops/layers` | same query | binary kind-4 frame: classes + height above floor |
+| POST | `/ops/route` | `{"from_xy":[x,y],"to_xy":[x,y],"cell":0.1}` | `{"found":true,"start_snapped_m":0.3,"length_m":4.2,"cells":40,"marginal_cells":0,"verdict":"passable"\|"marginal","max_step_m":0.08,"path":[[x,y],…]}` or `{"found":false,"reason":"…"}` |
+| GET | `/ai/status` | | `{"available":bool,"reason":"…","models":{"decisions":"typesafe/jev-1.14","prose":"google/gemini-2.5-flash"}}` |
+| POST | `/ai/triage` | `{"cell":0.1}` | Jev ranking of findings: `{"items":[{"id":"V1","kind":"void","attention":0.82,"confidence":0.7,"why":"…"}],"rescan":{"recommended":false,"p":0.2,"confidence":0.8},"cost_usd":0.0003}` |
+| POST | `/ai/sitrep` | `{"cell":0.1}` | `{"text":"five-line situation report","facts":{…findings…},"model":"…","cost_usd":…}` |
+| POST | `/ai/ask` | `{"question":"…"}` | `{"intent":"route\|measure\|list_voids\|list_obstacles\|coverage\|sitrep\|other","confidence":0.9,"tool":{…result…},"answer":"…"}` |
 | GET | `/sessions` | | `[SessionMeta]` |
 | GET | `/sessions/{id}` | | SessionMeta |
 | GET | `/sessions/{id}/points` | | binary: `u32 n`, n × (f32 x,y,z) base frame |
@@ -165,6 +172,39 @@ f32 cell_m, f32 x0_m, f32 y0_m, f32 z_min_m, f32 z_max_m,
 h × w × f32 row-major (row index = y), NaN = empty
 ```
 Cell (ix, iy) covers x ∈ [x0 + ix·cell, x0 + (ix+1)·cell), same for y.
+
+Binary, kind 4 **operator layers** (`GET /api/ops/layers` only, never pushed):
+```
+u8 kind=4, u8 pad, u16 pad, u32 w, u32 h, f32 cell_m, f32 x0_m, f32 y0_m,
+h × w × u8 class, then h × w × f32 height above the fitted floor (NaN = not known)
+```
+Classes: 0 unknown (sweep gap too wide, or past the last return), 1 passable, 2 marginal, 3 blocked, 4 shadow (occluded by a nearer object: scan from elsewhere), 5 blind (the stripe along the tilt axle no scan plane can reach: rotate the scanner 90°).
+
+### Findings (`GET /api/ops/findings`)
+
+All deterministic. Bearings are clockwise from +x (the lidar's 0° mark) in degrees; distances from the scanner at the origin.
+```json
+{
+  "scanner": {"x_m": 0, "y_m": 0, "height_above_floor_m": 1.02, "note": "…"},
+  "points": 190000,
+  "grid": {"cell_m": 0.1, "w": 62, "h": 42, "x0_m": -3.1, "y0_m": -2.1},
+  "floor": {"fitted": true, "points": 51000, "z_at_origin_m": -0.02, "tilt_deg": 0.3, "rms_mm": 11.2},
+  "coverage": {"filled_cells": 1872, "interpolated_cells": 300, "shadow_cells": 139, "blind_cells": 585, "unknown_cells": 40,
+               "observable_cells": 2400, "area_seen_m2": 21.7, "coverage_pct": 90.5, "floor_reach_m": 3.0,
+               "blind_stripe": {"half_width_m": 0.57, "cells": 585, "note": "…"}},
+  "traversability": {"passable": 1500, "marginal": 80, "blocked": 300, "shadow": 139, "blind": 585, "params": {"max_step_m": 0.15, "max_slope_deg": 25}},
+  "obstacles":   [{"id": "O1", "cells": 13, "area_m2": 0.13, "height_m": 0.49, "x_m": 1.07, "y_m": 1.07, "distance_m": 1.51, "bearing_deg": 315, "bbox_m": [0.8, 0.9, 1.6, 1.5]}],
+  "voids":       [{"id": "V1", "cells": 80, "area_m2": 0.8, "clearance_m": 0.6, "x_m": 1.0, "y_m": -1.0, "distance_m": 1.41, "bearing_deg": 45, "bbox_m": […]}],
+  "depressions": [{"id": "D1", "…": "same shape, depth_m"}],
+  "shadows":     [{"id": "S1", "cells": 60, "area_m2": 0.6, "x_m": 2.2, "y_m": 1.6, "distance_m": 2.7, "bearing_deg": 324, "bbox_m": […]}],
+  "next_station": {"bearing_deg": 324, "distance_m": 1.4, "reason": "largest occluded region S1: 0.6 m² at 2.7 m"}
+}
+```
+A void is a cell whose returns have a vertical gap ≥ 0.4 m starting within 0.15 m of the floor (a slab over open space), never a wall. Objects are split where neighbouring heights differ by more than 0.5 m, so a box against a wall stays its own finding.
+
+### AI layer (`/api/ai/*`)
+
+Both endpoints consume the findings JSON, never points. `OPENROUTER_API_KEY` in `core/.env` or the environment; without it `/ai/status` reports `available: false` and the other calls return 503. Jev (`typesafe/jev-1.14`, OpenRouter Decisions API) answers typed questions with a probability and a confidence; Gemini Flash writes prose from the findings plus Jev's verdicts. Guardrails: prose is labelled as an assistant summary, never says "survivor" (only "possible void", "bearing with confidence"), and every number in it comes from the findings.
 
 ## 4. Session on disk
 

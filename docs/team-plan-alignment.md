@@ -39,6 +39,13 @@ Decision needed: A or B.
 
 Not in this repo yet. Staged per the plan's §4: level meters → channel check → paired-channel → 4-channel GCC-PHAT. The dashboard gets an audio tab when Milestone 5 starts. Session format will gain `audio/*.wav` and the microphone geometry goes into the config file. Nothing built here blocks it.
 
+## Two geometry findings from the simulator (22 Oct), for the hardware side
+
+1. **The scanner must be well above the floor.** Each tilt step cuts the floor in a line at `y = h / tan φ` (h = scanner height above the floor). At the bench rig's 8 cm, 2° steps give lines at 0.76, 1.14 and 2.3 m and nothing beyond; the floor between them is unknown. On a 1 m tripod the same sweep covers the whole 6 × 4 m room. For the deployment demo: tripod or a raised base, about 1 m.
+2. **There is a blind stripe along the tilt axle.** Every scan plane contains the axle line, so the floor within `h / tan φmax` of it is never cut: ±58 cm at 1 m with ±60°, ±27 cm with ±75°. Taller objects inside the stripe are still seen. The fix is procedural, not mechanical: a second station rotated 90° in place, which the software merges as two stations. The dashboard labels the stripe "blind" and suggests the rotation.
+
+Also: a box taller than the scanner shows only its near face (its top is never seen), and shadows behind objects scale with `d · h / (h − h_obj)`, so a low scanner makes everything a shadow. All three argue for height.
+
 ## Smaller notes
 
 - Sweep range: plan says −75°..+75°; job defaults are −60..60 and the panel accepts anything within the servo limits.
