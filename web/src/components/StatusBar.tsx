@@ -54,6 +54,11 @@ export function StatusBar() {
         {fmtInt(cloudCount)} pts
       </span>
       <span className="dim">{fmtInt(frames)} scan frames</span>
+      {status?.alarms && status.alarms.length > 0 && (
+        <span className="err" title={status.alarms.join("\n")}>
+          {status.alarms.length === 1 ? status.alarms[0] : `${status.alarms.length} alarms: ${status.alarms[0]}`}
+        </span>
+      )}
       {lastLog && (
         <span
           className={lastLog.level === "error" ? "err" : lastLog.level === "warn" ? "warn" : "dim"}

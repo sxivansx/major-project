@@ -1,3 +1,4 @@
+import { SnapshotButton } from "./SnapshotButton";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store/store";
 import { useThrottled } from "../store/hooks";
@@ -132,6 +133,7 @@ export function RawValues() {
             </button>
           )}
           <span className="spacer" style={{ flex: 1 }} />
+          <SnapshotButton />
           <span className="mono dim">
             {scan ? `${total} of ${scan.n} rows` : "no scan"}
             {scan && aMin !== "" && aMax !== "" && Number(aMin) > Number(aMax) ? " (wrapped)" : ""}

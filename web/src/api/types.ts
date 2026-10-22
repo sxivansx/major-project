@@ -49,6 +49,16 @@ export interface Status {
   job: Job | null;
   live_points: number;
   session_loaded: string | null;
+  alarms?: string[];
+}
+
+export interface Metrics {
+  points: number;
+  steps: number | null;
+  points_per_step: number | null;
+  duration_s: number | null;
+  grid: { cell_m: number; cells: number; filled: number; coverage_pct: number; points_per_filled_cell: number | null };
+  floor: { points: number; rms_mm: number; tilt_deg: number; offset_mm: number } | null;
 }
 
 export interface PortInfo {

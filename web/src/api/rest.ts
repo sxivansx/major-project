@@ -1,3 +1,4 @@
+import type { Metrics } from "./types";
 // Thin fetch wrappers for /api. Errors throw ApiError with the status and
 // whatever the server said, so panels can show the message inline.
 
@@ -102,6 +103,9 @@ export const api = {
 
   config: () => request<Config>("GET", "/config"),
   putConfig: (c: Config) => request<Config>("PUT", "/config", c),
+
+  metrics: (q: GridQuery) => request<Metrics>("GET", "/metrics" + gridQuery(q)),
+  snapshotUrl: (rotations: number) => `/api/scan/snapshot.csv?rotations=${rotations}`,
 };
 
 export function errorText(e: unknown): string {

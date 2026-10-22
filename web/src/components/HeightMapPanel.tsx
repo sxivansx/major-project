@@ -4,6 +4,7 @@ import { GRID_LAYERS, type GridFrame, type GridLayer } from "../api/types";
 import { clientLog, useStore } from "../store/store";
 import { rampCssGradient, rampRgb } from "../lib/colormap";
 import { fmt, fmtInt } from "../lib/format";
+import { MetricsLine } from "./MetricsLine";
 
 // Top-down 2.5D height map on a canvas. Row index = y, so grid row 0 is the
 // lowest y and is drawn at the bottom (+y up on screen, +x right).
@@ -326,6 +327,7 @@ export function HeightMapPanel() {
         <span>{fmt(range[1], grid?.layer === "count" ? 0 : 2)}</span>
         <span className="dim">{grid?.layer === "count" ? "points per cell" : "z (m)"}</span>
       </div>
+      <MetricsLine />
     </section>
   );
 }
