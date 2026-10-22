@@ -2,9 +2,11 @@ import { create } from "zustand";
 import type {
   Config,
   GridFrame,
+  GridLayer,
   Job,
   JobRequest,
   LogLevel,
+  Metrics,
   PortInfo,
   ScanFrame,
   SessionMeta,
@@ -24,7 +26,19 @@ export interface LogEntry {
 
 export const LOG_MAX = 200;
 
-export interface State {
+// View settings; every tab's Advanced drawer edits a slice of these.
+export interface UiState {
+  showSurface: boolean;
+  showHelpers: boolean;
+  pointSize: number;
+  colorZ: [number, number]; // z range for the colour ramp in 3D
+  surfaceMaxStep: number; // metres; quads with a larger z spread are not drawn
+  gridForm: { cell: string; layer: GridLayer; zMin: string; zMax: string }; // height map query (strings: form inputs)
+  fitColours: boolean; // height map colour range from the data instead of z min/max
+  cloudResetNonce: number; // bump to put the 3D camera back to the default view
+}
+
+export interface State extends UiState {
   // websocket
   wsState: WsState;
   wsAttempt: number;
@@ -36,6 +50,8 @@ export interface State {
   config: Config | null;
   ports: PortInfo[];
   sessions: SessionMeta[];
+  metrics: Metrics | null; // GET /api/metrics for the current grid
+  metricsError: string | null;
 
   // live data (throttled)
   scan: ScanFrame | null;
@@ -46,16 +62,10 @@ export interface State {
 
   log: LogEntry[];
 
-  // scan job form (shared by the Scan job panel and the operator action bar)
+  // scan job form (shared by the Scan job panel and the action bars)
   jobForm: JobRequest;
 
-  // ui
   tab: Tab;
-  showSurface: boolean;
-  showHelpers: boolean;
-  pointSize: number;
-  colorZ: [number, number]; // z range for the colour ramp in 3D
-  surfaceMaxStep: number; // metres; quads with a larger z spread are not drawn
 
   // actions
   setWs: (p: Partial<Pick<State, "wsState" | "wsAttempt" | "wsRetryAt">>) => void;
@@ -64,6 +74,7 @@ export interface State {
   setConfig: (c: Config) => void;
   setPorts: (p: PortInfo[]) => void;
   setSessions: (s: SessionMeta[]) => void;
+  setMetrics: (m: Metrics | null, err?: string | null) => void;
   setScan: (f: ScanFrame, hz: number) => void;
   setGrid: (g: GridFrame | null) => void;
   setCloud: (count: number, version: number) => void;
@@ -71,7 +82,7 @@ export interface State {
   clearLog: () => void;
   setJobForm: (p: Partial<JobRequest>) => void;
   setTab: (t: Tab) => void;
-  setUi: (p: Partial<Pick<State, "showSurface" | "showHelpers" | "pointSize" | "colorZ" | "surfaceMaxStep">>) => void;
+  setUi: (p: Partial<UiState>) => void;
 }
 
 let logId = 0;
@@ -101,6 +112,8 @@ export const useStore = create<State>((set) => ({
   config: null,
   ports: [],
   sessions: [],
+  metrics: null,
+  metricsError: null,
 
   scan: null,
   scanHzMeasured: 0,
@@ -118,6 +131,9 @@ export const useStore = create<State>((set) => ({
   pointSize: 2,
   colorZ: [-0.5, 2.5],
   surfaceMaxStep: 1.0,
+  gridForm: { cell: "0.05", layer: "max", zMin: "-0.5", zMax: "2.5" },
+  fitColours: false,
+  cloudResetNonce: 0,
 
   setWs: (p) => set(p),
   setStatus: (status) => set({ status }),
@@ -126,6 +142,7 @@ export const useStore = create<State>((set) => ({
   setConfig: (config) => set({ config }),
   setPorts: (ports) => set({ ports }),
   setSessions: (sessions) => set({ sessions }),
+  setMetrics: (metrics, metricsError = null) => set({ metrics, metricsError }),
   setScan: (scan, hz) => set((s) => ({ scan, scanHzMeasured: hz, wsFrames: s.wsFrames + 1 })),
   setGrid: (grid) => set({ grid }),
   setCloud: (cloudCount, cloudVersion) => set({ cloudCount, cloudVersion }),

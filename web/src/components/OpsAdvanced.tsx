@@ -4,6 +4,7 @@ import { fmt, fmtTime } from "../lib/format";
 import { stopSweep } from "../store/actions";
 import { refreshOps, useOps, type LayerToggles } from "../store/ops";
 import { useStore } from "../store/store";
+import { JobPanel } from "./JobPanel";
 import { RankFindings } from "./OpsAssistant";
 import { FindingList, ParamControls, Situation } from "./OpsFindings";
 import { useState } from "react";
@@ -73,6 +74,7 @@ export function OpsAdvanced() {
       </div>
       <div className="ops-advanced-grid">
         <div className="ops-advanced-col">
+          <JobPanel />
           {findings && findings.grid.w > 0 ? <Situation f={findings} /> : <div className="empty">no analysis yet</div>}
           <div className="ops-block">
             <div className="ops-block-title">Route</div>

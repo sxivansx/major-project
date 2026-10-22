@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
-import { Canvas, useFrame } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import type { GridFrame } from "../api/types";
 import { cloud } from "../store/cloud";
@@ -215,7 +215,26 @@ function Rig({ axisZ, h, phiDeg }: { axisZ: number; h: number; phiDeg: number })
   );
 }
 
-export function CloudView() {
+// Default view: looking down from above at about 60°, from the +x/+y side.
+const CAMERA_HOME: [number, number, number] = [3.5, 9, 4.5];
+
+// Puts the camera back to the default view whenever `nonce` changes (the Fit
+// button). OrbitControls registers itself as the default controls.
+function CameraHome({ nonce, targetY }: { nonce: number; targetY: number }) {
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls) as { target: THREE.Vector3; update: () => void } | null;
+  useEffect(() => {
+    if (nonce === 0) return;
+    camera.position.set(...CAMERA_HOME);
+    if (controls) {
+      controls.target.set(0, targetY, 0);
+      controls.update();
+    } else camera.lookAt(0, targetY, 0);
+  }, [nonce, camera, controls, targetY]);
+  return null;
+}
+
+export function CloudView({ resetNonce = 0 }: { resetNonce?: number }) {
   const showSurface = useStore((s) => s.showSurface);
   const showHelpers = useStore((s) => s.showHelpers);
   const pointSize = useStore((s) => s.pointSize);
@@ -229,10 +248,11 @@ export function CloudView() {
     <Canvas
       dpr={[1, 1.5]}
       gl={{ antialias: true, powerPreference: "high-performance" }}
-      camera={{ position: [5, 4, 6.5], fov: 45, near: 0.02, far: 300 }}
+      camera={{ position: CAMERA_HOME, fov: 45, near: 0.02, far: 300 }}
       onCreated={({ gl }) => gl.setClearColor("#1c1c1c")}
     >
       <OrbitControls makeDefault target={[0, axisZ, 0]} />
+      <CameraHome nonce={resetNonce} targetY={axisZ} />
       {/* three's XZ plane at y=0 is our z=0 base plate */}
       {showHelpers && <gridHelper args={[10, 20, "#4a4a4a", "#2c2c2c"]} />}
       <group rotation={Z_UP}>

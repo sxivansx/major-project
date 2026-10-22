@@ -7,7 +7,7 @@
 // Against the real core this will move the servo and run a short sweep.
 
 import { encodeOpsLayers, parseFrame, parseGrid, parseOpsLayers, parseSessionPoints } from "../src/api/frames";
-import type { AiAsk, AiSitrep, AiStatus, AiTriage, BinaryFrame, Config, Findings, Job, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
+import type { AiAsk, AiSitrep, AiStatus, AiTriage, BinaryFrame, Config, Findings, Job, Metrics, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
 import { FINDING_KINDS } from "../src/api/types";
 
 const BASE = process.env.CHECK_URL ?? "http://127.0.0.1:8000";
@@ -196,6 +196,10 @@ const g2 = parseGrid(await reqBin("/grid?cell=0.1&layer=mean&z_min=-1&z_max=2"))
 ok(g2.layer === "mean" && Math.abs(g2.cell_m - 0.1) < 1e-6, `GET /grid -> ${g2.w}x${g2.h} ${g2.layer} cell ${g2.cell_m}`);
 const g3 = parseGrid(await reqBin("/grid?layer=count"));
 ok(g3.layer === "count", "GET /grid?layer=count");
+const mt = await req<Metrics>("GET", "/metrics?cell=0.1");
+ok(mt.points > 0 && mt.grid && mt.grid.cells > 0 && mt.grid.filled > 0 && mt.grid.filled <= mt.grid.cells, `GET /metrics -> ${mt.points} points, ${mt.grid?.filled}/${mt.grid?.cells} cells`);
+ok(mt.grid.coverage_pct >= 0 && mt.grid.coverage_pct <= 100, `metrics coverage ${mt.grid.coverage_pct}%`);
+ok(mt.floor === null || (typeof mt.floor.rms_mm === "number" && typeof mt.floor.tilt_deg === "number" && typeof mt.floor.offset_mm === "number"), `metrics floor ${mt.floor ? `${mt.floor.points} pts, RMS ${mt.floor.rms_mm} mm` : "null"}`);
 
 // ---- 6b. operator products ----
 console.log("\nOperator products");

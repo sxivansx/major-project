@@ -1,20 +1,25 @@
-import { cloud, cloudClear } from "../store/cloud";
+import { useState } from "react";
+import { api, errorText } from "../api/rest";
+import { cloud } from "../store/cloud";
+import { fmt, fmtInt } from "../lib/format";
+import { clearCloud, startSweep } from "../store/actions";
 import { useStore } from "../store/store";
-import { fmtInt } from "../lib/format";
 import { CloudView } from "./CloudView";
-import { HeightMapPanel } from "./HeightMapPanel";
+import { HeightMapControls, HeightMapPanel, downloadHeightMapPng } from "./HeightMapPanel";
+import { JobPanel } from "./JobPanel";
+import { MountPanel } from "./MountPanel";
+import { Shell, useAdvancedFlag, type BigNumber } from "./Shell";
 
-export function CloudTab() {
-  const cloudCount = useStore((s) => s.cloudCount);
-  const setCloud = useStore((s) => s.setCloud);
-  const showSurface = useStore((s) => s.showSurface);
+// Point cloud and height map: the 3D view left, the 2.5D map right, the
+// numbers from /api/metrics on top.
+
+function CloudControls() {
   const showHelpers = useStore((s) => s.showHelpers);
   const pointSize = useStore((s) => s.pointSize);
   const colorZ = useStore((s) => s.colorZ);
   const surfaceMaxStep = useStore((s) => s.surfaceMaxStep);
+  const cloudCount = useStore((s) => s.cloudCount);
   const setUi = useStore((s) => s.setUi);
-  const sessionLoaded = useStore((s) => s.status?.session_loaded ?? null);
-
   const setZ = (i: 0 | 1, v: string) => {
     const n = Number(v);
     if (!Number.isFinite(n)) return;
@@ -22,84 +27,181 @@ export function CloudTab() {
     next[i] = n;
     setUi({ colorZ: next });
   };
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <span>3D view</span>
+      </div>
+      <div className="panel-body">
+        <div className="field">
+          <label>Point px</label>
+          <input
+            type="number"
+            min={1}
+            max={8}
+            step={1}
+            value={pointSize}
+            onChange={(e) => setUi({ pointSize: Math.max(1, Math.min(8, Number(e.target.value) || 1)) })}
+          />
+        </div>
+        <div className="field">
+          <label>Colour z</label>
+          <div className="row">
+            <input type="number" step={0.1} value={colorZ[0]} onChange={(e) => setZ(0, e.target.value)} />
+            <input type="number" step={0.1} value={colorZ[1]} onChange={(e) => setZ(1, e.target.value)} />
+            <button
+              disabled={cloudCount === 0}
+              title="Set the colour range to the z extent of the cloud"
+              onClick={() => {
+                if (Number.isFinite(cloud.zMin) && cloud.zMax > cloud.zMin) setUi({ colorZ: [+cloud.zMin.toFixed(2), +cloud.zMax.toFixed(2)] });
+              }}
+            >
+              Fit colours
+            </button>
+          </div>
+        </div>
+        <div className="field" title="Surface quads with a larger z spread are skipped (0 = draw all)">
+          <label>Max step m</label>
+          <input type="number" min={0} step={0.1} value={surfaceMaxStep} onChange={(e) => setUi({ surfaceMaxStep: Math.max(0, Number(e.target.value) || 0) })} />
+        </div>
+        <label className="inline-check">
+          <input type="checkbox" checked={showHelpers} onChange={(e) => setUi({ showHelpers: e.target.checked })} />
+          grid and axes
+        </label>
+      </div>
+    </section>
+  );
+}
+
+export function CloudTab() {
+  const [advanced, setAdvanced] = useAdvancedFlag("cloud");
+  const status = useStore((s) => s.status);
+  const sessions = useStore((s) => s.sessions);
+  const cloudCount = useStore((s) => s.cloudCount);
+  const metrics = useStore((s) => s.metrics);
+  const grid = useStore((s) => s.grid);
+  const showSurface = useStore((s) => s.showSurface);
+  const cloudResetNonce = useStore((s) => s.cloudResetNonce);
+  const setUi = useStore((s) => s.setUi);
+  const [scanErr, setScanErr] = useState<string | null>(null);
+  const [scanBusy, setScanBusy] = useState(false);
+
+  const job = status?.job ?? null;
+  const running = job?.state === "running";
+  const ready = !!status?.lidar.connected && !!status?.servo.connected;
+  const sessionId = status?.session_loaded ?? null;
+  const sessionName = sessionId ? (sessions.find((s) => s.id === sessionId)?.name ?? sessionId) : null;
+
+  const numbers: BigNumber[] = [
+    { label: "Points", value: fmtInt(cloudCount) },
+    {
+      label: "Coverage",
+      value: metrics ? (
+        <>
+          {fmt(metrics.grid.coverage_pct, 0)}
+          <small>% · {fmtInt(metrics.grid.filled)} cells</small>
+        </>
+      ) : (
+        "–"
+      ),
+    },
+    {
+      label: "Floor RMS",
+      value: metrics?.floor ? (
+        <>
+          {fmt(metrics.floor.rms_mm, 0)}
+          <small>mm</small>
+        </>
+      ) : (
+        "–"
+      ),
+    },
+    { label: "Session", value: <span title={sessionId ?? ""}>{sessionName ?? "live"}</span> },
+  ];
+
+  const scan = async () => {
+    setScanErr(null);
+    setScanBusy(true);
+    try {
+      await startSweep();
+    } catch (e) {
+      setScanErr(errorText(e));
+    } finally {
+      setScanBusy(false);
+    }
+  };
 
   return (
-    <div className="cloud-grid">
-      <section className="panel">
-        <div className="panel-head">
-          <span>3D point cloud</span>
-          <span className="sub">
-            {fmtInt(cloudCount)} pts
-            {sessionLoaded ? ` · session ${sessionLoaded}` : ""}
-            {cloud.dropped > 0 ? ` · ${fmtInt(cloud.dropped)} dropped (buffer full)` : ""}
-          </span>
-        </div>
-        <div className="canvas-toolbar">
-          <label>
-            Point px
-            <input
-              type="number"
-              min={1}
-              max={8}
-              step={1}
-              value={pointSize}
-              onChange={(e) => setUi({ pointSize: Math.max(1, Math.min(8, Number(e.target.value) || 1)) })}
-            />
-          </label>
-          <label>
-            Colour z
-            <input type="number" step={0.1} value={colorZ[0]} onChange={(e) => setZ(0, e.target.value)} />
-            to
-            <input type="number" step={0.1} value={colorZ[1]} onChange={(e) => setZ(1, e.target.value)} />
-          </label>
-          <button
-            className="small"
-            disabled={cloudCount === 0}
-            title="Set the colour range to the z extent of the cloud"
-            onClick={() => {
-              if (Number.isFinite(cloud.zMin) && cloud.zMax > cloud.zMin)
-                setUi({ colorZ: [+cloud.zMin.toFixed(2), +cloud.zMax.toFixed(2)] });
-            }}
-          >
+    <Shell
+      numbers={numbers}
+      numbersDim={running}
+      main={
+        <section className="panel ops-mappanel">
+          <div className="panel-head">
+            <span>3D point cloud</span>
+            <span className="sub">
+              {fmtInt(cloudCount)} pts
+              {sessionId ? ` · session ${sessionId}` : ""}
+              {cloud.dropped > 0 ? ` · ${fmtInt(cloud.dropped)} dropped (buffer full)` : ""}
+            </span>
+          </div>
+          <div className="scene-wrap">
+            <CloudView resetNonce={cloudResetNonce} />
+            <div className="scene-overlay">drag: orbit · right-drag: pan · wheel: zoom · x red, y green, z blue · blue dot: tilt axis</div>
+          </div>
+        </section>
+      }
+      side={<HeightMapPanel />}
+      actions={
+        <>
+          <button className="primary" disabled={!ready || running || scanBusy} onClick={() => void scan()} title="Sweep with the Scan job settings">
+            Scan
+          </button>
+          {running && job && (
+            <span className="mono dim">
+              scanning… step {job.step} of {job.n_steps}
+            </span>
+          )}
+          {scanErr && <span className="err mono">{scanErr}</span>}
+          <button onClick={() => setUi({ cloudResetNonce: cloudResetNonce + 1 })} title="Camera back to the default view">
             Fit
           </button>
-          <label className="inline-check">
-            <input type="checkbox" checked={showHelpers} onChange={(e) => setUi({ showHelpers: e.target.checked })} />
-            grid and axes
-          </label>
-          <label className="inline-check">
-            <input type="checkbox" checked={showSurface} onChange={(e) => setUi({ showSurface: e.target.checked })} />
-            surface
-          </label>
-          <label title="Surface quads with a larger z spread are skipped (0 = draw all)">
-            max step m
-            <input
-              type="number"
-              min={0}
-              step={0.1}
-              value={surfaceMaxStep}
-              disabled={!showSurface}
-              onChange={(e) => setUi({ surfaceMaxStep: Math.max(0, Number(e.target.value) || 0) })}
-            />
-          </label>
-          <span className="spacer" />
-          <button
-            className="small"
-            disabled={cloudCount === 0}
-            onClick={() => {
-              cloudClear();
-              setCloud(0, cloud.version);
-            }}
-          >
+          <button className={showSurface ? "toggled" : ""} onClick={() => setUi({ showSurface: !showSurface })}>
+            Surface {showSurface ? "on" : "off"}
+          </button>
+          <button disabled={!grid} onClick={() => downloadHeightMapPng()} title="Download the height map as a PNG">
+            PNG
+          </button>
+          {sessionId ? (
+            <a href={api.sessionExportUrl(sessionId, "ply")} download>
+              <button title={`Export session ${sessionId} as ASCII PLY`}>PLY</button>
+            </a>
+          ) : (
+            <button disabled title="Load a session first">
+              PLY
+            </button>
+          )}
+          <button disabled={cloudCount === 0 || running} onClick={clearCloud}>
             Clear
           </button>
+        </>
+      }
+      advanced={
+        <div className="ops-advanced-grid cols-3">
+          <div className="ops-advanced-col">
+            <CloudControls />
+            <HeightMapControls />
+          </div>
+          <div className="ops-advanced-col">
+            <JobPanel />
+          </div>
+          <div className="ops-advanced-col">
+            <MountPanel />
+          </div>
         </div>
-        <div className="scene-wrap">
-          <CloudView />
-          <div className="scene-overlay">drag: orbit · right-drag: pan · wheel: zoom · x red, y green, z blue · blue dot: tilt axis</div>
-        </div>
-      </section>
-      <HeightMapPanel />
-    </div>
+      }
+      advancedOpen={advanced}
+      onAdvanced={setAdvanced}
+    />
   );
 }

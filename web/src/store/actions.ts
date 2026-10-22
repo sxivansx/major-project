@@ -1,10 +1,23 @@
-// Actions shared by more than one panel. The Scan job panel and the operator
-// action bar both start and stop sweeps from the same form in the store.
+// Actions shared by more than one place in the UI (the action bars, the side
+// columns and the Advanced drawers all reach the same server calls). Each one
+// updates the store, logs failures and rethrows so the caller can show the
+// message inline.
 
 import { api, errorText } from "../api/rest";
 import type { JobRequest } from "../api/types";
 import { cloudClear } from "./cloud";
 import { clientLog, useStore } from "./store";
+
+async function statusCall(name: string, fn: () => Promise<import("../api/types").Status>): Promise<void> {
+  try {
+    useStore.getState().setStatus(await fn());
+  } catch (e) {
+    clientLog("error", `${name}: ${errorText(e)}`);
+    throw e;
+  }
+}
+
+// ---- sweeps ----
 
 export function sweepSteps(f: JobRequest): number {
   if (!(f.phi_step > 0)) return 0;
@@ -27,6 +40,65 @@ export async function startSweep(): Promise<number> {
   }
 }
 
-export async function stopSweep(): Promise<void> {
-  useStore.getState().setStatus(await api.jobStop());
+export const stopSweep = () => statusCall("job/stop", () => api.jobStop());
+
+// ---- connections ----
+
+export const connectLidar = (body: { source: "s2" | "sim"; port: string; baud: number }) =>
+  statusCall("lidar/connect", () => api.lidarConnect(body));
+export const disconnectLidar = () => statusCall("lidar/disconnect", () => api.lidarDisconnect());
+export const connectServo = (port: string) => statusCall("servo/connect", () => api.servoConnect(port));
+export const disconnectServo = () => statusCall("servo/disconnect", () => api.servoDisconnect());
+
+export async function refreshPorts(): Promise<void> {
+  try {
+    useStore.getState().setPorts(await api.ports());
+  } catch (e) {
+    clientLog("error", `GET /api/ports: ${errorText(e)}`);
+    throw e;
+  }
+}
+
+// ---- servo ----
+
+export const servoMove = (body: { servo_deg: number } | { phi_deg: number }) =>
+  statusCall("servo/move", () => api.servoMove(body));
+export const servoHome = () => statusCall("servo/home", () => api.servoHome());
+
+// ---- height map ----
+
+// PUT the grid part of the config from the form, then GET the grid with it.
+export async function applyGridForm(): Promise<void> {
+  const st = useStore.getState();
+  const f = st.gridForm;
+  const q = {
+    cell: Number(f.cell),
+    layer: f.layer,
+    z_min: f.zMin === "" ? null : Number(f.zMin),
+    z_max: f.zMax === "" ? null : Number(f.zMax),
+  };
+  try {
+    if (st.config) {
+      const next = {
+        ...st.config,
+        grid: {
+          cell_m: q.cell,
+          layer: f.layer,
+          z_min_m: q.z_min ?? st.config.grid.z_min_m,
+          z_max_m: q.z_max ?? st.config.grid.z_max_m,
+        },
+      };
+      st.setConfig(await api.putConfig(next));
+      st.setUi({ colorZ: [next.grid.z_min_m, next.grid.z_max_m] });
+    }
+    st.setGrid(await api.grid(q));
+  } catch (e) {
+    clientLog("error", `grid: ${errorText(e)}`);
+    throw e;
+  }
+}
+
+export function clearCloud(): void {
+  cloudClear();
+  useStore.getState().setCloud(0, 0);
 }

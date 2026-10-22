@@ -3,6 +3,7 @@ import { api, errorText } from "../api/rest";
 import { cloudClear } from "../store/cloud";
 import { clientLog, useStore } from "../store/store";
 import { fmtDateTime, fmtInt } from "../lib/format";
+import { Shell, type BigNumber } from "./Shell";
 
 export function SessionsPanel() {
   const sessions = useStore((s) => s.sessions);
@@ -84,74 +85,107 @@ export function SessionsPanel() {
     }
   };
 
+  const totalPoints = sessions.reduce((a, s) => a + s.n_points, 0);
+  const loadedMeta = loaded ? sessions.find((s) => s.id === loaded) : undefined;
+  const numbers: BigNumber[] = [
+    { label: "Sessions", value: fmtInt(sessions.length) },
+    { label: "Total points", value: fmtInt(totalPoints) },
+    { label: "Loaded", value: loadedMeta ? loadedMeta.name : loaded ? loaded : "none" },
+  ];
+
   return (
-    <section className="panel full-panel">
-      <div className="panel-head">
-        <span>Sessions</span>
-        <span className="row" style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          <span className="sub">{loaded ? `loaded: ${loaded}` : ""}</span>
-          <button className="small" disabled={busy !== null} onClick={refresh}>
-            Refresh
-          </button>
-        </span>
-      </div>
-      <div className="panel-body" style={{ padding: 0 }}>
-        {err && (
-          <div className="error" style={{ padding: 8 }}>
-            {err}
+    <Shell
+      numbers={numbers}
+      main={
+        <section className="panel ops-mappanel">
+          <div className="panel-head">
+            <span>Sessions</span>
+            <span className="sub">{loaded ? `loaded: ${loaded}` : ""}</span>
           </div>
-        )}
-        {sessions.length === 0 ? (
-          <div className="empty">No sessions yet. Run a sweep to create one.</div>
-        ) : (
-          <table className="list">
-            <thead>
-              <tr>
-                <th>Id</th>
-                <th>Name</th>
-                <th>Created</th>
-                <th style={{ textAlign: "right" }}>Points</th>
-                <th style={{ textAlign: "right" }}>Steps</th>
-                <th>φ range</th>
-                <th>Lidar</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sessions.map((s) => (
-                <tr key={s.id}>
-                  <td className="mono">{s.id}</td>
-                  <td>{s.name}</td>
-                  <td className="mono">{fmtDateTime(s.created)}</td>
-                  <td className="num">{fmtInt(s.n_points)}</td>
-                  <td className="num">{s.n_steps}</td>
-                  <td className="mono">
-                    {s.phi_start}° to {s.phi_end}° by {s.phi_step}° × {s.rotations}
-                  </td>
-                  <td className="mono">{s.lidar?.model ?? "–"}</td>
-                  <td className="actions">
-                    <button className="small" disabled={busy !== null} onClick={() => load(s.id)}>
-                      Load
-                    </button>
-                    <button className="small" disabled={busy !== null} onClick={() => grid(s.id)}>
-                      Grid
-                    </button>
-                    <a className="small" href={api.sessionExportUrl(s.id, "ply")} download>
-                      <button className="small">PLY</button>
-                    </a>
-                    <a className="small" href={api.sessionExportUrl(s.id, "csv")} download>
-                      <button className="small">CSV</button>
-                    </a>
-                    <button className="small danger" disabled={busy !== null} onClick={() => del(s.id)}>
-                      Delete
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-    </section>
+          <div className="panel-body" style={{ padding: 0 }}>
+            {err && (
+              <div className="error" style={{ padding: 8 }}>
+                {err}
+              </div>
+            )}
+            {sessions.length === 0 ? (
+              <div className="empty">No sessions yet. Run a sweep to create one.</div>
+            ) : (
+              <table className="list">
+                <thead>
+                  <tr>
+                    <th>Id</th>
+                    <th>Name</th>
+                    <th>Created</th>
+                    <th style={{ textAlign: "right" }}>Points</th>
+                    <th style={{ textAlign: "right" }}>Steps</th>
+                    <th>φ range</th>
+                    <th>Lidar</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sessions.map((s) => (
+                    <tr key={s.id} className={s.id === loaded ? "sel" : ""}>
+                      <td className="mono">{s.id}</td>
+                      <td>{s.name}</td>
+                      <td className="mono">{fmtDateTime(s.created)}</td>
+                      <td className="num">{fmtInt(s.n_points)}</td>
+                      <td className="num">{s.n_steps}</td>
+                      <td className="mono">
+                        {s.phi_start}° to {s.phi_end}° by {s.phi_step}° × {s.rotations}
+                      </td>
+                      <td className="mono">{s.lidar?.model ?? "–"}</td>
+                      <td className="actions">
+                        <button className="small" disabled={busy !== null} onClick={() => load(s.id)}>
+                          Load
+                        </button>
+                        <button className="small" disabled={busy !== null} onClick={() => grid(s.id)}>
+                          Grid
+                        </button>
+                        <a className="small" href={api.sessionExportUrl(s.id, "ply")} download>
+                          <button className="small">PLY</button>
+                        </a>
+                        <a className="small" href={api.sessionExportUrl(s.id, "csv")} download>
+                          <button className="small">CSV</button>
+                        </a>
+                        <button className="small danger" disabled={busy !== null} onClick={() => del(s.id)}>
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </section>
+      }
+      side={
+        <section className="panel ops-right">
+          <div className="panel-head">
+            <span>Saved sweeps</span>
+          </div>
+          <div className="panel-body ops-summary">
+            <div className="sensor-text">
+              {sessions.length === 0
+                ? "No sweeps saved yet. Every finished sweep is saved as a session on the core."
+                : `${fmtInt(sessions.length)} saved sweep${sessions.length === 1 ? "" : "s"} with ${fmtInt(totalPoints)} points in total.`}
+            </div>
+            <div className="sensor-text">
+              {loadedMeta
+                ? `Loaded: ${loadedMeta.name} (${fmtInt(loadedMeta.n_points)} points, ${loadedMeta.n_steps} steps).`
+                : "Nothing loaded: the other tabs show the live sweep."}
+            </div>
+            <div className="hint">Load puts a session into the live view (point cloud, height map, Operator). Grid only fetches its height map. PLY and CSV download the points.</div>
+          </div>
+        </section>
+      }
+      actions={
+        <button disabled={busy !== null} onClick={() => void refresh()}>
+          Refresh
+        </button>
+      }
+    />
   );
 }

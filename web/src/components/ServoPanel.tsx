@@ -1,20 +1,20 @@
 import { useRef, useState } from "react";
 import { api, errorText } from "../api/rest";
-import { clientLog, useStore } from "../store/store";
+import { servoHome, servoMove } from "../store/actions";
+import { useStore } from "../store/store";
 import { fmt } from "../lib/format";
+
+// The tilt slider lives in the Live scan tab's Sensor column, the raw
+// calibration console in its Advanced drawer. ServoPanel composes both the
+// old sidebar way.
 
 const DRAG_SEND_MS = 100;
 
-interface ConsoleLine {
-  id: number;
-  dir: "in" | "out";
-  text: string;
-}
-
-export function ServoPanel() {
+// One slider in servo degrees (the servo's own limits) that shows the tilt φ
+// it produces, with Level (home) next to it.
+export function TiltSlider() {
   const servo = useStore((s) => s.status?.servo);
-  const config = useStore((s) => s.config);
-  const setStatus = useStore((s) => s.setStatus);
+  const mount = useStore((s) => s.config?.mount);
 
   const connected = !!servo?.connected;
   const min = servo?.min_deg ?? 0;
@@ -24,27 +24,17 @@ export function ServoPanel() {
 
   const [dragValue, setDragValue] = useState<number>(servoDeg ?? (min + max) / 2);
   const [dragging, setDragging] = useState(false);
-  // while dragging show the drag value, otherwise follow the real servo
-  const slider = dragging || servoDeg === null ? dragValue : servoDeg;
-  const setSlider = setDragValue;
-  const [phiInput, setPhiInput] = useState("");
   const [err, setErr] = useState<string | null>(null);
-  const [rawLine, setRawLine] = useState("?");
-  const [consoleLines, setConsoleLines] = useState<ConsoleLine[]>([]);
-  const consoleId = useRef(0);
+  const slider = dragging || servoDeg === null ? dragValue : servoDeg;
   const lastSend = useRef(0);
   const sendTimer = useRef<number | undefined>(undefined);
   const pendingDeg = useRef<number | null>(null);
 
-  const move = async (body: { servo_deg: number } | { phi_deg: number }) => {
-    setErr(null);
-    try {
-      setStatus(await api.servoMove(body));
-    } catch (e) {
-      setErr(errorText(e));
-      clientLog("error", `servo/move: ${errorText(e)}`);
-    }
-  };
+  // φ for a servo angle, from the mount mapping, while dragging
+  const phiFor = (deg: number) => (mount ? (mount.invert ? -1 : 1) * (deg - mount.center_deg) : NaN);
+  const shownPhi = dragging ? phiFor(slider) : (phiDeg ?? phiFor(slider));
+
+  const move = (deg: number) => servoMove({ servo_deg: deg }).catch((e) => setErr(errorText(e)));
 
   // throttle sends while dragging; always send the final value on release
   const sendDeg = (deg: number, final: boolean) => {
@@ -54,7 +44,7 @@ export function ServoPanel() {
       sendTimer.current = undefined;
       pendingDeg.current = null;
       lastSend.current = now;
-      void move({ servo_deg: deg });
+      void move(deg);
     } else {
       pendingDeg.current = deg;
       if (sendTimer.current === undefined) {
@@ -62,7 +52,7 @@ export function ServoPanel() {
           sendTimer.current = undefined;
           if (pendingDeg.current !== null) {
             lastSend.current = performance.now();
-            void move({ servo_deg: pendingDeg.current });
+            void move(pendingDeg.current);
             pendingDeg.current = null;
           }
         }, DRAG_SEND_MS);
@@ -70,26 +60,67 @@ export function ServoPanel() {
     }
   };
 
-  const home = async () => {
-    setErr(null);
-    try {
-      setStatus(await api.servoHome());
-    } catch (e) {
-      setErr(errorText(e));
-    }
-  };
+  return (
+    <div className="tilt">
+      <div className="slider-row">
+        <span className="dim">Tilt</span>
+        <input
+          type="range"
+          min={min}
+          max={max}
+          step={0.5}
+          value={slider}
+          disabled={!connected}
+          onPointerDown={() => {
+            setDragValue(slider);
+            setDragging(true);
+          }}
+          onPointerUp={() => {
+            setDragging(false);
+            sendDeg(dragValue, true);
+          }}
+          onKeyUp={() => sendDeg(slider, true)}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            setDragValue(v);
+            if (dragging) sendDeg(v, false);
+            else sendDeg(v, true); // keyboard / click on the track
+          }}
+        />
+        <span className="val" title={`servo ${fmt(slider, 1)}°`}>
+          φ {Number.isFinite(shownPhi) ? fmt(shownPhi, 1) : "–"}°
+        </span>
+        <button className="small" disabled={!connected} title="Scan plane horizontal (servo home)" onClick={() => servoHome().catch((e) => setErr(errorText(e)))}>
+          Level
+        </button>
+      </div>
+      {err && <div className="error">{err}</div>}
+    </div>
+  );
+}
 
-  const sendPhi = () => {
-    const v = Number(phiInput);
-    if (!Number.isFinite(v)) return;
-    void move({ phi_deg: v });
-  };
+interface ConsoleLine {
+  id: number;
+  dir: "in" | "out";
+  text: string;
+}
+
+// Raw line protocol console for calibration (?, T, L, C ...).
+export function ServoConsole() {
+  const servo = useStore((s) => s.status?.servo);
+  const setStatus = useStore((s) => s.setStatus);
+  const mount = useStore((s) => s.config?.mount);
+  const connected = !!servo?.connected;
+  const [rawLine, setRawLine] = useState("?");
+  const [phiInput, setPhiInput] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const [consoleLines, setConsoleLines] = useState<ConsoleLine[]>([]);
+  const consoleId = useRef(0);
 
   const sendRaw = async () => {
     const line = rawLine.trim();
     if (!line) return;
-    const push = (dir: "in" | "out", t: string) =>
-      setConsoleLines((ls) => [...ls.slice(-9), { id: ++consoleId.current, dir, text: t }]);
+    const push = (dir: "in" | "out", t: string) => setConsoleLines((ls) => [...ls.slice(-9), { id: ++consoleId.current, dir, text: t }]);
     push("in", line);
     try {
       const r = await api.servoRaw(line);
@@ -107,54 +138,30 @@ export function ServoPanel() {
     }
   };
 
-  const mount = config?.mount;
+  const sendPhi = () => {
+    const v = Number(phiInput);
+    if (!Number.isFinite(v)) return;
+    setErr(null);
+    void servoMove({ phi_deg: v }).catch((e) => setErr(errorText(e)));
+  };
 
   return (
     <section className="panel">
       <div className="panel-head">
-        <span>Servo</span>
+        <span>Servo console</span>
         <span className="sub">
-          {servoDeg !== null ? `${fmt(servoDeg, 1)}° servo` : ""}
-          {phiDeg !== null ? ` · φ ${fmt(phiDeg, 1)}°` : ""}
+          {servo?.servo_deg != null ? `${fmt(servo.servo_deg, 1)}° servo` : ""}
+          {servo?.phi_deg != null ? ` · φ ${fmt(servo.phi_deg, 1)}°` : ""}
         </span>
       </div>
       <div className="panel-body">
-        <div className="field">
-          <label>Servo deg</label>
-          <div className="slider-row">
-            <input
-              type="range"
-              min={min}
-              max={max}
-              step={0.5}
-              value={slider}
-              disabled={!connected}
-              onPointerDown={() => {
-                setDragValue(slider);
-                setDragging(true);
-              }}
-              onPointerUp={() => {
-                setDragging(false);
-                sendDeg(dragValue, true);
-              }}
-              onKeyUp={() => sendDeg(slider, true)}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                setSlider(v);
-                if (dragging) sendDeg(v, false);
-                else sendDeg(v, true); // keyboard / click on the track
-              }}
-            />
-            <span className="val">{fmt(slider, 1)}°</span>
-          </div>
-        </div>
         <div className="field">
           <label>Tilt φ (deg)</label>
           <div className="row">
             <input
               type="number"
               step={0.5}
-              placeholder={phiDeg !== null ? fmt(phiDeg, 1) : "0"}
+              placeholder={servo?.phi_deg != null ? fmt(servo.phi_deg, 1) : "0"}
               value={phiInput}
               disabled={!connected}
               onChange={(e) => setPhiInput(e.target.value)}
@@ -165,31 +172,10 @@ export function ServoPanel() {
             <button disabled={!connected || phiInput === ""} onClick={sendPhi}>
               Go
             </button>
-            <button disabled={!connected} onClick={home} title="H: go to range/2">
-              Home
-            </button>
           </div>
         </div>
-        <dl className="kv">
-          <dt>servo_deg</dt>
-          <dd>{fmt(servoDeg, 1, "°")}</dd>
-          <dt>phi_deg</dt>
-          <dd>{fmt(phiDeg, 1, "°")}</dd>
-          <dt>encoder</dt>
-          <dd>
-            {servo?.encoder ?? "–"}
-            {servo?.meas_deg != null ? ` · ${fmt(servo.meas_deg, 1)}° (φ ${fmt(servo.phi_meas_deg, 1)}°)` : ""}
-            {servo?.settled === false ? " · moving" : ""}
-          </dd>
-          <dt>Mapping</dt>
-          <dd>
-            {mount
-              ? `φ = ${mount.invert ? "−" : ""}(servo − ${mount.center_deg})`
-              : "–"}
-          </dd>
-        </dl>
+        <div className="hint">Mapping: {mount ? `φ = ${mount.invert ? "−" : ""}(servo − ${mount.center_deg})` : "–"}</div>
         {err && <div className="error">{err}</div>}
-
         <div className="section-title">Raw console (calibration)</div>
         <div className="row" style={{ display: "flex", gap: 4 }}>
           <input
@@ -218,10 +204,17 @@ export function ServoPanel() {
             ))}
           </div>
         )}
-        <div className="hint">
-          Commands: ? status, I identify, T deg, S deg ms, H home, L min max, C us_min us_max range
-        </div>
+        <div className="hint">Commands: ? status, I identify, T deg, S deg ms, H home, L min max, C us_min us_max range</div>
       </div>
     </section>
+  );
+}
+
+export function ServoPanel() {
+  return (
+    <>
+      <TiltSlider />
+      <ServoConsole />
+    </>
   );
 }

@@ -12,7 +12,7 @@
 import type { ServerWebSocket } from "bun";
 import { encodeGrid, encodeOpsLayers, encodePoints, encodeScan, encodeSessionPoints } from "../src/api/frames";
 import type { Config, GridLayer, Job, JobRequest, SessionMeta, Status } from "../src/api/types";
-import { AI_MODELS, OPS_DEFAULTS, aiAsk, aiSitrep, aiTriage, analyze, nearestPassable, planRoute, type OpsParams, type OpsResult } from "./ops";
+import { AI_MODELS, OPS_DEFAULTS, aiAsk, aiSitrep, aiTriage, analyze, fitPlaneNear, nearestPassable, planRoute, type OpsParams, type OpsResult } from "./ops";
 import { computeGrid, fakeScan, filterQuality, scanToPoints, type FakeScan, type Mount } from "./world";
 
 const PORT = Number(process.env.PORT ?? 8000);
@@ -71,6 +71,8 @@ let nextJobId = 1;
 let stopRequested = false;
 let loadJobId = 1_000_000; // job_id used for replayed session chunks
 let jobPhiMax = 60; // |φ| reach of the last job's sweep (sets the blind stripe width)
+let lastJobSteps = 0; // for /api/metrics
+let lastJobDuration: number | null = null;
 let sessionPhiMax = 60; // same for the loaded session
 let cloudVersion = 0; // bumped whenever the live cloud changes (analysis cache key)
 
@@ -380,6 +382,8 @@ async function runJob(req: JobRequest, jobId: number) {
   }
   if (job.state === "running") job.state = "done";
   job.eta_s = 0;
+  lastJobSteps = job.step;
+  lastJobDuration = +(now() - job.started).toFixed(1);
   broadcast(gridFrame(jobXyz, jobN, new URLSearchParams()));
   sendJob();
   if (job.state === "done" || (job.state === "stopped" && jobN > 0)) {
@@ -643,6 +647,36 @@ async function handleApi(req: Request, path: string): Promise<Response> {
       return bin(gridFrame(s.xyz, s.meta.n_points, url.searchParams));
     }
     return bin(gridFrame(jobXyz, jobN, url.searchParams));
+  }
+
+  // ---- evaluation numbers ----
+  if (path === "/metrics" && m === "GET") {
+    const { xyz, n } = liveCloud();
+    const cell = Number(url.searchParams.get("cell") ?? config.grid.cell_m) || config.grid.cell_m;
+    if (!(cell > 0)) return err(400, "cell must be > 0");
+    const zmin = url.searchParams.get("z_min") ? Number(url.searchParams.get("z_min")) : config.grid.z_min_m;
+    const zmax = url.searchParams.get("z_max") ? Number(url.searchParams.get("z_max")) : config.grid.z_max_m;
+    const g = computeGrid(xyz, n, cell, "max", zmin, zmax);
+    let filled = 0;
+    for (let i = 0; i < g.data.length; i++) if (Number.isFinite(g.data[i])) filled++;
+    const cells = g.w * g.h;
+    const loaded = status.session_loaded ? sessions.get(status.session_loaded) : undefined;
+    const steps = loaded ? loaded.meta.n_steps : lastJobSteps || null;
+    const floor = fitPlaneNear(xyz, n, 0, 0.1);
+    return json({
+      points: n,
+      steps,
+      points_per_step: steps ? Math.round(n / steps) : null,
+      duration_s: loaded ? null : lastJobDuration,
+      grid: {
+        cell_m: cell,
+        cells,
+        filled,
+        coverage_pct: cells ? +((100 * filled) / cells).toFixed(1) : 0,
+        points_per_filled_cell: filled ? +(n / filled).toFixed(1) : null,
+      },
+      floor: floor ? { points: floor.points, rms_mm: floor.rms_mm, tilt_deg: floor.tilt_deg, offset_mm: Math.round(floor.coef[2] * 1000) } : null,
+    });
   }
 
   // ---- operator products ----

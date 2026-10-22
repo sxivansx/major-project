@@ -111,6 +111,33 @@ function fitFloor(xyz: Float32Array, n: number): { coef: [number, number, number
   };
 }
 
+// Plane z = a x + b y + c through the points with |z - z0| <= band (the
+// /api/metrics floor: within ±10 cm of z = 0). Null with fewer than 50 points.
+export function fitPlaneNear(xyz: Float32Array, n: number, z0: number, band: number): { points: number; coef: [number, number, number]; rms_mm: number; tilt_deg: number } | null {
+  let sxx = 0, sxy = 0, sx = 0, syy = 0, sy = 0, s1 = 0, sxz = 0, syz = 0, sz = 0;
+  for (let i = 0; i < n; i++) {
+    const z = xyz[i * 3 + 2];
+    if (Math.abs(z - z0) > band) continue;
+    const x = xyz[i * 3];
+    const y = xyz[i * 3 + 1];
+    sxx += x * x; sxy += x * y; sx += x; syy += y * y; sy += y; s1++; sxz += x * z; syz += y * z; sz += z;
+  }
+  if (s1 < 50) return null;
+  const det = sxx * (syy * s1 - sy * sy) - sxy * (sxy * s1 - sy * sx) + sx * (sxy * sy - syy * sx);
+  if (Math.abs(det) < 1e-12) return null;
+  const a = (sxz * (syy * s1 - sy * sy) - sxy * (syz * s1 - sy * sz) + sx * (syz * sy - syy * sz)) / det;
+  const b = (sxx * (syz * s1 - sy * sz) - sxz * (sxy * s1 - sy * sx) + sx * (sxy * sz - syz * sx)) / det;
+  const c = (sxx * (syy * sz - syz * sy) - sxy * (sxy * sz - syz * sx) + sxz * (sxy * sy - syy * sx)) / det;
+  let ss = 0;
+  for (let i = 0; i < n; i++) {
+    const z = xyz[i * 3 + 2];
+    if (Math.abs(z - z0) > band) continue;
+    const d = z - (a * xyz[i * 3] + b * xyz[i * 3 + 1] + c);
+    ss += d * d;
+  }
+  return { points: s1, coef: [a, b, c], rms_mm: r(Math.sqrt(ss / s1) * 1000, 1), tilt_deg: r(Math.atan(Math.hypot(a, b)) / DEG, 2) };
+}
+
 // ---- regions ----
 
 function labelRegions(mask: Uint8Array, w: number, h: number, conn: 4 | 8, values: Float32Array | null, maxJump: number | null) {

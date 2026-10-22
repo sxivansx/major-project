@@ -13,7 +13,14 @@ export default defineConfig({
     strictPort: false,
     proxy: {
       "/api": { target: core, changeOrigin: false },
-      "/ws": { target: core.replace(/^http/, "ws"), ws: true },
+      "/ws": {
+        target: core.replace(/^http/, "ws"),
+        ws: true,
+        // a core restart under an open dashboard must not take the dev server down
+        configure: (proxy) => {
+          proxy.on("error", (err) => console.warn("[ws proxy]", err.message));
+        },
+      },
     },
   },
   build: {

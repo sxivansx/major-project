@@ -35,25 +35,17 @@ body {
   overflow: hidden;
 }
 
-/* ---- app shell ---- */
+/* ---- app shell (no sidebar: the engineering panels live in each tab's Advanced drawer) ---- */
 .app {
   display: grid;
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr) 28px;
   height: 100vh;
 }
 
-.sidebar {
-  grid-row: 1;
-  grid-column: 1;
-  overflow-y: auto;
-  border-right: 1px solid var(--border);
-  background: var(--bg-panel);
-}
-
 .main {
   grid-row: 1;
-  grid-column: 2;
+  grid-column: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -258,6 +250,38 @@ button.small {
   font-size: 12px;
 }
 
+/* download links that sit among buttons (Snapshot CSV) */
+a.button {
+  display: inline-block;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  padding: 4px 6px;
+  font: inherit;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+a.button:hover {
+  background: var(--bg-hover);
+}
+
+a.button.small {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+a.button.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.ops-actions a.button {
+  padding: 5px 14px;
+  font-size: 13px;
+}
+
 input[type="range"] {
   width: 100%;
   padding: 0;
@@ -458,24 +482,6 @@ input[type="checkbox"] {
 }
 
 /* ---- live tab ---- */
-.live-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 8px;
-  padding: 8px;
-  flex: 1;
-  min-height: 0;
-  min-width: 0;
-}
-
-.live-right {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-height: 0;
-  min-width: 0;
-}
-
 .polar-wrap {
   flex: 1;
   min-height: 0;
@@ -525,16 +531,6 @@ input[type="checkbox"] {
 }
 
 /* ---- cloud tab ---- */
-.cloud-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr);
-  gap: 8px;
-  padding: 8px;
-  flex: 1;
-  min-height: 0;
-  min-width: 0;
-}
-
 .scene-wrap {
   flex: 1;
   min-height: 0;
@@ -639,12 +635,6 @@ table.list a:hover {
   text-decoration: underline;
 }
 
-.full-panel {
-  flex: 1;
-  margin: 8px;
-  min-height: 0;
-}
-
 /* ---- log ---- */
 .log-list {
   font-family: var(--mono);
@@ -711,19 +701,7 @@ table.list a:hover {
   font-size: 12px;
 }
 
-/* ---- operator tab ---- */
-.app.no-sidebar {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.app.no-sidebar .sidebar {
-  display: none;
-}
-
-.app.no-sidebar .main {
-  grid-column: 1;
-}
-
+/* ---- tab shell (every tab) ---- */
 .ops-simple {
   flex: 1;
   display: flex;
@@ -952,13 +930,67 @@ button.toggled {
 .ops-advanced-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 0 8px;
+  gap: 8px;
+  padding: 8px;
   overflow: auto;
   min-height: 0;
 }
 
+.ops-advanced-grid.cols-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .ops-advanced-col {
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ops-advanced .panel {
+  flex: none;
+}
+
+.ops-advanced .panel-body {
+  flex: none;
+  overflow: visible;
+}
+
+.ops-advanced .raw-wrap .raw-scroll {
+  height: 260px;
+  flex: none;
+}
+
+/* sentences in the side columns */
+.sensor-text {
+  line-height: 1.5;
+  font-size: 13px;
+}
+
+.sensor-connect {
+  border: 1px solid var(--border);
+  padding: 8px;
+  background: var(--bg);
+}
+
+.sensor-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.sensor-row:last-child {
+  margin-bottom: 0;
+}
+
+.sensor-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.tilt .slider-row .val {
+  width: 72px;
 }
 
 .ops-block {

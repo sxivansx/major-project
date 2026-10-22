@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, errorText } from "../api/rest";
+import { errorText } from "../api/rest";
 import { GRID_LAYERS, type GridFrame, type GridLayer } from "../api/types";
-import { clientLog, useStore } from "../store/store";
+import { applyGridForm } from "../store/actions";
+import { useStore } from "../store/store";
 import { rampCssGradient, rampRgb } from "../lib/colormap";
 import { fmt, fmtInt } from "../lib/format";
 import { MetricsLine } from "./MetricsLine";
 
 // Top-down 2.5D height map on a canvas. Row index = y, so grid row 0 is the
-// lowest y and is drawn at the bottom (+y up on screen, +x right).
+// lowest y and is drawn at the bottom (+y up on screen, +x right). The query
+// controls (cell, layer, z range, Apply) are a separate component for the
+// Advanced drawer; the PNG download is an action-bar function.
 
 function colourRange(g: GridFrame, fitToData: boolean): [number, number] {
   if (g.layer === "count" || fitToData || !(g.z_max_m > g.z_min_m)) {
@@ -74,34 +77,28 @@ function fitGrid(g: GridFrame, cssW: number, cssH: number): Fit {
   return { ox, oy, scale };
 }
 
+// The mounted height map canvas, for the PNG action.
+const canvasRegistry: { el: HTMLCanvasElement | null } = { el: null };
+
+export function downloadHeightMapPng(): boolean {
+  const c = canvasRegistry.el;
+  const grid = useStore.getState().grid;
+  if (!c || !grid) return false;
+  c.toBlob((blob) => {
+    if (!blob) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `heightmap-${grid.layer}-${grid.cell_m}m.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+  return true;
+}
+
 export function HeightMapPanel() {
   const grid = useStore((s) => s.grid);
-  const config = useStore((s) => s.config);
-  const setConfig = useStore((s) => s.setConfig);
-  const setGrid = useStore((s) => s.setGrid);
-  const showSurface = useStore((s) => s.showSurface);
-  const setUi = useStore((s) => s.setUi);
-
-  const [cell, setCell] = useState("0.05");
-  const [layer, setLayer] = useState<GridLayer>("max");
-  const [zMin, setZMin] = useState("-0.5");
-  const [zMax, setZMax] = useState("2.5");
-  const [fitToData, setFitToData] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const fitToData = useStore((s) => s.fitColours);
   const [hover, setHover] = useState<{ x: number; y: number; v: number; ix: number; iy: number } | null>(null);
-
-  // seed the form from the server config once it arrives
-  const seeded = useRef(false);
-  useEffect(() => {
-    if (config && !seeded.current) {
-      seeded.current = true;
-      setCell(String(config.grid.cell_m));
-      setLayer(config.grid.layer);
-      setZMin(String(config.grid.z_min_m));
-      setZMax(String(config.grid.z_max_m));
-    }
-  }, [config]);
 
   const range = useMemo(() => (grid ? colourRange(grid, fitToData) : ([0, 1] as [number, number])), [grid, fitToData]);
   const image = useMemo(() => (grid ? renderGrid(grid, range) : null), [grid, range]);
@@ -109,6 +106,13 @@ export function HeightMapPanel() {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fitRef = useRef<Fit | null>(null);
+
+  useEffect(() => {
+    canvasRegistry.el = canvasRef.current;
+    return () => {
+      if (canvasRegistry.el === canvasRef.current) canvasRegistry.el = null;
+    };
+  }, []);
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -209,109 +213,17 @@ export function HeightMapPanel() {
     });
   };
 
-  const apply = async () => {
-    setErr(null);
-    setBusy(true);
-    const q = {
-      cell: Number(cell),
-      layer,
-      z_min: zMin === "" ? null : Number(zMin),
-      z_max: zMax === "" ? null : Number(zMax),
-    };
-    try {
-      if (config) {
-        const next = {
-          ...config,
-          grid: {
-            cell_m: q.cell,
-            layer,
-            z_min_m: q.z_min ?? config.grid.z_min_m,
-            z_max_m: q.z_max ?? config.grid.z_max_m,
-          },
-        };
-        setConfig(await api.putConfig(next));
-        setUi({ colorZ: [next.grid.z_min_m, next.grid.z_max_m] });
-      }
-      setGrid(await api.grid(q));
-    } catch (e) {
-      setErr(errorText(e));
-      clientLog("error", `grid: ${errorText(e)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
   let filled = 0;
   if (grid) for (let i = 0; i < grid.data.length; i++) if (Number.isFinite(grid.data[i])) filled++;
 
   return (
-    <section className="panel">
+    <section className="panel ops-right">
       <div className="panel-head">
         <span>2.5D height map</span>
         <span className="sub">
           {grid ? `${grid.w}×${grid.h} @ ${+grid.cell_m.toFixed(3)} m · ${grid.layer} · ${fmtInt(filled)} cells` : "no grid"}
         </span>
       </div>
-      <div className="canvas-toolbar">
-        <label>
-          Cell m
-          <input type="number" step={0.01} min={0.01} value={cell} onChange={(e) => setCell(e.target.value)} />
-        </label>
-        <label>
-          Layer
-          <select value={layer} onChange={(e) => setLayer(e.target.value as GridLayer)}>
-            {GRID_LAYERS.map((l) => (
-              <option key={l} value={l}>
-                {l}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          z min
-          <input type="number" step={0.1} value={zMin} onChange={(e) => setZMin(e.target.value)} />
-        </label>
-        <label>
-          z max
-          <input type="number" step={0.1} value={zMax} onChange={(e) => setZMax(e.target.value)} />
-        </label>
-        <button className="small primary" disabled={busy} onClick={apply} title="PUT /api/config then GET /api/grid">
-          Apply
-        </button>
-        <span className="spacer" />
-        <label className="inline-check" title="Colour range from the data instead of z min/max">
-          <input type="checkbox" checked={fitToData} onChange={(e) => setFitToData(e.target.checked)} />
-          fit colours
-        </label>
-        <label className="inline-check">
-          <input type="checkbox" checked={showSurface} onChange={(e) => setUi({ showSurface: e.target.checked })} />
-          surface in 3D
-        </label>
-        <button
-          className="small"
-          disabled={!grid}
-          title="Download the map as a PNG for the report"
-          onClick={() => {
-            const c = canvasRef.current;
-            if (!c || !grid) return;
-            c.toBlob((blob) => {
-              if (!blob) return;
-              const a = document.createElement("a");
-              a.href = URL.createObjectURL(blob);
-              a.download = `heightmap-${grid.layer}-${grid.cell_m}m.png`;
-              a.click();
-              URL.revokeObjectURL(a.href);
-            });
-          }}
-        >
-          PNG
-        </button>
-      </div>
-      {err && (
-        <div className="error" style={{ padding: "0 8px" }}>
-          {err}
-        </div>
-      )}
       <div className="heightmap-wrap" ref={wrapRef}>
         <canvas ref={canvasRef} onMouseMove={onMove} onMouseLeave={() => setHover(null)} />
         {hover && (
@@ -328,6 +240,75 @@ export function HeightMapPanel() {
         <span className="dim">{grid?.layer === "count" ? "points per cell" : "z (m)"}</span>
       </div>
       <MetricsLine />
+    </section>
+  );
+}
+
+// Cell size, layer, z range and Apply (PUT /api/config then GET /api/grid),
+// plus the colour options. Advanced drawer of the point cloud tab.
+export function HeightMapControls() {
+  const form = useStore((s) => s.gridForm);
+  const fitColours = useStore((s) => s.fitColours);
+  const showSurface = useStore((s) => s.showSurface);
+  const setUi = useStore((s) => s.setUi);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const set = (p: Partial<typeof form>) => setUi({ gridForm: { ...form, ...p } });
+  const apply = async () => {
+    setErr(null);
+    setBusy(true);
+    try {
+      await applyGridForm();
+    } catch (e) {
+      setErr(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <span>Height map</span>
+      </div>
+      <div className="panel-body">
+        <div className="field">
+          <label>Cell m</label>
+          <input type="number" step={0.01} min={0.01} value={form.cell} onChange={(e) => set({ cell: e.target.value })} />
+        </div>
+        <div className="field">
+          <label>Layer</label>
+          <select value={form.layer} onChange={(e) => set({ layer: e.target.value as GridLayer })}>
+            {GRID_LAYERS.map((l) => (
+              <option key={l} value={l}>
+                {l}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label>z min / max</label>
+          <div className="row">
+            <input type="number" step={0.1} value={form.zMin} onChange={(e) => set({ zMin: e.target.value })} />
+            <input type="number" step={0.1} value={form.zMax} onChange={(e) => set({ zMax: e.target.value })} />
+          </div>
+        </div>
+        <div className="btn-row">
+          <button className="primary" disabled={busy} onClick={() => void apply()} title="PUT /api/config then GET /api/grid">
+            Apply
+          </button>
+        </div>
+        {err && <div className="error">{err}</div>}
+        <label className="inline-check" style={{ marginTop: 8 }} title="Colour range from the data instead of z min/max">
+          <input type="checkbox" checked={fitColours} onChange={(e) => setUi({ fitColours: e.target.checked })} />
+          fit colours to the data
+        </label>
+        <label className="inline-check" style={{ marginTop: 4 }}>
+          <input type="checkbox" checked={showSurface} onChange={(e) => setUi({ showSurface: e.target.checked })} />
+          surface in 3D
+        </label>
+      </div>
     </section>
   );
 }

@@ -7,6 +7,7 @@ import { useStore } from "../store/store";
 import { OpsAdvanced } from "./OpsAdvanced";
 import { OpsMap, type OpsMapHandle } from "./OpsMap";
 import { OpsSummary } from "./OpsSummary";
+import { Shell, type BigNumber } from "./Shell";
 
 // The Operator tab, simple view: three numbers, one map, what we have, three
 // buttons. Everything else sits behind Advanced.
@@ -109,27 +110,27 @@ export function OpsTab() {
     );
   }
 
-  return (
-    <div className="ops-simple">
-      <div className={"bignums ops-top" + (scan.scanning ? " scanning" : "")}>
-        <div className="bignum">
-          <div className="label">Seen</div>
-          <div className="value">
-            {haveAnalysis ? fmt(findings!.coverage.coverage_pct, 0) : "–"}
-            {haveAnalysis && <small>%</small>}
-          </div>
-        </div>
-        <div className="bignum">
-          <div className="label">Possible voids</div>
-          <div className="value">{haveAnalysis ? findings!.voids.length : "–"}</div>
-        </div>
-        <div className="bignum">
-          <div className="label">Next</div>
-          <div className="value ops-next">{nextStationText(findings)}</div>
-        </div>
-      </div>
+  const numbers: BigNumber[] = [
+    {
+      label: "Seen",
+      value: haveAnalysis ? (
+        <>
+          {fmt(findings!.coverage.coverage_pct, 0)}
+          <small>%</small>
+        </>
+      ) : (
+        "–"
+      ),
+    },
+    { label: "Possible voids", value: haveAnalysis ? findings!.voids.length : "–" },
+    { label: "Next", value: nextStationText(findings), className: "ops-next" },
+  ];
 
-      <div className="ops-main">
+  return (
+    <Shell
+      numbers={numbers}
+      numbersDim={scan.scanning}
+      main={
         <section className="panel ops-mappanel">
           {alarms.length > 0 && <div className="ops-alarm">{alarms.join(" · ")}</div>}
           {error && <div className="ops-alarm">analysis: {error}</div>}
@@ -165,30 +166,28 @@ export function OpsTab() {
             <div className="empty ops-connect">Connect the LiDAR and servo on the Live scan tab</div>
           )}
         </section>
-        <OpsSummary />
-      </div>
-
-      <div className="ops-actions">
-        <button className="primary" disabled={!connected || scan.scanning || scanBusy} onClick={() => void doScan()} title="Sweep with the Scan job settings">
-          Scan
-        </button>
-        {scanningText && <span className="mono dim">{scanningText}</span>}
-        {scanErr && <span className="err mono">{scanErr}</span>}
-        <button className={routeMode ? "toggled" : ""} disabled={!layers || layers.w === 0} onClick={onRoute}>
-          {routeLabel}
-        </button>
-        <span className="mono ops-route-text">{routeLine}</span>
-        <button disabled={!haveAnalysis} onClick={() => void report()} title="Download the map as PNG and the findings as JSON">
-          Report
-        </button>
-        {loading && <span className="dim">analysing</span>}
-        <span className="spacer" />
-        <button className="ops-adv-toggle" onClick={() => setAdvanced(!advanced)} aria-expanded={advanced}>
-          Advanced {advanced ? "▾" : "▸"}
-        </button>
-      </div>
-
-      {advanced && <OpsAdvanced />}
-    </div>
+      }
+      side={<OpsSummary />}
+      actions={
+        <>
+          <button className="primary" disabled={!connected || scan.scanning || scanBusy} onClick={() => void doScan()} title="Sweep with the Scan job settings">
+            Scan
+          </button>
+          {scanningText && <span className="mono dim">{scanningText}</span>}
+          {scanErr && <span className="err mono">{scanErr}</span>}
+          <button className={routeMode ? "toggled" : ""} disabled={!layers || layers.w === 0} onClick={onRoute}>
+            {routeLabel}
+          </button>
+          <span className="mono ops-route-text">{routeLine}</span>
+          <button disabled={!haveAnalysis} onClick={() => void report()} title="Download the map as PNG and the findings as JSON">
+            Report
+          </button>
+          {loading && <span className="dim">analysing</span>}
+        </>
+      }
+      advanced={<OpsAdvanced />}
+      advancedOpen={advanced}
+      onAdvanced={setAdvanced}
+    />
   );
 }
