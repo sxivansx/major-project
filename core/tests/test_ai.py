@@ -17,8 +17,8 @@ def fake_openrouter(prose: str = "Scan covers 12.5 m² at 83% coverage. One poss
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        calls.append((request.url.path, body))
-        if request.url.path.endswith("/alpha/decisions"):
+        calls.append((request.url.host + request.url.path, body))
+        if request.url.path.endswith("/alpha/decisions") or request.url.path.endswith("/v1/systemone"):
             answers = {}
             state = json.dumps(body["state"]).lower()
             question = str(body["state"].get("question", "")).lower() if isinstance(body["state"], dict) else ""
@@ -33,7 +33,10 @@ def fake_openrouter(prose: str = "Scan covers 12.5 m² at 83% coverage. One poss
                     if name == "intent":
                         pick = "route" if "reach" in question or "route" in question else ("sitrep" if "summary" in question else "other")
                     answers[name] = {"type": "choice", "choice": pick, "confidence": 0.9, "probabilities": {o: (0.9 if o == pick else 0.1) for o in opts}}
-            return httpx.Response(200, json={"id": "x", "model": body["model"], "answers": answers, "usage": {"input_tokens": 500, "output_tokens": 10, "cost": 0.00002}})
+            usage = {"input_tokens": 500, "output_tokens": 10}
+            if "openrouter" in request.url.host:
+                usage["cost"] = 0.00002  # TypeSafe's own API reports tokens only
+            return httpx.Response(200, json={"id": "x", "model": body["model"], "answers": answers, "usage": usage})
         if request.url.path.endswith("/v1/chat/completions"):
             return httpx.Response(200, json={"choices": [{"message": {"content": prose}}], "usage": {"cost": 0.0001}})
         return httpx.Response(404, json={"error": "no"})
@@ -41,8 +44,29 @@ def fake_openrouter(prose: str = "Scan covers 12.5 m² at 83% coverage. One poss
     return httpx.MockTransport(handler), calls
 
 
-def client_with(transport):
-    return AIClient(key="test-key", transport=transport)
+def client_with(transport, typesafe_key: str = ""):
+    return AIClient(key="test-key", typesafe_key=typesafe_key, transport=transport)
+
+
+def test_typesafe_direct_for_decisions_and_prose_template_without_openrouter(tmp_path):
+    transport, calls = fake_openrouter()
+    ai = AIClient(key="", typesafe_key="ts-key", transport=transport)
+    s = ai.status()
+    assert s["available"] and s["decisions"]["provider"] == "typesafe" and s["decisions"]["model"] == "jev-latest"
+    assert s["prose"]["available"] is False and "Gemini" in s["reason"]
+    app = create_app(config_path=tmp_path / "c.json", sessions_dir=tmp_path / "s", web_dist=tmp_path / "nope", sim_hz=60, ai_client=ai)
+    with TestClient(app) as c:
+        c.calls = calls
+        run_sim_sweep(c)
+        t = c.post("/api/ai/triage", json={"cell": 0.1}).json()
+        assert t["items"] and t["cost_usd"] == pytest.approx(500 * 0.042 / 1e6)
+        path, body = calls[-1]
+        assert path.endswith("/v1/systemone") and body["model"] == "jev-latest"
+        assert calls[-1] and "typesafe.ai" in str(calls)  # went direct, not via OpenRouter
+        r = c.post("/api/ai/sitrep", json={}).json()
+        assert r["model"] == "template"
+        a = c.post("/api/ai/ask", json={"question": "give me a summary"}).json()
+        assert a["intent"] == "sitrep" and a["answer"] and "no prose" not in a["answer"]
 
 
 @pytest.fixture
@@ -64,7 +88,7 @@ def run_sim_sweep(c):
 
 
 def test_unavailable_without_key(tmp_path):
-    ai = AIClient(key="", transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    ai = AIClient(key="", typesafe_key="", transport=httpx.MockTransport(lambda r: httpx.Response(500)))
     assert ai.available is False and ai.status()["available"] is False
     with pytest.raises(AIError, match="unavailable"):
         ai.decide("x", {})
@@ -127,7 +151,7 @@ def test_ask_routes_to_a_tool(app_client):
 
 
 def test_openrouter_errors_become_502(tmp_path):
-    ai = AIClient(key="k", transport=httpx.MockTransport(lambda r: httpx.Response(429, json={"error": "rate"})))
+    ai = AIClient(key="k", typesafe_key="", transport=httpx.MockTransport(lambda r: httpx.Response(429, json={"error": "rate"})))
     app = create_app(config_path=tmp_path / "c.json", sessions_dir=tmp_path / "s", web_dist=tmp_path / "nope", ai_client=ai)
     with TestClient(app) as c:
         r = c.post("/api/ai/triage", json={})

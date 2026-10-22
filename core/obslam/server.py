@@ -283,7 +283,7 @@ def create_app(
     async def ai_sitrep(body: AIRequest):
         res = await asyncio.to_thread(run_analysis, ops_params(body.cell, None, None))
         tri = None
-        if ai.available:
+        if ai.decisions_available:
             try:
                 tri = await asyncio.to_thread(ai_mod.triage, ai, res.findings)
             except ai_mod.AIError as e:

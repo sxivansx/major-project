@@ -1,5 +1,6 @@
 """AI layer over the findings: Jev (TypeSafe, typed decisions) for every judgment call, Gemini Flash
-for prose. Both through OpenRouter with one key. Inputs are the findings dict, never points.
+for prose. Jev goes to TypeSafe directly (TYPESAFE_API_KEY) or to OpenRouter; Gemini goes through
+OpenRouter (OPENROUTER_API_KEY). Inputs are the findings dict, never points.
 
 Guardrails: Jev cannot write text, so every ranking reason is a template over the finding's own
 numbers. Prose is checked after generation; if it claims a person ("survivor"), the deterministic
@@ -22,7 +23,8 @@ log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = ROOT / "core" / ".env"
 OPENROUTER = "https://openrouter.ai/api"
-DECISIONS_MODEL = os.environ.get("OBSLAM_DECISIONS_MODEL", "typesafe/jev-1.14")
+TYPESAFE = "https://api.typesafe.ai"
+JEV_USD_PER_INPUT_TOKEN = 0.042 / 1e6  # TypeSafe list price; its API reports tokens, not cost
 PROSE_MODEL = os.environ.get("OBSLAM_PROSE_MODEL", "google/gemini-3.5-flash")
 
 FORBIDDEN = re.compile(r"\b(survivor|victim|casualt|body|bodies|person is|people are)\b", re.I)
@@ -32,65 +34,94 @@ class AIError(Exception):
     pass
 
 
-def load_key() -> str | None:
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if key:
-        return key.strip()
+def load_env(name: str) -> str | None:
+    val = os.environ.get(name)
+    if val:
+        return val.strip()
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
             line = line.strip()
-            if line.startswith("OPENROUTER_API_KEY="):
+            if line.startswith(f"{name}="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'") or None
     return None
 
 
 class AIClient:
+    """Decisions go to TypeSafe directly when TYPESAFE_API_KEY is set, else to Jev on OpenRouter.
+    Prose always goes to OpenRouter. Either key may be missing; each half degrades on its own."""
+
     def __init__(
         self,
         key: str | None = None,
-        decisions_model: str = DECISIONS_MODEL,
+        typesafe_key: str | None = None,
+        decisions_model: str | None = None,
         prose_model: str = PROSE_MODEL,
         transport: httpx.BaseTransport | None = None,
         timeout: float = 40.0,
     ):
-        self.key = key if key is not None else load_key()
-        self.decisions_model = decisions_model
+        self.key = key if key is not None else load_env("OPENROUTER_API_KEY")
+        self.typesafe_key = typesafe_key if typesafe_key is not None else load_env("TYPESAFE_API_KEY")
+        default_model = "jev-latest" if self.typesafe_key else "typesafe/jev-1.14"
+        self.decisions_model = decisions_model or os.environ.get("OBSLAM_DECISIONS_MODEL") or default_model
         self.prose_model = prose_model
-        headers = {"HTTP-Referer": "https://github.com/sxivansx/major-project", "X-Title": "major-project"}
-        if self.key:
-            headers["Authorization"] = f"Bearer {self.key}"
-        self._http = httpx.Client(base_url=OPENROUTER, timeout=timeout, transport=transport, headers=headers)
+        self._http = httpx.Client(timeout=timeout, transport=transport)
+
+    @property
+    def decisions_available(self) -> bool:
+        return bool(self.typesafe_key or self.key)
+
+    @property
+    def prose_available(self) -> bool:
+        return bool(self.key)
 
     @property
     def available(self) -> bool:
-        return bool(self.key)
+        return self.decisions_available
 
     def status(self) -> dict:
+        provider = "typesafe" if self.typesafe_key else ("openrouter" if self.key else None)
+        reasons = []
+        if not self.decisions_available:
+            reasons.append("no TYPESAFE_API_KEY or OPENROUTER_API_KEY for Jev")
+        if not self.prose_available:
+            reasons.append("no OPENROUTER_API_KEY for Gemini (sitrep and answers use templates)")
         return {
-            "available": self.available,
-            "reason": None if self.available else "no OPENROUTER_API_KEY in the environment or core/.env",
+            "available": self.decisions_available,
+            "reason": "; ".join(reasons) if reasons else None,
             "models": {"decisions": self.decisions_model, "prose": self.prose_model},
+            "decisions": {"available": self.decisions_available, "provider": provider, "model": self.decisions_model},
+            "prose": {"available": self.prose_available, "provider": "openrouter" if self.key else None, "model": self.prose_model},
         }
 
-    def _post(self, path: str, body: dict) -> dict:
-        if not self.available:
-            raise AIError("AI layer unavailable: no OPENROUTER_API_KEY")
+    def _post(self, url: str, body: dict, token: str, who: str) -> dict:
+        headers = {"Authorization": f"Bearer {token}", "HTTP-Referer": "https://github.com/sxivansx/major-project", "X-Title": "major-project"}
         try:
-            r = self._http.post(path, json=body)
+            r = self._http.post(url, json=body, headers=headers)
         except httpx.HTTPError as e:
-            raise AIError(f"OpenRouter unreachable: {e}") from e
+            raise AIError(f"{who} unreachable: {e}") from e
         if r.status_code >= 400:
-            raise AIError(f"OpenRouter {r.status_code}: {r.text[:300]}")
+            raise AIError(f"{who} {r.status_code}: {r.text[:300]}")
         return r.json()
 
     def decide(self, state, questions: dict) -> tuple[dict, float]:
         """Jev: one state, many typed questions. Returns (answers by name, cost in USD)."""
-        data = self._post("/alpha/decisions", {"model": self.decisions_model, "state": state, "questions": questions})
-        return data.get("answers", {}), float((data.get("usage") or {}).get("cost") or 0.0)
+        if not self.decisions_available:
+            raise AIError("AI layer unavailable: no TYPESAFE_API_KEY or OPENROUTER_API_KEY")
+        body = {"model": self.decisions_model, "state": state, "questions": questions}
+        if self.typesafe_key:
+            data = self._post(f"{TYPESAFE}/v1/systemone", body, self.typesafe_key, "TypeSafe")
+            usage = data.get("usage") or {}
+            cost = float(usage.get("cost") or (usage.get("input_tokens") or 0) * JEV_USD_PER_INPUT_TOKEN)
+        else:
+            data = self._post(f"{OPENROUTER}/alpha/decisions", body, self.key, "OpenRouter")
+            cost = float((data.get("usage") or {}).get("cost") or 0.0)
+        return data.get("answers", {}), cost
 
     def complete(self, system: str, user: str, max_tokens: int = 500, temperature: float = 0.2) -> tuple[str, float]:
+        if not self.prose_available:
+            raise AIError("prose unavailable: no OPENROUTER_API_KEY")
         data = self._post(
-            "/v1/chat/completions",
+            f"{OPENROUTER}/v1/chat/completions",
             {
                 "model": self.prose_model,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -98,6 +129,8 @@ class AIClient:
                 "temperature": temperature,
                 "usage": {"include": True},
             },
+            self.key,
+            "OpenRouter",
         )
         try:
             text = data["choices"][0]["message"]["content"]
@@ -226,7 +259,7 @@ def template_sitrep(findings: dict, triage_result: dict | None = None) -> str:
 def sitrep(ai: AIClient, findings: dict, triage_result: dict | None = None) -> dict:
     facts = facts_from(findings)
     fallback = template_sitrep(findings, triage_result)
-    if not ai.available:
+    if not ai.prose_available:
         return {"text": fallback, "facts": facts, "model": "template", "cost_usd": 0.0, "note": ai.status()["reason"]}
     user = json.dumps({"context": CONTEXT, "facts": facts, "assistant_ranking": (triage_result or {}).get("items", [])[:6], "rescan": (triage_result or {}).get("rescan")})
     try:
@@ -255,6 +288,31 @@ ANSWER_SYSTEM = (
     "result and facts given. Never claim a person is present; never use the words survivor, victim, body. "
     "If the tool result says something was not found or not possible, say so plainly. No markdown."
 )
+
+
+def template_answer(intent: str, tool: dict) -> str:
+    """Plain-words answer from the tool result when no prose model is configured."""
+    if intent == "route":
+        r = tool.get("route") or {}
+        if r.get("found"):
+            return f"Route to {tool.get('target')}: {r['length_m']} m, {r['verdict']}, max step {r['max_step_m']} m."
+        return f"No passable route to {tool.get('target')}: {r.get('reason', 'unknown')}."
+    if intent == "measure":
+        m = tool.get("measure") or {}
+        return f"{m.get('id')}: {m.get('distance_m')} m away at {m.get('bearing_deg')}°, {m.get('area_m2')} m²."
+    if intent == "list_voids":
+        v = tool.get("voids") or []
+        return f"{len(v)} possible void(s): " + "; ".join(f"{i['id']} {i['area_m2']} m² at {i['distance_m']} m / {i['bearing_deg']:.0f}°" for i in v[:5]) if v else "No covered voids detected."
+    if intent == "list_obstacles":
+        o = tool.get("obstacles") or []
+        return f"{len(o)} obstacle(s): " + "; ".join(f"{i['id']} {i['height_m']} m high at {i['distance_m']} m / {i['bearing_deg']:.0f}°" for i in o[:5]) if o else "No obstacles detected."
+    if intent == "coverage":
+        c = tool.get("coverage") or {}
+        ns = tool.get("next_station")
+        return f"Coverage {c.get('coverage_pct')}% of the observable area; {c.get('shadow_cells')} shadow, {c.get('blind_cells')} blind, {c.get('unknown_cells')} unknown cells." + (f" Next station: {ns['reason']}." if ns else "")
+    if intent == "sitrep":
+        return tool.get("sitrep", "")
+    return "No prose model configured; see the tool result."
 
 
 def ask(ai: AIClient, question: str, findings: dict, route_to: Callable[[float, float], dict | None]) -> dict:
@@ -289,11 +347,14 @@ def ask(ai: AIClient, question: str, findings: dict, route_to: Callable[[float, 
         tool["sitrep"] = template_sitrep(findings)
     else:
         tool["facts"] = facts
-    try:
-        answer, cost2 = ai.complete(ANSWER_SYSTEM, json.dumps({"question": question, "tool_result": tool}), max_tokens=300)
-        cost += cost2
-        if FORBIDDEN.search(answer):
-            answer = "Assistant answer withheld by the guardrail; see the tool result."
-    except AIError as e:
-        answer = f"(no prose: {e})"
+    if ai.prose_available:
+        try:
+            answer, cost2 = ai.complete(ANSWER_SYSTEM, json.dumps({"question": question, "tool_result": tool}), max_tokens=300)
+            cost += cost2
+            if FORBIDDEN.search(answer):
+                answer = "Assistant answer withheld by the guardrail; see the tool result."
+        except AIError as e:
+            answer = f"(no prose: {e})"
+    else:
+        answer = template_answer(intent, tool)
     return {"intent": intent, "confidence": round(conf, 3), "target": tool["target"], "tool": tool, "answer": answer, "cost_usd": round(cost, 6)}
