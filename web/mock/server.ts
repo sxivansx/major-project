@@ -38,6 +38,9 @@ const status: Status = {
   session_loaded: null,
 };
 
+// The ESP32-S3 Wi-Fi relay: tcp://host:8899 (lidar) and tcp://host:8900 (servo)
+const isTcpPort = (p: string | undefined) => /^tcp:\/\/[^/\s:]+:\d+$/i.test(p ?? "");
+
 const FAKE_PORTS = [
   { path: "/dev/cu.usbserial-0001", description: "CP2102N USB to UART Bridge Controller" },
   { path: "/dev/cu.usbmodem1101", description: "USB JTAG/serial debug unit" },
@@ -209,7 +212,7 @@ function buildSweep(name: string, phiStart: number, phiEnd: number, phiStep: num
     phi_end: phiEnd,
     phi_step: phiStep,
     rotations,
-    lidar: { model: "S2M1", serial: "A1B2C3D4E5F6" },
+    lidar: { model: "S3", serial: "A1B2C3D4E5F6" },
     mount: { ...config.mount },
   };
   return { meta, xyz, phi: phiA, theta, range, quality } as SessionData;
@@ -416,7 +419,7 @@ async function runJob(req: JobRequest, jobId: number) {
         phi_end: req.phi_end,
         phi_step: req.phi_step,
         rotations: req.rotations,
-        lidar: { model: "S2M1", serial: "A1B2C3D4E5F6" },
+        lidar: { model: "S3", serial: "A1B2C3D4E5F6" },
         mount: { ...config.mount },
       },
       xyz,
@@ -539,14 +542,14 @@ async function handleApi(req: Request, path: string): Promise<Response> {
   if (path === "/lidar/connect" && m === "POST") {
     const b = await body<{ source?: string; port?: string; baud?: number }>(req);
     if (b.source !== "s2" && b.source !== "sim") return err(422, "source must be s2 or sim");
-    if (b.source === "s2" && !FAKE_PORTS.some((p) => p.path === b.port)) return err(404, `port ${b.port ?? ""} not found`);
+    if (b.source === "s2" && !FAKE_PORTS.some((p) => p.path === b.port) && !isTcpPort(b.port)) return err(404, `port ${b.port ?? ""} not found`);
     await sleep(300);
     status.lidar = {
       connected: true,
       source: b.source,
       port: b.source === "sim" ? "sim" : b.port,
       baud: b.baud ?? 1000000,
-      model: "S2M1",
+      model: "S3",
       serial: "A1B2C3D4E5F6",
       firmware: "1.02",
       hardware: 18,
@@ -572,7 +575,7 @@ async function handleApi(req: Request, path: string): Promise<Response> {
 
   if (path === "/servo/connect" && m === "POST") {
     const b = await body<{ port?: string }>(req);
-    if (b.port !== "sim" && !FAKE_PORTS.some((p) => p.path === b.port)) return err(404, `port ${b.port ?? ""} not found`);
+    if (b.port !== "sim" && !FAKE_PORTS.some((p) => p.path === b.port) && !isTcpPort(b.port)) return err(404, `port ${b.port ?? ""} not found`);
     await sleep(200);
     status.servo = { connected: true, port: b.port };
     refreshServoStatus();

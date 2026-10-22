@@ -10,21 +10,63 @@ import { fmt, fmtInt, text } from "../lib/format";
 
 export const SIM = "sim";
 
-function PortSelect({ value, onChange, disabled, sim }: { value: string; onChange: (v: string) => void; disabled?: boolean; sim?: boolean }) {
+// The ESP32-S3 can relay the lidar and the tilt servo over Wi-Fi; the core
+// then takes tcp://host:8899 as the lidar port and tcp://host:8900 as the
+// servo port, so the pickers accept a typed value as well as a detected port.
+export const WIFI_HINT = "Over Wi-Fi: the ESP32 prints its IP on its USB serial; LiDAR on port 8899, tilt on 8900.";
+export const isTcpPort = (p: string) => /^tcp:\/\//i.test(p.trim());
+
+const PORT_KEYS = { lidar: "obslam.port.lidar", servo: "obslam.port.servo" };
+function loadPort(key: string): string {
+  try {
+    return localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+function savePort(key: string, v: string): void {
+  try {
+    localStorage.setItem(key, v);
+  } catch {
+    // private window or storage blocked: the value just does not persist
+  }
+}
+
+function PortField({
+  id,
+  value,
+  onChange,
+  disabled,
+  placeholder,
+  sim,
+}: {
+  id: string;
+  value: string;
+  onChange: (v: string) => void;
+  disabled?: boolean;
+  placeholder: string;
+  sim?: boolean;
+}) {
   const ports = useStore((s) => s.ports);
   const [busy, setBusy] = useState(false);
   return (
     <div className="sensor-row">
-      <select value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
-        {sim && <option value={SIM}>sim (no hardware)</option>}
-        {!sim && ports.length === 0 && <option value="">(no ports found)</option>}
+      <input
+        className="mono"
+        list={id}
+        value={value}
+        disabled={disabled}
+        placeholder={placeholder}
+        spellCheck={false}
+        autoComplete="off"
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <datalist id={id}>
+        {sim && <option value={SIM} label="no hardware" />}
         {ports.map((p) => (
-          <option key={p.path} value={p.path}>
-            {p.path}
-            {p.description ? ` (${p.description})` : ""}
-          </option>
+          <option key={p.path} value={p.path} label={p.description} />
         ))}
-      </select>
+      </datalist>
       <button
         className="small"
         disabled={busy}
@@ -40,25 +82,32 @@ function PortSelect({ value, onChange, disabled, sim }: { value: string; onChang
   );
 }
 
-// Source, port, baud and the Connect button for the lidar.
+// Source, port, baud and the Connect button for the lidar. The port is a
+// detected serial port or a typed tcp://host:8899 (Wi-Fi relay); the last
+// value is remembered.
 export function LidarConnect() {
   const ports = useStore((s) => s.ports);
   const [source, setSource] = useState<"s2" | "sim">("s2");
-  const [port, setPort] = useState("");
+  const [port, setPortState] = useState(() => loadPort(PORT_KEYS.lidar));
   const [baud, setBaud] = useState(1000000);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const setPort = (v: string) => {
+    setPortState(v);
+    savePort(PORT_KEYS.lidar, v);
+  };
 
-  // pick the first port once the list arrives, unless the user already chose
+  // pick the first detected port once the list arrives, unless something was typed or remembered
   useEffect(() => {
-    if (!port && ports.length) setPort(ports[0].path);
+    if (!port && ports.length) setPortState(ports[0].path);
   }, [ports, port]);
 
+  const tcp = isTcpPort(port);
   const connect = async () => {
     setErr(null);
     setBusy(true);
     try {
-      await connectLidar({ source, port: source === "sim" ? SIM : port, baud });
+      await connectLidar({ source, port: source === "sim" ? SIM : port.trim(), baud });
     } catch (e) {
       setErr(errorText(e));
     } finally {
@@ -76,15 +125,21 @@ export function LidarConnect() {
         <input
           type="number"
           value={baud}
-          disabled={source === "sim"}
-          title="Baud"
+          disabled={source === "sim" || tcp}
+          title={tcp ? "Baud does not apply over Wi-Fi" : "Baud"}
           style={{ width: 96 }}
           onChange={(e) => setBaud(Number(e.target.value))}
         />
       </div>
-      <PortSelect value={port} onChange={setPort} disabled={source === "sim"} />
+      <PortField
+        id="lidar-ports"
+        value={port}
+        onChange={setPort}
+        disabled={source === "sim"}
+        placeholder="/dev/cu.usbserial-… or tcp://192.168.4.7:8899"
+      />
       <div className="sensor-row">
-        <button className="primary" disabled={busy || (source === "s2" && !port)} onClick={() => void connect()}>
+        <button className="primary" disabled={busy || (source === "s2" && !port.trim())} onClick={() => void connect()}>
           Connect LiDAR
         </button>
       </div>
@@ -93,17 +148,22 @@ export function LidarConnect() {
   );
 }
 
-// Port and the Connect button for the ESP32 tilt servo.
+// Port and the Connect button for the ESP32 tilt servo: a detected serial
+// port, "sim", or a typed tcp://host:8900 (Wi-Fi relay); remembered.
 export function ServoConnect() {
-  const [port, setPort] = useState(SIM);
+  const [port, setPortState] = useState(() => loadPort(PORT_KEYS.servo) || SIM);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const setPort = (v: string) => {
+    setPortState(v);
+    savePort(PORT_KEYS.servo, v);
+  };
 
   const connect = async () => {
     setErr(null);
     setBusy(true);
     try {
-      await connectServo(port);
+      await connectServo(port.trim());
     } catch (e) {
       setErr(errorText(e));
     } finally {
@@ -113,9 +173,9 @@ export function ServoConnect() {
 
   return (
     <div className="sensor-connect">
-      <PortSelect value={port} onChange={setPort} sim />
+      <PortField id="servo-ports" value={port} onChange={setPort} placeholder="sim, /dev/cu.usbmodem… or tcp://192.168.4.7:8900" sim />
       <div className="sensor-row">
-        <button className="primary" disabled={busy} onClick={() => void connect()}>
+        <button className="primary" disabled={busy || !port.trim()} onClick={() => void connect()}>
           Connect servo
         </button>
       </div>

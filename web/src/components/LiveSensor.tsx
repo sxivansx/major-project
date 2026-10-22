@@ -1,6 +1,6 @@
 import { fmt, fmtInt } from "../lib/format";
 import { useStore } from "../store/store";
-import { LidarConnect, ServoConnect } from "./ConnectionPanel";
+import { LidarConnect, ServoConnect, WIFI_HINT } from "./ConnectionPanel";
 import { TiltSlider } from "./ServoPanel";
 
 // "Sensor": what the hardware is doing, in sentences; the connect controls
@@ -49,6 +49,7 @@ export function LiveSensor() {
         {!lidar?.connected && <LidarConnect />}
         <div className="sensor-text">{servoText}</div>
         {!servo?.connected && <ServoConnect />}
+        {(!lidar?.connected || !servo?.connected) && <div className="hint">{WIFI_HINT}</div>}
         <div className="ops-ask-wrap">
           <TiltSlider />
         </div>
