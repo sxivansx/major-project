@@ -170,4 +170,139 @@ export interface GridFrame {
   data: Float32Array; // h * w, row-major, row = y, NaN = empty
 }
 
-export type BinaryFrame = ScanFrame | PointsFrame | GridFrame;
+export type BinaryFrame = ScanFrame | PointsFrame | GridFrame | OpsLayersFrame;
+
+// ---- operator layer: /api/ops/* and /api/ai/* (docs/api.md, section 3) ----
+
+// Cell classes in the kind-4 layers frame.
+export const CLASS_NAMES = ["unknown", "passable", "marginal", "blocked", "shadow", "blind"] as const;
+export type ClassName = (typeof CLASS_NAMES)[number];
+
+export interface OpsLayersFrame {
+  kind: 4;
+  w: number;
+  h: number;
+  cell_m: number;
+  x0_m: number;
+  y0_m: number;
+  classes: Uint8Array; // h * w, row-major, row = y
+  height: Float32Array; // h * w, metres above the fitted floor, NaN = not known
+}
+
+export interface OpsQuery {
+  cell?: number;
+  max_step?: number;
+  max_slope?: number;
+}
+
+// One region in the findings lists. height_m for obstacles, clearance_m for
+// voids, depth_m for depressions; shadows carry none of the three.
+export interface Finding {
+  id: string;
+  cells: number;
+  area_m2: number;
+  x_m: number;
+  y_m: number;
+  distance_m: number;
+  bearing_deg: number; // clockwise from +x
+  bbox_m: [number, number, number, number]; // x min, y min, x max, y max
+  height_m?: number;
+  clearance_m?: number;
+  depth_m?: number;
+}
+
+export type FindingKind = "voids" | "obstacles" | "depressions" | "shadows";
+export const FINDING_KINDS: FindingKind[] = ["voids", "obstacles", "depressions", "shadows"];
+
+export interface Findings {
+  scanner: { x_m: number; y_m: number; height_above_floor_m: number | null; note?: string };
+  points: number;
+  grid: { cell_m: number; w: number; h: number; x0_m: number; y0_m: number };
+  floor: { fitted: boolean; points: number; z_at_origin_m?: number; tilt_deg?: number; rms_mm?: number };
+  coverage: {
+    filled_cells: number;
+    interpolated_cells: number;
+    shadow_cells: number;
+    blind_cells: number;
+    unknown_cells: number;
+    observable_cells: number;
+    area_seen_m2: number;
+    coverage_pct: number;
+    floor_reach_m: number;
+    blind_stripe: { half_width_m: number; cells: number; note: string } | null;
+  };
+  traversability: {
+    passable: number;
+    marginal: number;
+    blocked: number;
+    shadow: number;
+    blind: number;
+    params: { max_step_m: number; max_slope_deg: number };
+  };
+  obstacles: Finding[];
+  voids: Finding[];
+  depressions: Finding[];
+  shadows: Finding[];
+  // bearing_deg is null when the advice is "rotate in place" (blind stripe).
+  next_station: { bearing_deg: number | null; distance_m: number; reason: string } | null;
+}
+
+export interface RouteRequest {
+  from_xy: [number, number];
+  to_xy: [number, number];
+  cell?: number;
+  max_step?: number;
+  max_slope?: number;
+}
+
+export type RouteResult =
+  | {
+      found: true;
+      start_snapped_m: number;
+      length_m: number;
+      cells: number;
+      marginal_cells: number;
+      verdict: "passable" | "marginal";
+      max_step_m: number;
+      path: [number, number][];
+    }
+  | { found: false; reason: string };
+
+export interface AiStatus {
+  available: boolean;
+  reason?: string;
+  models?: { decisions?: string; prose?: string };
+}
+
+export interface AiTriageItem {
+  id: string;
+  kind: string;
+  attention: number; // 0..1
+  confidence: number; // 0..1
+  why: string;
+}
+
+export interface AiTriage {
+  items: AiTriageItem[];
+  rescan: { recommended: boolean; p: number; confidence: number };
+  model?: string;
+  cost_usd?: number;
+}
+
+export interface AiSitrep {
+  text: string;
+  facts?: unknown;
+  model?: string;
+  cost_usd?: number;
+}
+
+export type AiIntent = "route" | "measure" | "list_voids" | "list_obstacles" | "coverage" | "sitrep" | "other";
+
+export interface AiAsk {
+  intent: AiIntent | string;
+  confidence: number;
+  tool?: unknown; // shape depends on intent; a route intent carries a RouteResult
+  answer: string;
+  model?: string;
+  cost_usd?: number;
+}

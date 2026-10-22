@@ -30,3 +30,9 @@ export function text(v: string | number | null | undefined): string {
   if (v === null || v === undefined || v === "") return "–";
   return String(v);
 }
+
+// Assistant call cost, e.g. $0.0003
+export function fmtUsd(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "–";
+  return "$" + v.toFixed(4);
+}

@@ -10,9 +10,10 @@
 // cloud and height map.
 
 import type { ServerWebSocket } from "bun";
-import { encodeGrid, encodePoints, encodeScan, encodeSessionPoints } from "../src/api/frames";
+import { encodeGrid, encodeOpsLayers, encodePoints, encodeScan, encodeSessionPoints } from "../src/api/frames";
 import type { Config, GridLayer, Job, JobRequest, SessionMeta, Status } from "../src/api/types";
-import { computeGrid, fakeScan, scanToPoints, type FakeScan, type Mount } from "./world";
+import { AI_MODELS, OPS_DEFAULTS, aiAsk, aiSitrep, aiTriage, analyze, nearestPassable, planRoute, type OpsParams, type OpsResult } from "./ops";
+import { computeGrid, fakeScan, filterQuality, scanToPoints, type FakeScan, type Mount } from "./world";
 
 const PORT = Number(process.env.PORT ?? 8000);
 const SCAN_PERIOD_MS = 100;
@@ -66,6 +67,9 @@ let scanTimer: ReturnType<typeof setInterval> | null = null;
 let nextJobId = 1;
 let stopRequested = false;
 let loadJobId = 1_000_000; // job_id used for replayed session chunks
+let jobPhiMax = 60; // |φ| reach of the last job's sweep (sets the blind stripe width)
+let sessionPhiMax = 60; // same for the loaded session
+let cloudVersion = 0; // bumped whenever the live cloud changes (analysis cache key)
 
 const sockets = new Set<ServerWebSocket<unknown>>();
 
@@ -169,7 +173,7 @@ function buildSweep(name: string, phiStart: number, phiEnd: number, phiStep: num
   let total = 0;
   for (const phi of steps) {
     for (let r = 0; r < rotations; r++) {
-      const scan = fakeScan(config.mount as Mount, phi, 3200, config.lidar.max_range_m);
+      const scan = filterQuality(fakeScan(config.mount as Mount, phi, 3200, config.lidar.max_range_m), config.lidar.min_quality);
       chunks.push({ phi, scan, xyz: scanToPoints(config.mount as Mount, phi, scan) });
       total += scan.n;
     }
@@ -233,10 +237,10 @@ function toPly(s: SessionData): string {
 
 function toCsv(s: SessionData): string {
   const n = s.meta.n_points;
-  const lines: string[] = ["phi,theta,range,quality,x,y,z"];
+  const lines: string[] = ["phi,phi_meas,theta,range,quality,x,y,z"];
   for (let i = 0; i < n; i++) {
     lines.push(
-      `${s.phi[i]},${s.theta[i].toFixed(3)},${s.range[i].toFixed(4)},${s.quality[i]},` +
+      `${s.phi[i]},${s.phi[i]},${s.theta[i].toFixed(3)},${s.range[i].toFixed(4)},${s.quality[i]},` +
         `${s.xyz[i * 3].toFixed(4)},${s.xyz[i * 3 + 1].toFixed(4)},${s.xyz[i * 3 + 2].toFixed(4)}`,
     );
   }
@@ -256,6 +260,41 @@ function gridFrame(xyz: Float32Array, n: number, q: URLSearchParams): ArrayBuffe
 
 let jobXyz = new Float32Array(0);
 let jobN = 0;
+
+// ---- operator products ----
+
+function liveCloud(): { xyz: Float32Array; n: number } {
+  if (status.session_loaded && sessions.has(status.session_loaded)) {
+    const s = sessions.get(status.session_loaded)!;
+    return { xyz: s.xyz, n: s.meta.n_points };
+  }
+  return { xyz: jobXyz, n: jobN };
+}
+
+function opsParamsFrom(get: (k: string) => string | number | null | undefined): OpsParams {
+  const num = (k: string, d: number) => {
+    const v = get(k);
+    if (v === null || v === undefined || v === "") return d;
+    const x = Number(v);
+    if (!Number.isFinite(x)) throw new RangeError(`${k} must be a number`);
+    return x;
+  };
+  const p = { cell: num("cell", OPS_DEFAULTS.cell), maxStep: num("max_step", OPS_DEFAULTS.maxStep), maxSlope: num("max_slope", OPS_DEFAULTS.maxSlope) };
+  if (!(p.cell > 0)) throw new RangeError("cell must be > 0");
+  return p;
+}
+
+let opsCache: { key: string; res: OpsResult } | null = null;
+function opsResult(p: OpsParams): OpsResult {
+  const key = `${p.cell}|${p.maxStep}|${p.maxSlope}|${cloudVersion}|${status.session_loaded ?? ""}`;
+  if (opsCache && opsCache.key === key) return opsCache.res;
+  const { xyz, n } = liveCloud();
+  const scannerZ = (config.mount.axis_z_mm + config.mount.h_mm) / 1000;
+  const phiMax = status.session_loaded && sessions.has(status.session_loaded) ? sessionPhiMax : jobPhiMax;
+  const res = analyze(xyz, n, p, scannerZ, phiMax);
+  opsCache = { key, res };
+  return res;
+}
 
 async function runJob(req: JobRequest, jobId: number) {
   const steps: number[] = [];
@@ -283,6 +322,8 @@ async function runJob(req: JobRequest, jobId: number) {
   status.session_loaded = null;
   jobXyz = new Float32Array(steps.length * req.rotations * 3400 * 3);
   jobN = 0;
+  jobPhiMax = Math.max(Math.abs(req.phi_start), Math.abs(req.phi_end)) || 60;
+  cloudVersion++;
   sendLog("info", `job ${jobId} "${req.name}": ${steps.length} steps from ${req.phi_start} to ${req.phi_end} by ${req.phi_step}`);
   sendStatus();
   sendJob();
@@ -302,7 +343,7 @@ async function runJob(req: JobRequest, jobId: number) {
     let pts = new Float32Array(0);
     for (let r = 0; r < req.rotations; r++) {
       await sleep(SCAN_PERIOD_MS);
-      const scan = lastScan ?? fakeScan(config.mount as Mount, phi, 3200, config.lidar.max_range_m);
+      const scan = filterQuality(lastScan ?? fakeScan(config.mount as Mount, phi, 3200, config.lidar.max_range_m), config.lidar.min_quality);
       const xyz = scanToPoints(config.mount as Mount, phi, scan);
       rec.push({ phi, scan });
       const merged = new Float32Array(pts.length + xyz.length);
@@ -322,6 +363,7 @@ async function runJob(req: JobRequest, jobId: number) {
     }
     jobXyz.set(pts, jobN * 3);
     jobN += n;
+    cloudVersion++;
     job.step = i + 1;
     job.points += n;
     job.eta_s = +((steps.length - job.step) * perStepS).toFixed(1);
@@ -459,6 +501,8 @@ function handleSession(id: string, rest: string, method: string, req: Request): 
     if (status.job?.state === "running") return err(409, "a job is running");
     status.session_loaded = id;
     status.live_points = s.meta.n_points;
+    sessionPhiMax = Math.max(Math.abs(s.meta.phi_start), Math.abs(s.meta.phi_end)) || 60;
+    cloudVersion++;
     const jobId = ++loadJobId;
     // replay as kind-2 chunks (<= 50k points), then a grid
     queueMicrotask(async () => {
@@ -596,6 +640,54 @@ async function handleApi(req: Request, path: string): Promise<Response> {
       return bin(gridFrame(s.xyz, s.meta.n_points, url.searchParams));
     }
     return bin(gridFrame(jobXyz, jobN, url.searchParams));
+  }
+
+  // ---- operator products ----
+  if ((path === "/ops/findings" || path === "/ops/layers") && m === "GET") {
+    let p: OpsParams;
+    try {
+      p = opsParamsFrom((k) => url.searchParams.get(k));
+    } catch (e) {
+      return err(400, (e as Error).message);
+    }
+    const res = opsResult(p);
+    if (path === "/ops/findings") return json(res.findings);
+    return bin(encodeOpsLayers({ w: res.w, h: res.h, cell_m: res.cell, x0_m: res.x0, y0_m: res.y0, classes: res.classes, height: res.rel }));
+  }
+  if (path === "/ops/route" && m === "POST") {
+    const b = await body<{ from_xy?: unknown; to_xy?: unknown; cell?: number; max_step?: number; max_slope?: number }>(req);
+    const xy = (v: unknown): [number, number] | null =>
+      Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === "number" && Number.isFinite(x)) ? [v[0], v[1]] : null;
+    const from = xy(b.from_xy);
+    const to = xy(b.to_xy);
+    if (!from || !to) return err(400, "from_xy and to_xy are [x, y] in metres");
+    let p: OpsParams;
+    try {
+      p = opsParamsFrom((k) => (b as Record<string, number | undefined>)[k]);
+    } catch (e) {
+      return err(400, (e as Error).message);
+    }
+    return json(planRoute(opsResult(p), from, to));
+  }
+
+  // ---- assistant layer (canned, reads the findings only) ----
+  if (path === "/ai/status" && m === "GET") return json({ available: true, reason: "mock provider, canned answers", models: AI_MODELS });
+  if (path === "/ai/triage" && m === "POST") {
+    const b = await body<{ cell?: number }>(req);
+    await sleep(400);
+    return json(aiTriage(opsResult({ ...OPS_DEFAULTS, cell: b.cell && b.cell > 0 ? b.cell : OPS_DEFAULTS.cell }).findings));
+  }
+  if (path === "/ai/sitrep" && m === "POST") {
+    const b = await body<{ cell?: number }>(req);
+    await sleep(600);
+    return json(aiSitrep(opsResult({ ...OPS_DEFAULTS, cell: b.cell && b.cell > 0 ? b.cell : OPS_DEFAULTS.cell }).findings));
+  }
+  if (path === "/ai/ask" && m === "POST") {
+    const b = await body<{ question?: string }>(req);
+    if (!b.question || typeof b.question !== "string") return err(422, "question required");
+    await sleep(500);
+    const res = opsResult(OPS_DEFAULTS);
+    return json(aiAsk(b.question, res.findings, (from, to) => planRoute(res, from, to), (x, y) => nearestPassable(res, x, y)));
   }
 
   if (path === "/sessions" && m === "GET") {

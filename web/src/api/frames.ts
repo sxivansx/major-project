@@ -2,7 +2,7 @@
 // Everything is little-endian (docs/api.md). Shared by the app, the mock
 // server and the headless check script, so keep this file dependency-free.
 
-import type { BinaryFrame, GridFrame, GridLayer, PointsFrame, ScanFrame } from "./types";
+import type { BinaryFrame, GridFrame, GridLayer, OpsLayersFrame, PointsFrame, ScanFrame } from "./types";
 
 const LAYER_BY_CODE: GridLayer[] = ["max", "min", "mean", "count"];
 export const LAYER_CODE: Record<GridLayer, number> = { max: 0, min: 1, mean: 2, count: 3 };
@@ -10,6 +10,7 @@ export const LAYER_CODE: Record<GridLayer, number> = { max: 0, min: 1, mean: 2, 
 export const SCAN_HEADER = 24; // u8 kind, u8[3] pad, u32 seq, f64 t, f32 phi, u32 n
 export const POINTS_HEADER = 20; // u8 kind, u8[3] pad, u32 job_id, u32 step, f32 phi, u32 n
 export const GRID_HEADER = 32; // u8 kind, u8 layer, u16 pad, u32 w, u32 h, 5 x f32
+export const OPS_HEADER = 24; // u8 kind=4, u8 pad, u16 pad, u32 w, u32 h, f32 cell, f32 x0, f32 y0
 
 // Typed-array views assume the platform is little-endian (every browser and
 // Bun target we care about). Fall back to a DataView copy otherwise.
@@ -85,6 +86,27 @@ export function parseGrid(buf: ArrayBuffer): GridFrame {
   };
 }
 
+// Kind 4, operator layers (GET /api/ops/layers only). After the 24-byte
+// header come w*h u8 classes, then w*h f32 heights above the fitted floor.
+// The f32 block is 4-byte aligned only when w*h is a multiple of 4, so
+// f32View falls back to a DataView copy for the other cases.
+export function parseOpsLayers(buf: ArrayBuffer): OpsLayersFrame {
+  need(buf, OPS_HEADER, "ops layers header");
+  const dv = new DataView(buf);
+  const kind = dv.getUint8(0);
+  if (kind !== 4) throw new FrameError(`ops layers: kind ${kind}, expected 4`);
+  const w = dv.getUint32(4, true);
+  const h = dv.getUint32(8, true);
+  const cell_m = dv.getFloat32(12, true);
+  const x0_m = dv.getFloat32(16, true);
+  const y0_m = dv.getFloat32(20, true);
+  const n = w * h;
+  need(buf, OPS_HEADER + n * 5, "ops layers body");
+  const classes = new Uint8Array(buf, OPS_HEADER, n);
+  const height = f32View(buf, OPS_HEADER + n, n);
+  return { kind: 4, w, h, cell_m, x0_m, y0_m, classes, height };
+}
+
 export function parseFrame(buf: ArrayBuffer): BinaryFrame {
   if (buf.byteLength < 1) throw new FrameError("empty binary frame");
   const kind = new Uint8Array(buf, 0, 1)[0];
@@ -95,6 +117,8 @@ export function parseFrame(buf: ArrayBuffer): BinaryFrame {
       return parsePoints(buf);
     case 3:
       return parseGrid(buf);
+    case 4:
+      return parseOpsLayers(buf);
     default:
       throw new FrameError(`unknown frame kind ${kind}`);
   }
@@ -156,6 +180,24 @@ export function encodeGrid(f: Omit<GridFrame, "kind">): ArrayBuffer {
   dv.setFloat32(28, f.z_max_m, true);
   let o = GRID_HEADER;
   for (let i = 0; i < count; i++, o += 4) dv.setFloat32(o, f.data[i], true);
+  return buf;
+}
+
+export function encodeOpsLayers(f: Omit<OpsLayersFrame, "kind">): ArrayBuffer {
+  const n = f.w * f.h;
+  const buf = new ArrayBuffer(OPS_HEADER + n * 5);
+  const dv = new DataView(buf);
+  dv.setUint8(0, 4);
+  dv.setUint8(1, 0);
+  dv.setUint16(2, 0, true);
+  dv.setUint32(4, f.w, true);
+  dv.setUint32(8, f.h, true);
+  dv.setFloat32(12, f.cell_m, true);
+  dv.setFloat32(16, f.x0_m, true);
+  dv.setFloat32(20, f.y0_m, true);
+  new Uint8Array(buf, OPS_HEADER, n).set(f.classes.subarray(0, n));
+  let o = OPS_HEADER + n;
+  for (let i = 0; i < n; i++, o += 4) dv.setFloat32(o, f.height[i], true);
   return buf;
 }
 

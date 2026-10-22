@@ -1,29 +1,14 @@
 import { useState } from "react";
-import { api, errorText } from "../api/rest";
+import { errorText } from "../api/rest";
 import type { JobRequest } from "../api/types";
-import { cloudClear } from "../store/cloud";
-import { clientLog, useStore } from "../store/store";
+import { startSweep, stopSweep, sweepSteps } from "../store/actions";
+import { useStore } from "../store/store";
 import { fmt, fmtDuration, fmtInt } from "../lib/format";
-
-const DEFAULTS: JobRequest = {
-  name: "bench-1",
-  phi_start: -60,
-  phi_end: 60,
-  phi_step: 2,
-  rotations: 1,
-  settle_ms: 300,
-};
-
-function stepsFor(f: JobRequest): number {
-  if (!(f.phi_step > 0)) return 0;
-  return Math.floor(Math.abs(f.phi_end - f.phi_start) / f.phi_step + 1e-9) + 1;
-}
 
 export function JobPanel() {
   const status = useStore((s) => s.status);
-  const setStatus = useStore((s) => s.setStatus);
-  const setCloud = useStore((s) => s.setCloud);
-  const [form, setForm] = useState<JobRequest>(DEFAULTS);
+  const form = useStore((s) => s.jobForm);
+  const setJobForm = useStore((s) => s.setJobForm);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -31,8 +16,7 @@ export function JobPanel() {
   const running = job?.state === "running";
   const ready = !!status?.lidar.connected && !!status?.servo.connected;
 
-  const set = <K extends keyof JobRequest>(k: K, v: JobRequest[K]) =>
-    setForm((f) => ({ ...f, [k]: v }));
+  const set = <K extends keyof JobRequest>(k: K, v: JobRequest[K]) => setJobForm({ [k]: v });
   const num = (k: keyof JobRequest) => (e: React.ChangeEvent<HTMLInputElement>) =>
     set(k, Number(e.target.value) as never);
 
@@ -40,13 +24,9 @@ export function JobPanel() {
     setErr(null);
     setBusy(true);
     try {
-      cloudClear();
-      setCloud(0, 0);
-      const r = await api.jobStart(form);
-      clientLog("info", `job ${r.job_id} "${form.name}" started`);
+      await startSweep();
     } catch (e) {
       setErr(errorText(e));
-      clientLog("error", `job/start: ${errorText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -56,7 +36,7 @@ export function JobPanel() {
     setErr(null);
     setBusy(true);
     try {
-      setStatus(await api.jobStop());
+      await stopSweep();
     } catch (e) {
       setErr(errorText(e));
     } finally {
@@ -64,7 +44,7 @@ export function JobPanel() {
     }
   };
 
-  const nSteps = stepsFor(form);
+  const nSteps = sweepSteps(form);
   const estS = (nSteps * (form.settle_ms + form.rotations * 100 + 50)) / 1000;
   const pct = job && job.n_steps > 0 ? Math.min(100, (100 * job.step) / job.n_steps) : 0;
 

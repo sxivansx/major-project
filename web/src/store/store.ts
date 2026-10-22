@@ -3,6 +3,7 @@ import type {
   Config,
   GridFrame,
   Job,
+  JobRequest,
   LogLevel,
   PortInfo,
   ScanFrame,
@@ -11,7 +12,7 @@ import type {
 } from "../api/types";
 
 export type WsState = "connecting" | "open" | "closed";
-export type Tab = "live" | "cloud" | "sessions" | "log";
+export type Tab = "ops" | "live" | "cloud" | "sessions" | "log";
 
 export interface LogEntry {
   id: number;
@@ -45,6 +46,9 @@ export interface State {
 
   log: LogEntry[];
 
+  // scan job form (shared by the Scan job panel and the operator action bar)
+  jobForm: JobRequest;
+
   // ui
   tab: Tab;
   showSurface: boolean;
@@ -65,17 +69,27 @@ export interface State {
   setCloud: (count: number, version: number) => void;
   addLog: (level: LogLevel, msg: string, t?: number, src?: "server" | "client") => void;
   clearLog: () => void;
+  setJobForm: (p: Partial<JobRequest>) => void;
   setTab: (t: Tab) => void;
   setUi: (p: Partial<Pick<State, "showSurface" | "showHelpers" | "pointSize" | "colorZ" | "surfaceMaxStep">>) => void;
 }
 
 let logId = 0;
 
-const TAB_IDS: Tab[] = ["live", "cloud", "sessions", "log"];
+const TAB_IDS: Tab[] = ["ops", "live", "cloud", "sessions", "log"];
 function initialTab(): Tab {
   const h = typeof location !== "undefined" ? location.hash.replace(/^#/, "") : "";
-  return (TAB_IDS as string[]).includes(h) ? (h as Tab) : "live";
+  return (TAB_IDS as string[]).includes(h) ? (h as Tab) : "ops";
 }
+
+export const JOB_DEFAULTS: JobRequest = {
+  name: "bench-1",
+  phi_start: -60,
+  phi_end: 60,
+  phi_step: 2,
+  rotations: 1,
+  settle_ms: 300,
+};
 
 export const useStore = create<State>((set) => ({
   wsState: "closed",
@@ -95,6 +109,8 @@ export const useStore = create<State>((set) => ({
   cloudVersion: 0,
 
   log: [],
+
+  jobForm: JOB_DEFAULTS,
 
   tab: initialTab(),
   showSurface: true,
@@ -121,6 +137,7 @@ export const useStore = create<State>((set) => ({
       return { log };
     }),
   clearLog: () => set({ log: [] }),
+  setJobForm: (p) => set((s) => ({ jobForm: { ...s.jobForm, ...p } })),
   setTab: (tab) => {
     if (typeof history !== "undefined") history.replaceState(null, "", "#" + tab);
     set({ tab });

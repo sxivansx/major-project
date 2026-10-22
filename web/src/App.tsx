@@ -6,6 +6,7 @@ import { ConnectionPanel } from "./components/ConnectionPanel";
 import { ServoPanel } from "./components/ServoPanel";
 import { MountPanel } from "./components/MountPanel";
 import { JobPanel } from "./components/JobPanel";
+import { OpsTab } from "./components/OpsTab";
 import { LiveTab } from "./components/LiveTab";
 import { CloudTab } from "./components/CloudTab";
 import { SessionsPanel } from "./components/SessionsPanel";
@@ -13,6 +14,7 @@ import { LogPanel } from "./components/LogPanel";
 import { StatusBar } from "./components/StatusBar";
 
 const TABS: { id: Tab; label: string }[] = [
+  { id: "ops", label: "Operator" },
   { id: "live", label: "Live scan" },
   { id: "cloud", label: "Point cloud and height map" },
   { id: "sessions", label: "Sessions" },
@@ -66,6 +68,7 @@ export default function App() {
           ))}
         </nav>
         <div className="tab-body">
+          {tab === "ops" && <OpsTab />}
           {tab === "live" && <LiveTab />}
           {tab === "cloud" && <CloudTab />}
           {tab === "sessions" && <SessionsPanel />}

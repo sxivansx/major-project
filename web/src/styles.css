@@ -710,3 +710,232 @@ table.list a:hover {
   color: var(--text-dim);
   font-size: 12px;
 }
+
+/* ---- operator tab ---- */
+.ops-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 7fr) minmax(320px, 3fr);
+  gap: 8px;
+  padding: 8px;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.ops-right {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.ops-right .panel {
+  flex: 1;
+}
+
+.ops-alarm {
+  color: var(--err);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ops-map-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: var(--bg);
+}
+
+.ops-map-wrap canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+}
+
+.ops-map-wrap canvas:active {
+  cursor: grabbing;
+}
+
+.ops-map-wrap.route canvas {
+  cursor: crosshair;
+}
+
+.ops-map-wrap .scene-overlay {
+  left: auto;
+  right: 8px;
+  top: 8px;
+  bottom: auto;
+}
+
+.ops-legend .sw {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--border-strong);
+  margin-right: 2px;
+  vertical-align: middle;
+}
+
+.ops-legend .sw.hatch-diag {
+  background: repeating-linear-gradient(135deg, currentColor 0 1px, transparent 1px 4px);
+}
+
+.ops-legend .sw.hatch-horiz {
+  background: repeating-linear-gradient(180deg, currentColor 0 1px, transparent 1px 4px);
+}
+
+.ops-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  flex: none;
+  flex-wrap: wrap;
+  min-height: 40px;
+}
+
+.ops-actions .progress {
+  width: 110px;
+  margin: 0;
+}
+
+.ops-actions .spacer {
+  flex: 1;
+}
+
+.ops-route-text {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+button.toggled {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.ops-col .panel-body {
+  padding: 0;
+}
+
+.ops-block {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ops-block-title {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.ops-block .kv {
+  margin-top: 4px;
+}
+
+.ops-block .kv dd {
+  white-space: normal;
+  text-overflow: clip;
+}
+
+.ops-list tr {
+  cursor: pointer;
+}
+
+.ops-list tbody tr:hover {
+  background: var(--bg-hover);
+}
+
+.ops-list tr.sel td {
+  background: var(--bg-hover);
+  color: #ffffff;
+}
+
+.ops-list th.num {
+  text-align: right;
+}
+
+.ops-list td:first-child {
+  color: var(--accent);
+}
+
+/* ---- assistant block ---- */
+.ai-section {
+  margin-top: 8px;
+}
+
+.ai-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-bottom: 3px;
+}
+
+.ai-out {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 6px 8px;
+  margin: 0 0 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.ai-item {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.ai-item:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.ai-item-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.ai-item .why {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.conf {
+  display: inline-block;
+  width: 56px;
+  height: 7px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  vertical-align: middle;
+}
+
+.conf > div {
+  height: 100%;
+  background: var(--accent);
+}
+
+.ai-ask {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.ai-ask input {
+  flex: 1;
+  min-width: 0;
+}

@@ -1,10 +1,26 @@
-import type { Metrics } from "./types";
 // Thin fetch wrappers for /api. Errors throw ApiError with the status and
 // whatever the server said, so panels can show the message inline.
 
-import type { Config, GridLayer, JobRequest, PortInfo, SessionMeta, Status } from "./types";
-import { parseGrid, parseSessionPoints } from "./frames";
-import type { GridFrame } from "./types";
+import type {
+  AiAsk,
+  AiSitrep,
+  AiStatus,
+  AiTriage,
+  Config,
+  Findings,
+  GridFrame,
+  GridLayer,
+  JobRequest,
+  Metrics,
+  OpsLayersFrame,
+  OpsQuery,
+  PortInfo,
+  RouteRequest,
+  RouteResult,
+  SessionMeta,
+  Status,
+} from "./types";
+import { parseGrid, parseOpsLayers, parseSessionPoints } from "./frames";
 
 export class ApiError extends Error {
   constructor(
@@ -64,6 +80,15 @@ function gridQuery(q: GridQuery): string {
   return s ? "?" + s : "";
 }
 
+function opsQuery(q: OpsQuery): string {
+  const p = new URLSearchParams();
+  if (q.cell !== undefined) p.set("cell", String(q.cell));
+  if (q.max_step !== undefined) p.set("max_step", String(q.max_step));
+  if (q.max_slope !== undefined) p.set("max_slope", String(q.max_slope));
+  const s = p.toString();
+  return s ? "?" + s : "";
+}
+
 export interface GridQuery {
   cell?: number;
   layer?: GridLayer;
@@ -106,6 +131,15 @@ export const api = {
 
   metrics: (q: GridQuery) => request<Metrics>("GET", "/metrics" + gridQuery(q)),
   snapshotUrl: (rotations: number) => `/api/scan/snapshot.csv?rotations=${rotations}`,
+
+  // operator products (deterministic) and the assistant layer
+  opsFindings: (q: OpsQuery) => request<Findings>("GET", "/ops/findings" + opsQuery(q)),
+  opsLayers: async (q: OpsQuery): Promise<OpsLayersFrame> => parseOpsLayers(await requestBinary("/ops/layers" + opsQuery(q))),
+  opsRoute: (body: RouteRequest) => request<RouteResult>("POST", "/ops/route", body),
+  aiStatus: () => request<AiStatus>("GET", "/ai/status"),
+  aiTriage: (body: { cell?: number }) => request<AiTriage>("POST", "/ai/triage", body),
+  aiSitrep: (body: { cell?: number }) => request<AiSitrep>("POST", "/ai/sitrep", body),
+  aiAsk: (question: string) => request<AiAsk>("POST", "/ai/ask", { question }),
 };
 
 export function errorText(e: unknown): string {

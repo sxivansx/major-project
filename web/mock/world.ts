@@ -7,16 +7,24 @@ export interface Aabb {
   max: [number, number, number];
 }
 
-// The bench top is the base plate (z = 0). Floor 0.75 m below, ceiling 2.5 m
-// above the floor. The lidar sits a little off-centre in the room.
-export const ROOM: Aabb = { min: [-2.0, -1.5, -0.75], max: [4.0, 2.5, 1.75] };
+// The bench top is the base plate (z = 0). Floor 0.75 m below, ceiling 4.25 m
+// above the floor (above the 3 m the operator analysis looks at, so the max-height
+// surface is the floor and the boxes, as in a rubble field). The lidar sits a
+// little off-centre in the room.
+export const ROOM: Aabb = { min: [-2.0, -1.5, -0.75], max: [4.0, 2.5, 3.5] };
 
+// Laid out so the operator analysis has something to say from a single station:
+// a low crate to route around, a tall box that casts a shadow to the far wall,
+// a slab with open space underneath (a covered void) against the far wall so
+// its own shadow lands on the wall, and a box on the bench behind the scanner
+// inside the blind stripe, where the horizontal live scan still sees it.
 export const BOXES: Aabb[] = [
-  { min: [1.2, -1.2, -0.75], max: [1.8, -0.6, -0.15] }, // crate on the floor
-  { min: [2.6, 0.8, -0.75], max: [3.4, 1.6, 0.35] }, // taller box
+  { min: [1.0, 1.0, -0.75], max: [1.6, 1.6, -0.45] }, // crate on the floor, 0.3 m: routes go around it
+  { min: [2.6, 0.8, -0.75], max: [3.4, 1.6, 0.35] }, // taller box, above the scanner: shadow to the far wall
   { min: [-1.2, 1.4, -0.75], max: [-0.4, 2.2, -0.45] }, // low box
-  { min: [0.6, 0.5, 0.0], max: [0.9, 0.8, 0.25] }, // small box on the bench
+  { min: [-0.9, -0.15, 0.0], max: [-0.6, 0.15, 0.25] }, // small box on the bench, behind the scanner
   { min: [-1.9, -1.4, -0.75], max: [-1.3, -0.2, 0.05] }, // cabinet in the corner
+  { min: [3.0, -1.4, -0.35], max: [4.0, -0.5, -0.25] }, // slab 0.4 m over the floor against the far wall: a covered void
 ];
 
 export interface Mount {
@@ -132,15 +140,38 @@ export function fakeScan(mount: Mount, phiDeg: number, nNominal = 3200, maxRange
     const d = dir(Math.cos(theta), Math.sin(theta));
     let r = castRay(origin, d);
     if (!Number.isFinite(r) || r > maxRange) continue;
-    r += gauss() * 0.02;
-    if (Math.random() < 0.003) r *= 0.5 + Math.random(); // the odd outlier
+    r += gauss() * 0.01; // S2 precision is about a centimetre; accuracy (±30 mm) is systematic
+    let q = Math.max(10, Math.min(63, Math.round(58 - r * 1.2 + gauss() * 4)));
+    if (Math.random() < 0.003) {
+      r *= 0.5 + Math.random(); // the odd outlier, flagged by a low quality like the real unit
+      q = Math.floor(Math.random() * 8);
+    }
     if (r < 0.1) continue;
     angle[n] = ((a % 360) + 360) % 360;
     range[n] = r;
-    quality[n] = Math.max(8, Math.min(63, Math.round(58 - r * 1.2 + gauss() * 4)));
+    quality[n] = q;
     n++;
   }
   return { n, angle: angle.subarray(0, n), range: range.subarray(0, n), quality: quality.subarray(0, n) };
+}
+
+// Drop nodes below a quality threshold (what the core does at ingest with lidar.min_quality).
+export function filterQuality(s: FakeScan, minQuality: number): FakeScan {
+  let n = 0;
+  for (let i = 0; i < s.n; i++) if (s.quality[i] >= minQuality) n++;
+  if (n === s.n) return s;
+  const angle = new Float32Array(n);
+  const range = new Float32Array(n);
+  const quality = new Uint8Array(n);
+  let o = 0;
+  for (let i = 0; i < s.n; i++) {
+    if (s.quality[i] < minQuality) continue;
+    angle[o] = s.angle[i];
+    range[o] = s.range[i];
+    quality[o] = s.quality[i];
+    o++;
+  }
+  return { n, angle, range, quality };
 }
 
 // Transform a scan at tilt φ into base-frame xyz.

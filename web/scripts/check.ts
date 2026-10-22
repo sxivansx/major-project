@@ -6,8 +6,9 @@
 //
 // Against the real core this will move the servo and run a short sweep.
 
-import { parseFrame, parseGrid, parseSessionPoints } from "../src/api/frames";
-import type { BinaryFrame, Config, Job, PortInfo, SessionMeta, Status } from "../src/api/types";
+import { encodeOpsLayers, parseFrame, parseGrid, parseOpsLayers, parseSessionPoints } from "../src/api/frames";
+import type { AiAsk, AiSitrep, AiStatus, AiTriage, BinaryFrame, Config, Findings, Job, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
+import { FINDING_KINDS } from "../src/api/types";
 
 const BASE = process.env.CHECK_URL ?? "http://127.0.0.1:8000";
 const WS_URL = BASE.replace(/^http/, "ws") + "/ws";
@@ -196,6 +197,166 @@ ok(g2.layer === "mean" && Math.abs(g2.cell_m - 0.1) < 1e-6, `GET /grid -> ${g2.w
 const g3 = parseGrid(await reqBin("/grid?layer=count"));
 ok(g3.layer === "count", "GET /grid?layer=count");
 
+// ---- 6b. operator products ----
+console.log("\nOperator products");
+{
+  // codec round trip; 3x3 cells so the f32 block is not 4-byte aligned
+  const classes = new Uint8Array([0, 1, 2, 3, 4, 5, 1, 1, 3]);
+  const height = new Float32Array([NaN, 0.1, 0.2, 0.9, NaN, NaN, 0, 0.05, 1.5]);
+  const buf = encodeOpsLayers({ w: 3, h: 3, cell_m: 0.1, x0_m: -0.3, y0_m: 0.2, classes, height });
+  ok(buf.byteLength === 24 + 9 * 5, `kind-4 frame is ${buf.byteLength} bytes (24 + 9 + 36)`);
+  const f = parseOpsLayers(buf);
+  ok(f.kind === 4 && f.w === 3 && f.h === 3 && Math.abs(f.cell_m - 0.1) < 1e-6 && Math.abs(f.x0_m + 0.3) < 1e-6, "kind-4 header round trip");
+  ok(Array.from(f.classes).join() === Array.from(classes).join(), "kind-4 classes round trip");
+  let same = f.height.length === 9;
+  for (let i = 0; i < 9; i++) {
+    if (Number.isNaN(height[i]) ? !Number.isNaN(f.height[i]) : Math.abs(f.height[i] - height[i]) > 1e-6) same = false;
+  }
+  ok(same, "kind-4 heights round trip through the unaligned f32 block");
+  ok(parseFrame(buf).kind === 4, "parseFrame dispatches kind 4");
+}
+// a full sweep so the floor is actually sampled (the job above is ±6°); a void
+// needs a floor return and a slab-top return in the same cell, so the step
+// matters: 4° gives sweep lines every few cells at 1-3 m
+col.text.length = 0;
+const opsJob = await req<{ job_id: number }>("POST", "/job/start", { name: "ops-check", phi_start: -60, phi_end: 60, phi_step: 4, rotations: 1, settle_ms: 50 });
+ok(await waitFor(() => col.text.some((m) => m.type === "job" && (m as unknown as Job).job_id === opsJob.job_id && (m as unknown as Job).state === "done"), 40000, "ops-check job done"), "ops-check sweep (-60..60 by 4) done");
+await sleep(300);
+const OPS_Q = "?cell=0.1&max_step=0.15&max_slope=25";
+const fd = await req<Findings>("GET", "/ops/findings" + OPS_Q);
+ok(fd.grid && fd.grid.w > 0 && fd.grid.h > 0 && Math.abs(fd.grid.cell_m - 0.1) < 1e-6, `findings grid ${fd.grid?.w}x${fd.grid?.h} @ ${fd.grid?.cell_m} m`);
+ok(fd.points > 0, `findings points ${fd.points}`);
+ok(fd.floor && typeof fd.floor.fitted === "boolean", `floor fitted=${fd.floor?.fitted} rms ${fd.floor?.rms_mm} mm tilt ${fd.floor?.tilt_deg}°`);
+const cov = fd.coverage;
+ok(cov.coverage_pct >= 0 && cov.coverage_pct <= 100 && cov.area_seen_m2 >= 0, `coverage ${cov.coverage_pct}% area ${cov.area_seen_m2} m² reach ${cov.floor_reach_m} m`);
+ok(cov.observable_cells <= fd.grid.w * fd.grid.h && cov.filled_cells + cov.interpolated_cells <= cov.observable_cells, "coverage counts consistent");
+const tv = fd.traversability;
+ok(tv.passable + tv.marginal + tv.blocked + tv.shadow + tv.blind <= fd.grid.w * fd.grid.h, `traversability p ${tv.passable} m ${tv.marginal} b ${tv.blocked} s ${tv.shadow} bl ${tv.blind}`);
+ok(tv.params && tv.params.max_step_m === 0.15 && tv.params.max_slope_deg === 25, "traversability params echo the query");
+let shapeOk = true;
+const ids = new Set<string>();
+for (const kind of FINDING_KINDS) {
+  const prefix = kind[0].toUpperCase();
+  if (!Array.isArray(fd[kind])) shapeOk = false;
+  for (const it of fd[kind] ?? []) {
+    ids.add(it.id);
+    if (!it.id.startsWith(prefix) || !(it.cells > 0) || !(it.area_m2 > 0)) shapeOk = false;
+    if (!(it.bearing_deg >= 0 && it.bearing_deg < 360) || !(it.distance_m >= 0)) shapeOk = false;
+    if (!Array.isArray(it.bbox_m) || it.bbox_m.length !== 4 || it.bbox_m[0] > it.bbox_m[2] || it.bbox_m[1] > it.bbox_m[3]) shapeOk = false;
+    if (Math.abs(Math.hypot(it.x_m, it.y_m) - it.distance_m) > 0.02) shapeOk = false;
+    const want = kind === "voids" ? "clearance_m" : kind === "obstacles" ? "height_m" : kind === "depressions" ? "depth_m" : null;
+    if (want && typeof it[want] !== "number") shapeOk = false;
+  }
+}
+ok(shapeOk, `finding items well formed: ${fd.voids.length} voids, ${fd.obstacles.length} obstacles, ${fd.depressions.length} depressions, ${fd.shadows.length} shadows`);
+ok(fd.obstacles.length >= 1, "at least one obstacle (room walls and boxes)");
+// the mock room has a slab (a void); the core's sim room does not, so only the shape is asserted
+ok(fd.voids.every((v) => typeof v.clearance_m === "number" && v.clearance_m >= 0.4), `voids well formed (${fd.voids.length}; the mock slab gives ≥1, the core sim room 0)`);
+ok(fd.shadows.length >= 1, "at least one shadow region behind a box");
+// at the bench rig's 8 cm the stripe is ±4 cm and may cover no cell; on a 1 m tripod it is ±58 cm
+ok(cov.blind_stripe !== null && cov.blind_stripe.half_width_m > 0, `blind stripe ±${cov.blind_stripe?.half_width_m} m, ${cov.blind_cells} cells`);
+ok(fd.next_station === null || typeof fd.next_station.reason === "string", `next station ${fd.next_station ? `${fd.next_station.bearing_deg}° ${fd.next_station.distance_m} m` : "none"}`);
+
+const ly = parseOpsLayers(await reqBin("/ops/layers" + OPS_Q));
+ok(ly.w === fd.grid.w && ly.h === fd.grid.h && Math.abs(ly.x0_m - fd.grid.x0_m) < 1e-5 && Math.abs(ly.y0_m - fd.grid.y0_m) < 1e-5, `layers grid matches findings grid (${ly.w}x${ly.h})`);
+{
+  const counts = [0, 0, 0, 0, 0, 0];
+  let bad = 0;
+  let mismatch = 0;
+  let blindOutside = 0;
+  for (let k = 0; k < ly.w * ly.h; k++) {
+    const c = ly.classes[k];
+    if (c > 5) bad++;
+    else counts[c]++;
+    const known = c === 1 || c === 2 || c === 3;
+    if (known !== Number.isFinite(ly.height[k])) mismatch++;
+    if (c === 5 && cov.blind_stripe) {
+      const iy = Math.floor(k / ly.w);
+      const y = ly.y0_m + (iy + 0.5) * ly.cell_m;
+      if (Math.abs(y) >= cov.blind_stripe.half_width_m + 1e-6) blindOutside++;
+    }
+  }
+  ok(bad === 0, "all classes in 0..5");
+  ok(counts[1] === tv.passable && counts[2] === tv.marginal && counts[3] === tv.blocked && counts[4] === tv.shadow && counts[5] === tv.blind, "class counts match traversability");
+  ok(mismatch === 0, "height is finite exactly on passable/marginal/blocked cells");
+  ok(blindOutside === 0, "blind cells lie within the blind stripe");
+}
+// route from the scanner to a far floor-level passable cell. The top of a wall or a
+// box is flat and so classes passable too, but sits inside a blocked ring; and the
+// blind stripe splits the floor in two, so the half the start snaps into is luck:
+// try a spread of goals, farthest first, and expect one to work.
+{
+  const cands: { xy: [number, number]; d: number }[] = [];
+  let blockedGoal: [number, number] | null = null;
+  for (let k = 0; k < ly.w * ly.h; k++) {
+    const iy = Math.floor(k / ly.w);
+    const ix = k - iy * ly.w;
+    const x = ly.x0_m + (ix + 0.5) * ly.cell_m;
+    const y = ly.y0_m + (iy + 0.5) * ly.cell_m;
+    if (ly.classes[k] === 1 && Math.abs(ly.height[k]) < 0.15) cands.push({ xy: [x, y], d: Math.hypot(x, y) });
+    if (ly.classes[k] === 3 && !blockedGoal) blockedGoal = [x, y];
+  }
+  cands.sort((a, b) => b.d - a.d);
+  let rt: RouteResult = { found: false, reason: "no passable cells" };
+  let goal: [number, number] = [0, 0];
+  let far = 0;
+  let tries = 0;
+  const stride = Math.max(1, Math.floor(cands.length / 12));
+  for (const c of cands.filter((_, i) => i % stride === 0).slice(0, 12)) {
+    tries++;
+    goal = c.xy;
+    far = c.d;
+    rt = await req<RouteResult>("POST", "/ops/route", { from_xy: [0, 0], to_xy: goal, cell: 0.1, max_step: 0.15, max_slope: 25 });
+    if (rt.found) break;
+  }
+  ok(rt.found === true, `route to (${goal[0].toFixed(2)}, ${goal[1].toFixed(2)}) at ${far.toFixed(2)} m found=${rt.found} after ${tries} goal${tries === 1 ? "" : "s"}${rt.found ? "" : " " + rt.reason}`);
+  if (rt.found) {
+    ok(rt.path.length >= 2 && rt.cells === rt.path.length, `path ${rt.path.length} cells, ${rt.length_m} m, ${rt.verdict}, max step ${rt.max_step_m} m, snapped ${rt.start_snapped_m} m`);
+    ok(rt.start_snapped_m >= 0 && rt.start_snapped_m <= 1.0, "start snap within 1 m");
+    const last = rt.path[rt.path.length - 1];
+    ok(Math.hypot(last[0] - goal[0], last[1] - goal[1]) < ly.cell_m, "path ends at the goal cell");
+    const first = rt.path[0];
+    ok(Math.hypot(first[0], first[1]) <= rt.start_snapped_m + ly.cell_m, "path starts at the (snapped) start");
+    ok(rt.length_m >= far - rt.start_snapped_m - 2 * ly.cell_m, "length at least the straight line");
+    ok(rt.verdict === "passable" || rt.verdict === "marginal", "verdict is passable or marginal");
+    let onPassable = true;
+    for (const [x, y] of rt.path) {
+      const ix = Math.floor((x - ly.x0_m) / ly.cell_m);
+      const iy = Math.floor((y - ly.y0_m) / ly.cell_m);
+      const c = ly.classes[iy * ly.w + ix];
+      if (c !== 1 && c !== 2) onPassable = false;
+    }
+    ok(onPassable, "every path cell is passable or marginal (route goes around blocked cells)");
+  }
+  if (blockedGoal) {
+    const rb = await req<RouteResult>("POST", "/ops/route", { from_xy: [0, 0], to_xy: blockedGoal, cell: 0.1 });
+    ok(rb.found === false && typeof rb.reason === "string" && rb.reason.length > 0, `route to a blocked cell: found=false, reason "${rb.found ? "" : rb.reason}"`);
+  }
+  const rOut = await fetch(BASE + "/api/ops/route", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ from_xy: [0], to_xy: [1, 1] }) });
+  ok(rOut.status === 400 || rOut.status === 422, `malformed route body -> ${rOut.status}`);
+}
+// assistant layer
+const ai = await req<AiStatus>("GET", "/ai/status");
+ok(typeof ai.available === "boolean", `GET /ai/status available=${ai.available}${ai.reason ? " (" + ai.reason + ")" : ""}`);
+if (ai.available) {
+  const tr = await req<AiTriage>("POST", "/ai/triage", { cell: 0.1 });
+  ok(Array.isArray(tr.items) && tr.items.every((i) => i.attention >= 0 && i.attention <= 1 && i.confidence >= 0 && i.confidence <= 1 && typeof i.why === "string"), `triage ${tr.items.length} items with attention/confidence in 0..1`);
+  ok(tr.items.every((i) => ids.has(i.id)), "triage ids exist in the findings");
+  ok(tr.rescan && typeof tr.rescan.recommended === "boolean" && tr.rescan.p >= 0 && tr.rescan.p <= 1, `rescan recommended=${tr.rescan?.recommended} p=${tr.rescan?.p}`);
+  const sr = await req<AiSitrep>("POST", "/ai/sitrep", { cell: 0.1 });
+  ok(typeof sr.text === "string" && sr.text.trim().length > 0, `sitrep ${sr.text.split("\n").length} lines`);
+  ok(!/survivor/i.test(sr.text), "sitrep never says survivor");
+  const target = fd.voids[0]?.id ?? fd.obstacles[0]?.id ?? "V1";
+  const ak = await req<AiAsk>("POST", "/ai/ask", { question: `route to ${target}` });
+  ok(typeof ak.intent === "string" && typeof ak.answer === "string" && ak.confidence >= 0 && ak.confidence <= 1, `ask -> intent ${ak.intent} confidence ${ak.confidence}`);
+  ok(ak.intent === "route" && !!ak.tool && typeof (ak.tool as { found?: unknown }).found === "boolean", "ask route carries a route result as tool");
+}
+
+{
+  const mineOps = (await req<SessionMeta[]>("GET", "/sessions")).find((s) => s.name === "ops-check");
+  if (mineOps) await req<void>("DELETE", `/sessions/${mineOps.id}`);
+}
+
 // ---- 7. config ----
 console.log("\nConfig");
 const c2 = await req<Config>("PUT", "/config", { ...config, grid: { ...config.grid, cell_m: 0.08 } });
@@ -218,7 +379,7 @@ if (mine) {
   const ply = await (await fetch(`${BASE}/api/sessions/${mine.id}/export.ply`)).text();
   ok(ply.startsWith("ply\nformat ascii 1.0"), "export.ply is ASCII PLY");
   const csv = await (await fetch(`${BASE}/api/sessions/${mine.id}/export.csv`)).text();
-  ok(csv.startsWith("phi,theta,range,quality,x,y,z"), "export.csv header");
+  ok(csv.startsWith("phi,phi_meas,theta,range,quality,x,y,z"), "export.csv header");
 
   col.frames.length = 0;
   const ld = await req<Status>("POST", `/sessions/${mine.id}/load`);
