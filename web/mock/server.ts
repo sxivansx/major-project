@@ -21,7 +21,7 @@ const POINTS_CHUNK = 50_000;
 // ---- state ----
 
 const config: Config = {
-  mount: { axis_z_mm: 80, h_mm: 0, lidar_yaw_deg: 0, center_deg: 135, invert: false },
+  mount: { axis_z_mm: 80, h_mm: 0, lidar_yaw_deg: 0, center_deg: 90, invert: false, enc_center_deg: 90, enc_invert: false },
   grid: { cell_m: 0.05, z_min_m: -0.5, z_max_m: 2.5, layer: "max" },
   lidar: { min_quality: 10, min_range_m: 0.1, max_range_m: 30 },
 };
