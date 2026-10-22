@@ -117,7 +117,9 @@ class AIClient:
             cost = float((data.get("usage") or {}).get("cost") or 0.0)
         return data.get("answers", {}), cost
 
-    def complete(self, system: str, user: str, max_tokens: int = 500, temperature: float = 0.2) -> tuple[str, float]:
+    def complete(self, system: str, user: str, max_tokens: int = 1200, temperature: float = 0.2) -> tuple[str, float]:
+        """Gemini 3.5 Flash reasons before answering and the reasoning counts against max_tokens, so
+        keep effort low, drop the reasoning from the reply, and treat a truncated reply as a failure."""
         if not self.prose_available:
             raise AIError("prose unavailable: no OPENROUTER_API_KEY")
         data = self._post(
@@ -127,16 +129,21 @@ class AIClient:
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                "reasoning": {"effort": "low", "exclude": True},
                 "usage": {"include": True},
             },
             self.key,
             "OpenRouter",
         )
         try:
-            text = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            text = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
             raise AIError(f"unexpected completion response: {str(data)[:200]}") from e
-        return (text or "").strip(), float((data.get("usage") or {}).get("cost") or 0.0)
+        cost = float((data.get("usage") or {}).get("cost") or 0.0)
+        if choice.get("finish_reason") == "length" or not (text or "").strip():
+            raise AIError(f"completion truncated or empty (finish_reason={choice.get('finish_reason')})")
+        return text.strip(), cost
 
 
 # ---- facts --------------------------------------------------------------------------------------
@@ -288,7 +295,8 @@ INTENTS = {
 
 ANSWER_SYSTEM = (
     "Answer a search-and-rescue operator's question in at most three plain sentences using only the tool "
-    "result and facts given. Never claim a person is present; never use the words survivor, victim, body. "
+    "result and facts given, and include the relevant numbers (distance, bearing, length, size, clearance). "
+    "Never claim a person is present; never use the words survivor, victim, body. "
     "If the tool result says something was not found or not possible, say so plainly. No markdown."
 )
 
@@ -352,12 +360,13 @@ def ask(ai: AIClient, question: str, findings: dict, route_to: Callable[[float, 
         tool["facts"] = facts
     if ai.prose_available:
         try:
-            answer, cost2 = ai.complete(ANSWER_SYSTEM, json.dumps({"question": question, "tool_result": tool}), max_tokens=300)
+            answer, cost2 = ai.complete(ANSWER_SYSTEM, json.dumps({"question": question, "tool_result": tool}), max_tokens=900)
             cost += cost2
             if FORBIDDEN.search(answer):
                 answer = "Assistant answer withheld by the guardrail; see the tool result."
         except AIError as e:
-            answer = f"(no prose: {e})"
+            log.warning("answer prose failed, using the template: %s", e)
+            answer = template_answer(intent, tool)
     else:
         answer = template_answer(intent, tool)
     return {"intent": intent, "confidence": round(conf, 3), "target": tool["target"], "tool": tool, "answer": answer, "cost_usd": round(cost, 6)}
