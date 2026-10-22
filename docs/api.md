@@ -95,6 +95,9 @@ Persisted to `core/config.json`.
 | POST | `/servo/raw` | `{"line":"?"}` | `{"reply":"STATUS ..."}` (calibration console) |
 | POST | `/job/start` | `{"name":"bench-1","phi_start":-60,"phi_end":60,"phi_step":2,"rotations":1,"settle_ms":300}` | `{"job_id":1}` |
 | POST | `/job/stop` | | Status |
+| POST | `/live/clear` | | Status (drops the live cloud) |
+| GET | `/scan/snapshot.csv` | `?rotations=1..20` | CSV `rotation,t,phi,angle,range,quality` of the next N raw rotations at the current tilt |
+| GET | `/metrics` | `?cell=&z_min=&z_max=` | `{points, steps, points_per_step, duration_s, grid:{cell_m,cells,filled,coverage_pct,points_per_filled_cell}, floor:{points,rms_mm,tilt_deg,offset_mm}\|null}` (floor = plane fit to points within ±10 cm of z=0) |
 | GET | `/grid` | `?cell=0.05&layer=max&z_min=&z_max=` | binary grid frame (kind 3 payload) |
 | GET | `/sessions` | | `[SessionMeta]` |
 | GET | `/sessions/{id}` | | SessionMeta |
@@ -116,9 +119,11 @@ Status object:
             "min_deg": 0, "max_deg": 270, "range": 270},
   "job": null,
   "live_points": 0,
-  "session_loaded": null
+  "session_loaded": null,
+  "alarms": []
 }
 ```
+`alarms` is the current set of watchdog conditions, checked once a second: no frames for >2 s, scan rate <8 Hz, <1000 points per rotation, lidar health not good, lidar stream died, last job failed. Each raise/clear also produces one `log` message. Finished jobs carry `finished` (unix s) and `session_id`.
 `job` when running:
 ```json
 {"job_id": 1, "name": "bench-1", "state": "running"|"done"|"stopped"|"error", "step": 12, "n_steps": 61,

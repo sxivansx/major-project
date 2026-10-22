@@ -111,6 +111,10 @@ def create_app(
         async def ticker():
             while True:
                 await asyncio.sleep(1.0)
+                try:
+                    rig.check_alarms()
+                except Exception:  # noqa: BLE001
+                    log.exception("alarm check failed")
                 rig.publish_status()
 
         task = asyncio.create_task(ticker())
@@ -186,6 +190,20 @@ def create_app(
     def live_clear():
         rig.clear_live()
         return rig.status()
+
+    @app.get(f"{api}/scan/snapshot.csv")
+    async def scan_snapshot(rotations: int = 1):
+        if not 1 <= rotations <= 20:
+            raise HTTPException(400, "rotations must be 1..20")
+        body = await asyncio.to_thread(rig.snapshot_csv, rotations)
+        name = f"snapshot-{rotations}rot.csv"
+        return Response(body, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    @app.get(f"{api}/metrics")
+    async def metrics(cell: float | None = None, z_min: float | None = None, z_max: float | None = None):
+        if cell is not None and cell <= 0:
+            raise HTTPException(400, "cell must be > 0")
+        return await asyncio.to_thread(rig.metrics, cell, z_min, z_max)
 
     def grid_args(cell, layer, z_min, z_max):
         if layer is not None and layer not in LAYERS:

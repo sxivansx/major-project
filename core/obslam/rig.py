@@ -76,6 +76,8 @@ class Rig:
         self.latest: ScanFrame | None = None
         self.seq = 0
         self._last_scan_pub = 0.0
+        self._scan_connected_at = 0.0
+        self._alarms: set[str] = set()
 
         self.tilt: TiltSource | None = None
 
@@ -146,7 +148,93 @@ class Rig:
                 "job": dict(self.job) if self.job else None,
                 "live_points": int(self.live_points().shape[0]),
                 "session_loaded": self.session_loaded,
+                "alarms": sorted(self._alarms),
             }
+
+    def check_alarms(self) -> list[str]:
+        """Called about once a second. Raises/clears alarms with one log line each."""
+        alarms: list[str] = []
+        now = time.time()
+        with self._lock:
+            if self.scan is not None and now - self._scan_connected_at > 3.0:
+                last_t = self.latest.t if self.latest else self._scan_connected_at
+                age = now - last_t
+                hz = self.stats.hz
+                if age > 2.0:
+                    alarms.append(f"no lidar frames for {age:.0f} s")
+                elif hz is not None and hz < 8.0:
+                    alarms.append(f"scan rate low: {hz:.1f} Hz")
+                if self.stats.pts_per_rev and self.stats.pts_per_rev < 1000:
+                    alarms.append(f"only {self.stats.pts_per_rev} points per rotation")
+                health = self.scan_info.get("health")
+                if health not in (None, "good"):
+                    alarms.append(f"lidar health {health}")
+            if self.scan is None and self.scan_error:
+                alarms.append(f"lidar stream died: {self.scan_error}")
+            job = self.job
+            if job and job["state"] == "error":
+                alarms.append(f"job {job['job_id']} failed: {job['error']}")
+            current = set(alarms)
+            raised, cleared = current - self._alarms, self._alarms - current
+            self._alarms = current
+        for a in sorted(raised):
+            self.log("warn", f"alarm: {a}")
+        for a in sorted(cleared):
+            self.log("info", f"cleared: {a}")
+        if raised or cleared:
+            self.publish_status()
+        return alarms
+
+    def snapshot_csv(self, rotations: int = 1, timeout: float = 5.0) -> bytes:
+        """The next `rotations` full rotations at the current tilt, raw, as CSV. For bias measurements."""
+        with self._lock:
+            if self.scan is None:
+                raise RigError("lidar not connected")
+        frames = self.wait_frames(rotations, time.time(), timeout)
+        phi = self.phi_now()
+        rows = ["rotation,t,phi,angle,range,quality"]
+        for i, f in enumerate(frames):
+            for a, r, q in zip(f.angle.tolist(), f.range.tolist(), f.quality.tolist()):
+                rows.append(f"{i},{f.t:.4f},{phi:.2f},{a:.3f},{r:.4f},{q}")
+        return ("\n".join(rows) + "\n").encode()
+
+    def metrics(self, cell: float | None = None, z_min=None, z_max=None, floor_band_m: float = 0.1) -> dict:
+        """Numbers for the evaluation chapter: coverage, throughput, floor flatness."""
+        xyz = self.live_points()
+        with self._lock:
+            job = dict(self.job) if self.job else None
+        n = int(xyz.shape[0])
+        out: dict = {"points": n, "steps": None, "points_per_step": None, "duration_s": None}
+        if job:
+            steps = int(job.get("step") or 0)
+            out["steps"] = steps
+            out["points_per_step"] = round(n / steps, 1) if steps else None
+            end = job.get("finished") or (time.time() if job["state"] == "running" else None)
+            out["duration_s"] = round(end - job["started"], 2) if end else None
+        g = self.grid(cell, "count", z_min, z_max)
+        filled = int(np.isfinite(g.data).sum())
+        cells = int(g.w * g.h)
+        out["grid"] = {
+            "cell_m": g.cell,
+            "cells": cells,
+            "filled": filled,
+            "coverage_pct": round(100.0 * filled / cells, 1) if n else 0.0,
+            "points_per_filled_cell": round(n / filled, 1) if filled else None,
+        }
+        band = xyz[np.abs(xyz[:, 2]) <= floor_band_m] if n else xyz
+        if band.shape[0] >= 50:
+            a = np.c_[band[:, 0], band[:, 1], np.ones(band.shape[0])].astype(np.float64)
+            coef, *_ = np.linalg.lstsq(a, band[:, 2].astype(np.float64), rcond=None)
+            resid = band[:, 2] - a @ coef
+            out["floor"] = {
+                "points": int(band.shape[0]),
+                "rms_mm": round(float(np.sqrt(np.mean(resid**2)) * 1000), 1),
+                "tilt_deg": round(float(np.degrees(np.arctan(np.hypot(coef[0], coef[1])))), 2),
+                "offset_mm": round(float(coef[2] * 1000), 1),
+            }
+        else:
+            out["floor"] = None
+        return out
 
     # ---- lidar -------------------------------------------------------------------------------
     def connect_lidar(self, source: str, port: str | None = None, baud: int = 1_000_000) -> None:
@@ -171,6 +259,7 @@ class Rig:
             self.scan_info, self.scan_error = info, None
             self.stats.reset()
             self.latest = None
+            self._scan_connected_at = time.time()
             src.start(self._on_frame, self._on_scan_exit)
         self.log("info", f"lidar connected: {info.get('model')} on {port or 'sim'}")
         self.publish_status()
@@ -417,7 +506,7 @@ class Rig:
             }
             self.sessions.save(meta, arrays)
         with self._lock:
-            self.job.update(state=state, error=error, eta_s=0.0, session_id=sid)
+            self.job.update(state=state, error=error, eta_s=0.0, session_id=sid, finished=time.time())
             self.session_loaded = sid
         self._publish(wire.encode_grid(self.grid()))
         self._publish_job()
