@@ -1,0 +1,3 @@
+[submodule "driver/rplidar_sdk"]
+	path = driver/rplidar_sdk
+	url = https://github.com/Slamtec/rplidar_sdk.git
