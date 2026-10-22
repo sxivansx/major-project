@@ -16,6 +16,9 @@ import { AI_MODELS, OPS_DEFAULTS, aiAsk, aiSitrep, aiTriage, analyze, nearestPas
 import { computeGrid, fakeScan, filterQuality, scanToPoints, type FakeScan, type Mount } from "./world";
 
 const PORT = Number(process.env.PORT ?? 8000);
+// MOCK_AI=off mimics a core without an OpenRouter key: /ai/status unavailable,
+// /ai/sitrep answers with a template, /ai/ask and /ai/triage return 503.
+const MOCK_AI = (process.env.MOCK_AI ?? "on") !== "off";
 const SCAN_PERIOD_MS = 100;
 const POINTS_CHUNK = 50_000;
 
@@ -651,7 +654,16 @@ async function handleApi(req: Request, path: string): Promise<Response> {
       return err(400, (e as Error).message);
     }
     const res = opsResult(p);
-    if (path === "/ops/findings") return json(res.findings);
+    if (path === "/ops/findings")
+      return json({
+        ...res.findings,
+        scan: {
+          in_progress: status.job?.state === "running",
+          step: status.job?.step ?? null,
+          n_steps: status.job?.n_steps ?? null,
+          session: status.session_loaded,
+        },
+      });
     return bin(encodeOpsLayers({ w: res.w, h: res.h, cell_m: res.cell, x0_m: res.x0, y0_m: res.y0, classes: res.classes, height: res.rel }));
   }
   if (path === "/ops/route" && m === "POST") {
@@ -671,18 +683,27 @@ async function handleApi(req: Request, path: string): Promise<Response> {
   }
 
   // ---- assistant layer (canned, reads the findings only) ----
-  if (path === "/ai/status" && m === "GET") return json({ available: true, reason: "mock provider, canned answers", models: AI_MODELS });
+  if (path === "/ai/status" && m === "GET")
+    return json(
+      MOCK_AI
+        ? { available: true, reason: "mock provider, canned answers", models: AI_MODELS }
+        : { available: false, reason: "no OPENROUTER_API_KEY in the environment or core/.env", models: AI_MODELS },
+    );
   if (path === "/ai/triage" && m === "POST") {
+    if (!MOCK_AI) return err(503, "assistant unavailable: no OPENROUTER_API_KEY");
     const b = await body<{ cell?: number }>(req);
     await sleep(400);
     return json(aiTriage(opsResult({ ...OPS_DEFAULTS, cell: b.cell && b.cell > 0 ? b.cell : OPS_DEFAULTS.cell }).findings));
   }
   if (path === "/ai/sitrep" && m === "POST") {
     const b = await body<{ cell?: number }>(req);
+    const f = opsResult({ ...OPS_DEFAULTS, cell: b.cell && b.cell > 0 ? b.cell : OPS_DEFAULTS.cell }).findings;
+    if (!MOCK_AI) return json({ text: aiSitrep(f).text, facts: f, model: "template" }); // written from the findings, no model
     await sleep(600);
-    return json(aiSitrep(opsResult({ ...OPS_DEFAULTS, cell: b.cell && b.cell > 0 ? b.cell : OPS_DEFAULTS.cell }).findings));
+    return json(aiSitrep(f));
   }
   if (path === "/ai/ask" && m === "POST") {
+    if (!MOCK_AI) return err(503, "assistant unavailable: no OPENROUTER_API_KEY");
     const b = await body<{ question?: string }>(req);
     if (!b.question || typeof b.question !== "string") return err(422, "question required");
     await sleep(500);

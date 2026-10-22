@@ -245,6 +245,8 @@ export interface Findings {
   shadows: Finding[];
   // bearing_deg is null when the advice is "rotate in place" (blind stripe).
   next_station: { bearing_deg: number | null; distance_m: number; reason: string } | null;
+  // newer cores: whether the live cloud is still being swept (the analysis is partial then)
+  scan?: { in_progress: boolean; step?: number | null; n_steps?: number | null; session?: string | null };
 }
 
 export interface RouteRequest {
@@ -272,6 +274,9 @@ export interface AiStatus {
   available: boolean;
   reason?: string;
   models?: { decisions?: string; prose?: string };
+  // newer cores may report the two models separately
+  decisions?: { available?: boolean; reason?: string };
+  prose?: { available?: boolean; reason?: string };
 }
 
 export interface AiTriageItem {
@@ -292,7 +297,7 @@ export interface AiTriage {
 export interface AiSitrep {
   text: string;
   facts?: unknown;
-  model?: string;
+  model?: string; // "template" when written without a model (no API key)
   cost_usd?: number;
 }
 

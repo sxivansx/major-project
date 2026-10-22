@@ -1,24 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { errorText } from "../api/rest";
-import { rampCssGradient } from "../lib/colormap";
-import { fmt, fmtDuration, fmtTime } from "../lib/format";
-import { startSweep, stopSweep } from "../store/actions";
-import { opsStale, refreshOps, scheduleOpsRefresh, useOps, type LayerToggles } from "../store/ops";
+import { fmt } from "../lib/format";
+import { startSweep } from "../store/actions";
+import { loadAiStatus, nextStationText, scanState, startOpsAutoRefresh, useOps } from "../store/ops";
 import { useStore } from "../store/store";
-import { HATCH_COLOUR, OpsMap, TRAV_RGB, heightRange, type OpsMapHandle } from "./OpsMap";
-import { OpsFindings } from "./OpsFindings";
+import { OpsAdvanced } from "./OpsAdvanced";
+import { OpsMap, type OpsMapHandle } from "./OpsMap";
+import { OpsSummary } from "./OpsSummary";
 
-// The Operator tab: what is out there, where could someone be, can we get
-// there, what have we not seen. Map left, findings right, actions under the map.
-
-const TOGGLES: { k: keyof LayerToggles; label: string }[] = [
-  { k: "terrain", label: "terrain" },
-  { k: "traversability", label: "traversability" },
-  { k: "shadow", label: "shadow" },
-  { k: "blind", label: "blind" },
-  { k: "findings", label: "findings" },
-  { k: "station", label: "next station" },
-];
+// The Operator tab, simple view: three numbers, one map, what we have, three
+// buttons. Everything else sits behind Advanced.
 
 function download(blob: Blob, name: string) {
   const a = document.createElement("a");
@@ -32,8 +23,10 @@ function stamp(): string {
   return new Date().toISOString().replace(/[-:]/g, "").slice(0, 15).replace("T", "-");
 }
 
-function rgb(c: [number, number, number]): string {
-  return `rgba(${c[0]},${c[1]},${c[2]},0.7)`;
+// "no passable route: goal blocked" rather than the reason repeating the prefix
+function routeFailText(reason: string): string {
+  const r = reason.replace(/^no passable route\s*/i, "").replace(/^\((.*)\)$/, "$1").trim();
+  return "no passable route" + (r ? ": " + r : "");
 }
 
 export function OpsTab() {
@@ -41,15 +34,14 @@ export function OpsTab() {
   const findings = useOps((s) => s.findings);
   const layers = useOps((s) => s.layers);
   const loading = useOps((s) => s.loading);
-  const updatedAt = useOps((s) => s.updatedAt);
+  const error = useOps((s) => s.error);
   const route = useOps((s) => s.route);
   const routeError = useOps((s) => s.routeError);
   const routeBusy = useOps((s) => s.routeBusy);
   const routeMode = useOps((s) => s.routeMode);
   const routeStart = useOps((s) => s.routeStart);
-  const routeSource = useOps((s) => s.routeSource);
-  const toggles = useOps((s) => s.toggles);
-  const setToggle = useOps((s) => s.setToggle);
+  const advanced = useOps((s) => s.advanced);
+  const setAdvanced = useOps((s) => s.setAdvanced);
   const setRouteMode = useOps((s) => s.setRouteMode);
   const clearRoute = useOps((s) => s.clearRoute);
   const cell = useOps((s) => s.cell);
@@ -60,27 +52,23 @@ export function OpsTab() {
   const [scanErr, setScanErr] = useState<string | null>(null);
   const [scanBusy, setScanBusy] = useState(false);
 
-  // analysis follows the live grid: refresh on mount when stale, then on
-  // every kind-3 frame, at most once per 2 s
   useEffect(() => {
-    if (opsStale()) void refreshOps();
-    return useStore.subscribe((s, prev) => {
-      if (s.grid !== prev.grid && s.grid) scheduleOpsRefresh();
-    });
+    void loadAiStatus();
+    return startOpsAutoRefresh();
   }, []);
 
   const alarms = status?.alarms ?? [];
-  const job = status?.job ?? null;
-  const running = job?.state === "running";
-  const ready = !!status?.lidar.connected && !!status?.servo.connected;
-  const pct = job && job.n_steps > 0 ? Math.min(100, (100 * job.step) / job.n_steps) : 0;
+  const connected = !!status?.lidar.connected && !!status?.servo.connected;
+  const haveSession = !!status?.session_loaded;
+  const scan = scanState(findings, status);
+  const scanningText = scan.scanning ? `scanning… step ${scan.step} of ${scan.n_steps}` : null;
+  const haveAnalysis = !!findings && findings.grid.w > 0;
 
-  const scan = async () => {
+  const doScan = async () => {
     setScanErr(null);
     setScanBusy(true);
     try {
-      if (running) await stopSweep();
-      else await startSweep();
+      await startSweep();
     } catch (e) {
       setScanErr(errorText(e));
     } finally {
@@ -101,102 +89,106 @@ export function OpsTab() {
     download(new Blob([json], { type: "application/json" }), `findings-${t}.json`);
   };
 
-  let routeText: React.ReactNode = null;
-  if (routeMode) routeText = <span className="dim">{routeStart ? "click the goal on the map" : "click the start on the map"}</span>;
-  else if (routeBusy) routeText = <span className="dim">planning route</span>;
-  else if (routeError) routeText = <span className="err">route: {routeError}</span>;
+  // Route button: Route -> Cancel while picking -> Clear route once there is a result
+  const routeLabel = route || routeError ? "Clear route" : routeMode ? "Cancel route" : "Route";
+  const onRoute = () => {
+    if (route || routeError) clearRoute();
+    else setRouteMode(!routeMode);
+  };
+  let routeLine: React.ReactNode = null;
+  if (routeMode) routeLine = <span className="dim">{routeStart ? "now click the goal" : "click the start on the map"}</span>;
+  else if (routeBusy) routeLine = <span className="dim">planning</span>;
+  else if (routeError) routeLine = <span className="err">route: {routeError}</span>;
   else if (route) {
-    if (route.found)
-      routeText = (
-        <span className={route.verdict === "passable" ? "ok" : "warn"}>
-          route {fmt(route.length_m, 1)} m · {route.verdict} · max step {fmt(route.max_step_m, 2)} m
-          {route.start_snapped_m > 0 ? ` · start snapped ${fmt(route.start_snapped_m, 1)} m` : ""}
-          {routeSource === "assistant" ? " · from the assistant" : ""}
-        </span>
-      );
-    else routeText = <span className="err">no route: {route.reason}</span>;
+    routeLine = route.found ? (
+      <span className={route.verdict === "passable" ? "ok" : "warn"}>
+        {fmt(route.length_m, 1)} m, {route.verdict}
+      </span>
+    ) : (
+      <span className="err">{routeFailText(route.reason)}</span>
+    );
   }
 
-  const range = layers ? heightRange(layers) : null;
-
   return (
-    <div className="ops-grid">
-      <section className="panel ops-main">
-        <div className="panel-head">
-          <span>Operator map</span>
-          <span className="sub">
-            {findings
-              ? `${findings.grid.w}×${findings.grid.h} @ ${+findings.grid.cell_m.toFixed(3)} m` + (updatedAt ? ` · ${fmtTime(updatedAt)}` : "")
-              : "no analysis"}
-            {loading ? " · analysing" : ""}
-          </span>
+    <div className="ops-simple">
+      <div className={"bignums ops-top" + (scan.scanning ? " scanning" : "")}>
+        <div className="bignum">
+          <div className="label">Seen</div>
+          <div className="value">
+            {haveAnalysis ? fmt(findings!.coverage.coverage_pct, 0) : "–"}
+            {haveAnalysis && <small>%</small>}
+          </div>
         </div>
-        {alarms.length > 0 && <div className="ops-alarm">{alarms.join(" · ")}</div>}
-        <div className="canvas-toolbar">
-          {TOGGLES.map((t) => (
-            <label key={t.k} className="inline-check">
-              <input type="checkbox" checked={toggles[t.k]} onChange={(e) => setToggle(t.k, e.target.checked)} />
-              {t.label}
-            </label>
-          ))}
-          <span className="spacer" />
-          <button className="small" onClick={() => mapRef.current?.fit()} title="Fit the analysed area in the view">
-            Fit
-          </button>
+        <div className="bignum">
+          <div className="label">Possible voids</div>
+          <div className="value">{haveAnalysis ? findings!.voids.length : "–"}</div>
         </div>
-        <OpsMap ref={mapRef} />
-        <div className="legend ops-legend">
-          <span className="sw" style={{ background: rgb(TRAV_RGB[1]) }} /> passable
-          <span className="sw" style={{ background: rgb(TRAV_RGB[2]) }} /> marginal
-          <span className="sw" style={{ background: rgb(TRAV_RGB[3]) }} /> blocked
-          <span className="sw hatch-diag" style={{ color: HATCH_COLOUR.shadow }} /> shadow
-          <span className="sw hatch-horiz" style={{ color: HATCH_COLOUR.blind }} /> blind
-          <span className="dim">unknown dark</span>
-          <span className="spacer" />
-          <span>{range ? fmt(range[0], 2) : "–"}</span>
-          <div className="bar" style={{ background: rampCssGradient(), maxWidth: 120 }} />
-          <span>{range ? fmt(range[1], 2) : "–"}</span>
-          <span className="dim">height above floor (m)</span>
+        <div className="bignum">
+          <div className="label">Next</div>
+          <div className="value ops-next">{nextStationText(findings)}</div>
         </div>
-        <div className="ops-actions">
-          <button
-            className={running ? "danger" : "primary"}
-            disabled={scanBusy || (!running && !ready)}
-            onClick={scan}
-            title={ready ? "Start a sweep with the Scan job form in the sidebar" : "Connect lidar and servo first"}
-          >
-            {running ? "Stop" : "Scan"}
-          </button>
-          {job && running && (
-            <>
-              <div className="progress" title={`${fmt(pct, 0)}%`}>
-                <div style={{ width: `${pct}%` }} />
-              </div>
-              <span className="mono dim">
-                step {job.step} of {job.n_steps} · φ {fmt(job.phi_deg, 0)}° · ETA {fmtDuration(job.eta_s)}
-              </span>
-            </>
-          )}
-          <button className={routeMode ? "toggled" : ""} onClick={() => setRouteMode(!routeMode)} disabled={!layers}>
-            Route
-          </button>
-          <button onClick={clearRoute} disabled={!route && !routeStart && !routeError}>
-            Clear route
-          </button>
-          <button onClick={() => void refreshOps()} disabled={loading}>
-            Refresh
-          </button>
-          <button onClick={() => void report()} disabled={!findings} title="Download the map as PNG and the findings as JSON">
-            Report
-          </button>
-          <span className="spacer" />
-          <span className="mono ops-route-text">{routeText}</span>
-          {scanErr && <span className="err mono">{scanErr}</span>}
-        </div>
-      </section>
-      <div className="ops-right">
-        <OpsFindings />
       </div>
+
+      <div className="ops-main">
+        <section className="panel ops-mappanel">
+          {alarms.length > 0 && <div className="ops-alarm">{alarms.join(" · ")}</div>}
+          {error && <div className="ops-alarm">analysis: {error}</div>}
+          {connected || haveSession ? (
+            <>
+              <OpsMap ref={mapRef} scanningText={scanningText} />
+              <div className="legend ops-legend">
+                {advanced ? (
+                  <>
+                    <span className="sw sw-passable" /> passable
+                    <span className="sw sw-marginal" /> marginal
+                    <span className="sw sw-blocked" /> blocked
+                    <span className="sw hatch-diag" /> shadow
+                    <span className="sw hatch-horiz" /> blind
+                    <span className="dim">unknown dark</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="sw sw-passable" /> can walk
+                    <span className="sw sw-blocked" /> blocked
+                    <span className="sw hatch-diag" /> not seen yet
+                    <span className="sw sw-void" /> V1 possible void
+                    <span className="dim">arrow: next station</span>
+                  </>
+                )}
+                <span className="spacer" />
+                <button className="small" onClick={() => mapRef.current?.fit()} title="Fit the scanned area in the view">
+                  Fit
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="empty ops-connect">Connect the LiDAR and servo on the Live scan tab</div>
+          )}
+        </section>
+        <OpsSummary />
+      </div>
+
+      <div className="ops-actions">
+        <button className="primary" disabled={!connected || scan.scanning || scanBusy} onClick={() => void doScan()} title="Sweep with the Scan job settings">
+          Scan
+        </button>
+        {scanningText && <span className="mono dim">{scanningText}</span>}
+        {scanErr && <span className="err mono">{scanErr}</span>}
+        <button className={routeMode ? "toggled" : ""} disabled={!layers || layers.w === 0} onClick={onRoute}>
+          {routeLabel}
+        </button>
+        <span className="mono ops-route-text">{routeLine}</span>
+        <button disabled={!haveAnalysis} onClick={() => void report()} title="Download the map as PNG and the findings as JSON">
+          Report
+        </button>
+        {loading && <span className="dim">analysing</span>}
+        <span className="spacer" />
+        <button className="ops-adv-toggle" onClick={() => setAdvanced(!advanced)} aria-expanded={advanced}>
+          Advanced {advanced ? "▾" : "▸"}
+        </button>
+      </div>
+
+      {advanced && <OpsAdvanced />}
     </div>
   );
 }

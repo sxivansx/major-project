@@ -31,8 +31,10 @@ export function text(v: string | number | null | undefined): string {
   return String(v);
 }
 
-// Assistant call cost, e.g. $0.0003
+// Assistant call cost: $0.005, $0.0003, $0.0012 (up to 4 decimals, no trailing zeros)
 export function fmtUsd(v: number | null | undefined): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "–";
-  return "$" + v.toFixed(4);
+  let s = v.toFixed(4).replace(/0+$/, "");
+  if (s.endsWith(".")) s += "00";
+  return "$" + s;
 }

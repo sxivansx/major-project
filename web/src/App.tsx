@@ -47,8 +47,9 @@ export default function App() {
     return () => ws.stop();
   }, []);
 
+  // The Operator tab is for the deployment point, not the bench: no sidebar.
   return (
-    <div className="app">
+    <div className={"app" + (tab === "ops" ? " no-sidebar" : "")}>
       <aside className="sidebar">
         <ConnectionPanel />
         <ServoPanel />

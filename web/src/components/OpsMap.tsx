@@ -8,10 +8,20 @@ import { planRoute, useOps } from "../store/ops";
 // scanner at the origin, +x the lidar's 0° (cable) mark, +y up on screen.
 // Bearings in the findings are clockwise from +x, so a bearing b points
 // along (cos b, -sin b) in world coordinates.
+//
+// Two renderings. Simple (default): one green for walkable, one red for
+// blocked, one hatch for everything not seen (shadow, blind, unknown), labels
+// only on voids, plus the next-station arrow. Advanced: the layer toggles
+// (terrain ramp, traversability, shadow hatch, blind hatch) and every finding
+// outlined and labelled.
 
 export interface OpsMapHandle {
   toBlob(): Promise<Blob | null>;
   fit(): void;
+}
+
+interface Props {
+  scanningText?: string | null; // shown top-left while a sweep runs
 }
 
 interface View {
@@ -46,7 +56,13 @@ export const TRAV_RGB: Record<number, [number, number, number]> = {
   2: [176, 138, 69],
   3: [168, 85, 85],
 };
-export const HATCH_COLOUR = { shadow: "#9a9a9a", blind: "#7a7a7a" };
+// Simple view: walkable green (marginal = same green, lighter), blocked red.
+export const SIMPLE_RGBA: Record<number, [number, number, number, number]> = {
+  1: [95, 143, 100, 150],
+  2: [95, 143, 100, 70],
+  3: [168, 85, 85, 150],
+};
+export const HATCH_COLOUR = { shadow: "#9a9a9a", blind: "#7a7a7a", notSeen: "#7c7c7c" };
 
 export const FINDING_STYLE: Record<FindingKind, { colour: string; width: number; dash: number[]; label: string }> = {
   voids: { colour: C.accent, width: 2, dash: [], label: "void" },
@@ -54,6 +70,20 @@ export const FINDING_STYLE: Record<FindingKind, { colour: string; width: number;
   depressions: { colour: "#b8b8b8", width: 1, dash: [2, 3], label: "depression" },
   shadows: { colour: C.dim, width: 1, dash: [6, 4], label: "shadow" },
 };
+
+// Plain words for the hover readout in the simple view.
+export function classWords(cls: number): string {
+  switch (cls) {
+    case 1:
+      return "can walk";
+    case 2:
+      return "can walk, rough";
+    case 3:
+      return "blocked";
+    default:
+      return "not seen";
+  }
+}
 
 // ---- layer images (world-aligned, row 0 at the top = max y) ----
 
@@ -101,7 +131,7 @@ function renderTerrain(l: OpsLayersFrame, range: [number, number]): HTMLCanvasEl
   return off;
 }
 
-function renderTrav(l: OpsLayersFrame): HTMLCanvasElement | null {
+function renderClasses(l: OpsLayersFrame, colours: Record<number, [number, number, number, number]>): HTMLCanvasElement | null {
   if (l.w === 0 || l.h === 0) return null;
   const off = document.createElement("canvas");
   off.width = l.w;
@@ -112,18 +142,24 @@ function renderTrav(l: OpsLayersFrame): HTMLCanvasElement | null {
   for (let iy = 0; iy < l.h; iy++) {
     const row = l.h - 1 - iy;
     for (let ix = 0; ix < l.w; ix++) {
-      const c = TRAV_RGB[l.classes[iy * l.w + ix]];
+      const c = colours[l.classes[iy * l.w + ix]];
       if (!c) continue;
       const o = (row * l.w + ix) * 4;
       px[o] = c[0];
       px[o + 1] = c[1];
       px[o + 2] = c[2];
-      px[o + 3] = 128;
+      px[o + 3] = c[3];
     }
   }
   ctx.putImageData(img, 0, 0);
   return off;
 }
+
+const TRAV_RGBA: Record<number, [number, number, number, number]> = {
+  1: [...TRAV_RGB[1], 128],
+  2: [...TRAV_RGB[2], 128],
+  3: [...TRAV_RGB[3], 128],
+};
 
 function hatchTile(kind: "diag" | "horiz", colour: string): HTMLCanvasElement {
   const t = document.createElement("canvas");
@@ -148,9 +184,9 @@ function hatchTile(kind: "diag" | "horiz", colour: string): HTMLCanvasElement {
   return t;
 }
 
-// Cells of one class filled with a repeating hatch, at HATCH_PX per cell so
-// the lines stay continuous across neighbouring cells.
-function renderHatch(l: OpsLayersFrame, cls: number, kind: "diag" | "horiz", colour: string): HTMLCanvasElement | null {
+// Cells of the given classes filled with a repeating hatch, at HATCH_PX per
+// cell so the lines stay continuous across neighbouring cells.
+function renderHatch(l: OpsLayersFrame, classes: number[], kind: "diag" | "horiz", colour: string): HTMLCanvasElement | null {
   if (l.w === 0 || l.h === 0) return null;
   const off = document.createElement("canvas");
   off.width = l.w * HATCH_PX;
@@ -159,17 +195,19 @@ function renderHatch(l: OpsLayersFrame, cls: number, kind: "diag" | "horiz", col
   const pat = ctx.createPattern(hatchTile(kind, colour), "repeat");
   if (!pat) return null;
   ctx.fillStyle = pat;
+  const want = new Uint8Array(256);
+  for (const c of classes) want[c] = 1;
   let any = false;
   for (let iy = 0; iy < l.h; iy++) {
     const row = l.h - 1 - iy;
     let ix = 0;
     while (ix < l.w) {
-      if (l.classes[iy * l.w + ix] !== cls) {
+      if (!want[l.classes[iy * l.w + ix]]) {
         ix++;
         continue;
       }
       let run = ix + 1;
-      while (run < l.w && l.classes[iy * l.w + run] === cls) run++;
+      while (run < l.w && want[l.classes[iy * l.w + run]]) run++;
       ctx.fillRect(ix * HATCH_PX, row * HATCH_PX, (run - ix) * HATCH_PX, HATCH_PX);
       any = true;
       ix = run;
@@ -233,7 +271,7 @@ interface Hover {
   cls: number;
 }
 
-export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
+export const OpsMap = forwardRef<OpsMapHandle, Props>(function OpsMap({ scanningText }, ref) {
   const layers = useOps((s) => s.layers);
   const findings = useOps((s) => s.findings);
   const route = useOps((s) => s.route);
@@ -244,9 +282,11 @@ export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
   const focus = useOps((s) => s.focus);
   const fitNonce = useOps((s) => s.fitNonce);
   const toggles = useOps((s) => s.toggles);
+  const advanced = useOps((s) => s.advanced);
   const select = useOps((s) => s.select);
   const setRouteStart = useOps((s) => s.setRouteStart);
   const setRouteMode = useOps((s) => s.setRouteMode);
+  const simple = !advanced;
 
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -257,14 +297,14 @@ export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
   const dragRef = useRef<{ x: number; y: number; cx: number; cy: number; moved: boolean } | null>(null);
 
   const range = useMemo(() => (layers ? heightRange(layers) : ([0, 1] as [number, number])), [layers]);
-  const terrainImg = useMemo(() => (layers ? renderTerrain(layers, range) : null), [layers, range]);
-  const travImg = useMemo(() => (layers ? renderTrav(layers) : null), [layers]);
-  const shadowImg = useMemo(() => (layers ? renderHatch(layers, 4, "diag", HATCH_COLOUR.shadow) : null), [layers]);
-  const blindImg = useMemo(() => (layers ? renderHatch(layers, 5, "horiz", HATCH_COLOUR.blind) : null), [layers]);
+  const terrainImg = useMemo(() => (layers && advanced && toggles.terrain ? renderTerrain(layers, range) : null), [layers, range, advanced, toggles.terrain]);
+  const travImg = useMemo(() => (layers ? renderClasses(layers, simple ? SIMPLE_RGBA : TRAV_RGBA) : null), [layers, simple]);
+  const notSeenImg = useMemo(() => (layers && simple ? renderHatch(layers, [0, 4, 5], "diag", HATCH_COLOUR.notSeen) : null), [layers, simple]);
+  const shadowImg = useMemo(() => (layers && advanced ? renderHatch(layers, [4], "diag", HATCH_COLOUR.shadow) : null), [layers, advanced]);
+  const blindImg = useMemo(() => (layers && advanced ? renderHatch(layers, [5], "horiz", HATCH_COLOUR.blind) : null), [layers, advanced]);
 
   // The view fits the analysed area on the first non-empty layers and follows
-  // it as the area grows during a sweep, until the user pans or zooms; the Fit
-  // button starts that over.
+  // it as the area grows, until the user pans or zooms; Fit starts that over.
   const fittedBoundsRef = useRef("");
   const userMovedRef = useRef(false);
   const doFit = () => {
@@ -384,18 +424,25 @@ export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
         const gw = layers.w * layers.cell_m * scale;
         const gh = layers.h * layers.cell_m * scale;
         ctx.imageSmoothingEnabled = false;
-        if (toggles.terrain && terrainImg) ctx.drawImage(terrainImg, gx, gy, gw, gh);
-        if (toggles.traversability && travImg) ctx.drawImage(travImg, gx, gy, gw, gh);
-        ctx.imageSmoothingEnabled = true;
-        if (toggles.shadow && shadowImg) ctx.drawImage(shadowImg, gx, gy, gw, gh);
-        if (toggles.blind && blindImg) ctx.drawImage(blindImg, gx, gy, gw, gh);
+        if (simple) {
+          if (travImg) ctx.drawImage(travImg, gx, gy, gw, gh);
+          ctx.imageSmoothingEnabled = true;
+          if (notSeenImg) ctx.drawImage(notSeenImg, gx, gy, gw, gh);
+        } else {
+          if (toggles.terrain && terrainImg) ctx.drawImage(terrainImg, gx, gy, gw, gh);
+          if (toggles.traversability && travImg) ctx.drawImage(travImg, gx, gy, gw, gh);
+          ctx.imageSmoothingEnabled = true;
+          if (toggles.shadow && shadowImg) ctx.drawImage(shadowImg, gx, gy, gw, gh);
+          if (toggles.blind && blindImg) ctx.drawImage(blindImg, gx, gy, gw, gh);
+        }
         ctx.strokeStyle = "#454545";
         ctx.strokeRect(Math.round(gx) + 0.5, Math.round(gy) + 0.5, Math.round(gw), Math.round(gh));
       }
 
-      // findings outlines
-      if (findings && toggles.findings) {
-        for (const kind of FINDING_KINDS) {
+      // findings outlines: voids always, the rest only in Advanced
+      if (findings && (simple || toggles.findings)) {
+        const kinds: FindingKind[] = simple ? ["voids"] : FINDING_KINDS;
+        for (const kind of kinds) {
           const st = FINDING_STYLE[kind];
           for (const f of findings[kind]) {
             const b = f.bbox_m;
@@ -421,7 +468,7 @@ export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
 
       // next station: arrow from the scanner at the bearing (clockwise from +x)
       const ns = findings?.next_station;
-      if (toggles.station && ns && ns.bearing_deg !== null && ns.bearing_deg !== undefined) {
+      if ((simple || toggles.station) && ns && ns.bearing_deg !== null && ns.bearing_deg !== undefined) {
         const len = Math.max(0.5, ns.distance_m);
         const dx = Math.cos(ns.bearing_deg * DEG);
         const dy = -Math.sin(ns.bearing_deg * DEG);
@@ -438,7 +485,7 @@ export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
         ctx.stroke();
         arrowHead(ctx, x0, y0, x1, y1, 9);
         ctx.lineWidth = 1;
-        label(ctx, `next station ${fmt(ns.bearing_deg, 0)}° ${fmt(ns.distance_m, 1)} m`, x1 + 6, y1 + 4, C.text);
+        label(ctx, simple ? "next station" : `next station ${fmt(ns.bearing_deg, 0)}° ${fmt(ns.distance_m, 1)} m`, x1 + 6, y1 + 4, C.text);
       }
 
       // route
@@ -489,7 +536,7 @@ export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
         ctx.stroke();
         arrowHead(ctx, x0, y0, ax, y0, 7);
         ctx.lineWidth = 1;
-        label(ctx, "+x cable mark", ax + 4, y0 + 4, C.accent);
+        label(ctx, simple ? "scanner" : "+x cable mark", ax + 4, y0 + 4, C.accent);
       }
 
       // hovered cell
@@ -501,18 +548,18 @@ export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
         ctx.strokeRect(Math.round(hx) + 0.5, Math.round(hy) + 0.5, Math.round(cs), Math.round(cs));
       }
 
-      if (!layers) {
+      if (!layers || layers.w === 0) {
         ctx.fillStyle = C.dim;
         ctx.font = "13px system-ui, sans-serif";
         ctx.textAlign = "center";
-        ctx.fillText("no analysis yet: scan or load a session", W / 2, 24);
+        ctx.fillText(scanningText ? "first results after this scan" : "nothing scanned yet", W / 2, H / 2 + 24);
       }
     };
     paint();
     const ro = new ResizeObserver(paint);
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [view, layers, findings, route, routeEnds, routeStart, selected, hover, toggles, terrainImg, travImg, shadowImg, blindImg]);
+  }, [view, layers, findings, route, routeEnds, routeStart, selected, hover, toggles, simple, terrainImg, travImg, notSeenImg, shadowImg, blindImg, scanningText]);
 
   // ---- mouse ----
 
@@ -567,10 +614,11 @@ export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
       }
       return;
     }
-    // select the smallest finding whose bbox contains the click
+    // select the smallest finding whose bbox contains the click (voids only in the simple view)
     let best: { f: Finding; area: number } | null = null;
     if (findings) {
-      for (const kind of FINDING_KINDS) {
+      const kinds: FindingKind[] = simple ? ["voids"] : FINDING_KINDS;
+      for (const kind of kinds) {
         for (const f of findings[kind]) {
           const b = f.bbox_m;
           if (p[0] >= b[0] && p[0] <= b[2] && p[1] >= b[1] && p[1] <= b[3]) {
@@ -595,13 +643,16 @@ export const OpsMap = forwardRef<OpsMapHandle>(function OpsMap(_props, ref) {
           setHover(null);
         }}
       />
+      {scanningText && <div className="ops-scanning">{scanningText}</div>}
       {hover && (
         <div className="heightmap-readout">
-          x {fmt(hover.x, 2)} y {fmt(hover.y, 2)} · h {Number.isFinite(hover.h) ? fmt(hover.h, 2) + " m" : "–"} ·{" "}
-          {CLASS_NAMES[hover.cls] ?? `class ${hover.cls}`}
+          x {fmt(hover.x, 2)} y {fmt(hover.y, 2)} ·{" "}
+          {simple
+            ? classWords(hover.cls)
+            : `h ${Number.isFinite(hover.h) ? fmt(hover.h, 2) + " m" : "–"} · ${CLASS_NAMES[hover.cls] ?? `class ${hover.cls}`}`}
         </div>
       )}
-      <div className="scene-overlay">drag: pan · wheel: zoom · click a finding to select{routeMode ? " · route: click start, then goal" : ""}</div>
+      <div className="scene-overlay">drag: pan · wheel: zoom{routeMode ? " · route: click start, then goal" : ""}</div>
     </div>
   );
 });

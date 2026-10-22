@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
-import { FINDING_KINDS, type Finding, type FindingKind, type Findings } from "../api/types";
-import { fmt, fmtInt, fmtTime } from "../lib/format";
+import type { Finding, FindingKind, Findings } from "../api/types";
+import { fmt, fmtInt } from "../lib/format";
 import { refreshOps, useOps } from "../store/ops";
-import { OpsAssistant } from "./OpsAssistant";
+
+// Pieces of the Advanced panel: the full situation block, one finding list
+// per kind, and the analysis parameter controls.
 
 const CELL_OPTIONS = [0.05, 0.1, 0.2];
 
@@ -19,7 +21,7 @@ const KIND_VALUE: Record<FindingKind, { key: keyof Finding; label: string } | nu
   shadows: null,
 };
 
-function Situation({ f }: { f: Findings }) {
+export function Situation({ f }: { f: Findings }) {
   const c = f.coverage;
   const t = f.traversability;
   const ns = f.next_station;
@@ -63,6 +65,12 @@ function Situation({ f }: { f: Findings }) {
         <dd>{fmtInt(f.points)}</dd>
         <dt>Next station</dt>
         <dd>{ns ? (ns.bearing_deg === null ? "rotate in place" : `bearing ${fmt(ns.bearing_deg, 0)}° · ${fmt(ns.distance_m, 1)} m`) : "–"}</dd>
+        {f.scan && (
+          <>
+            <dt>Scan</dt>
+            <dd>{f.scan.in_progress ? `in progress ${f.scan.step ?? "?"}/${f.scan.n_steps ?? "?"}` : f.scan.session ? `session ${f.scan.session}` : "complete"}</dd>
+          </>
+        )}
       </dl>
       {c.shadow_cells > 0 && <div className="hint">Shadow: occluded by a nearer object, scan from elsewhere.</div>}
       {c.blind_stripe && c.blind_stripe.cells > 0 && <div className="hint">Blind: {c.blind_stripe.note}</div>}
@@ -71,7 +79,7 @@ function Situation({ f }: { f: Findings }) {
   );
 }
 
-function FindingList({ kind, items }: { kind: FindingKind; items: Finding[] }) {
+export function FindingList({ kind, items }: { kind: FindingKind; items: Finding[] }) {
   const selected = useOps((s) => s.selected);
   const select = useOps((s) => s.select);
   const focusOn = useOps((s) => s.focusOn);
@@ -118,11 +126,8 @@ function FindingList({ kind, items }: { kind: FindingKind; items: Finding[] }) {
   );
 }
 
-export function OpsFindings() {
-  const findings = useOps((s) => s.findings);
-  const loading = useOps((s) => s.loading);
-  const error = useOps((s) => s.error);
-  const updatedAt = useOps((s) => s.updatedAt);
+// Cell size (re-queries on change) and max step (re-queries on Enter / blur).
+export function ParamControls() {
   const cell = useOps((s) => s.cell);
   const maxStep = useOps((s) => s.maxStep);
   const setParams = useOps((s) => s.setParams);
@@ -139,61 +144,37 @@ export function OpsFindings() {
   };
 
   return (
-    <section className="panel ops-col">
-      <div className="panel-head">
-        <span>Findings</span>
-        <span className="sub">{loading ? "analysing" : updatedAt ? `updated ${fmtTime(updatedAt)}` : "no analysis"}</span>
-      </div>
-      <div className="canvas-toolbar">
-        <label>
-          Cell m
-          <select
-            value={String(cell)}
-            onChange={(e) => {
-              setParams({ cell: Number(e.target.value) });
-              void refreshOps();
-            }}
-          >
-            {CELL_OPTIONS.map((c) => (
-              <option key={c} value={String(c)}>
-                {c}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label title="Largest step a person can climb; cells above it are blocked">
-          Max step m
-          <input
-            type="number"
-            step={0.05}
-            min={0.01}
-            value={stepText}
-            onChange={(e) => setStepText(e.target.value)}
-            onBlur={commitStep}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-            }}
-          />
-        </label>
-        <span className="spacer" />
-        <button className="small primary" disabled={loading} onClick={() => void refreshOps()} title="GET /api/ops/findings and /api/ops/layers">
-          Refresh analysis
-        </button>
-      </div>
-      <div className="panel-body ops-scroll">
-        {error && <div className="error" style={{ padding: "6px 10px", margin: 0 }}>{error}</div>}
-        {!findings && !error && <div className="empty">no analysis yet: scan or load a session</div>}
-        {findings && findings.grid.w === 0 && <div className="empty">no points in the live cloud: scan or load a session</div>}
-        {findings && findings.grid.w > 0 && (
-          <>
-            <Situation f={findings} />
-            {FINDING_KINDS.map((k) => (
-              <FindingList key={k} kind={k} items={findings[k]} />
-            ))}
-          </>
-        )}
-        <OpsAssistant />
-      </div>
-    </section>
+    <>
+      <label>
+        Cell m
+        <select
+          value={String(cell)}
+          onChange={(e) => {
+            setParams({ cell: Number(e.target.value) });
+            void refreshOps();
+          }}
+        >
+          {CELL_OPTIONS.map((c) => (
+            <option key={c} value={String(c)}>
+              {c}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label title="Largest step a person can climb; cells above it are blocked">
+        Max step m
+        <input
+          type="number"
+          step={0.05}
+          min={0.01}
+          value={stepText}
+          onChange={(e) => setStepText(e.target.value)}
+          onBlur={commitStep}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          }}
+        />
+      </label>
+    </>
   );
 }

@@ -256,6 +256,7 @@ ok(fd.shadows.length >= 1, "at least one shadow region behind a box");
 // at the bench rig's 8 cm the stripe is ±4 cm and may cover no cell; on a 1 m tripod it is ±58 cm
 ok(cov.blind_stripe !== null && cov.blind_stripe.half_width_m > 0, `blind stripe ±${cov.blind_stripe?.half_width_m} m, ${cov.blind_cells} cells`);
 ok(fd.next_station === null || typeof fd.next_station.reason === "string", `next station ${fd.next_station ? `${fd.next_station.bearing_deg}° ${fd.next_station.distance_m} m` : "none"}`);
+ok(fd.scan === undefined || (typeof fd.scan.in_progress === "boolean" && fd.scan.in_progress === false), `findings.scan ${fd.scan ? JSON.stringify(fd.scan) : "absent (older core)"}`);
 
 const ly = parseOpsLayers(await reqBin("/ops/layers" + OPS_Q));
 ok(ly.w === fd.grid.w && ly.h === fd.grid.h && Math.abs(ly.x0_m - fd.grid.x0_m) < 1e-5 && Math.abs(ly.y0_m - fd.grid.y0_m) < 1e-5, `layers grid matches findings grid (${ly.w}x${ly.h})`);
@@ -350,6 +351,17 @@ if (ai.available) {
   const ak = await req<AiAsk>("POST", "/ai/ask", { question: `route to ${target}` });
   ok(typeof ak.intent === "string" && typeof ak.answer === "string" && ak.confidence >= 0 && ak.confidence <= 1, `ask -> intent ${ak.intent} confidence ${ak.confidence}`);
   ok(ak.intent === "route" && !!ak.tool && typeof (ak.tool as { found?: unknown }).found === "boolean", "ask route carries a route result as tool");
+} else {
+  // without a key the situation report is still expected (a template), ask is not
+  const sr = await fetch(BASE + "/api/ai/sitrep", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cell: 0.1 }) });
+  ok(sr.status === 200 || sr.status === 503, `sitrep without a key -> ${sr.status}`);
+  if (sr.ok) {
+    const j = (await sr.json()) as AiSitrep;
+    ok(typeof j.text === "string" && j.text.length > 0 && j.model === "template", `template sitrep (model ${j.model})`);
+    ok(!/survivor/i.test(j.text), "template sitrep never says survivor");
+  }
+  const ak = await fetch(BASE + "/api/ai/ask", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: "coverage" }) });
+  ok(ak.status === 503, `ask without a key -> ${ak.status}`);
 }
 
 {
