@@ -1,0 +1,11 @@
+.claude/
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+web/dist/
+driver/build/
+driver/rplidar_sdk/output/
+driver/rplidar_sdk/obj/
+sessions/
+.DS_Store
