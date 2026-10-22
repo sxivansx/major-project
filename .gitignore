@@ -9,3 +9,5 @@ driver/rplidar_sdk/output/
 driver/rplidar_sdk/obj/
 sessions/
 .DS_Store
+core/config.json
+core/.venv/
