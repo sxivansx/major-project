@@ -133,6 +133,7 @@ class Rig:
                 "error": self.scan_error,
             }
             t = self.tilt
+            meas = t.meas_deg if t else None
             servo = {
                 "connected": t is not None,
                 "port": t.port if t else None,
@@ -141,6 +142,10 @@ class Rig:
                 "min_deg": t.min_deg if t else None,
                 "max_deg": t.max_deg if t else None,
                 "range": t.range if t else None,
+                "meas_deg": meas,
+                "phi_meas_deg": self.config.mount.enc_to_phi(meas) if meas is not None else None,
+                "encoder": t.encoder if t else None,
+                "settled": t.settled if t else None,
             }
             return {
                 "lidar": lidar,
@@ -431,9 +436,34 @@ class Rig:
             if self.job:
                 self.publish_json({"type": "job", **self.job})
 
+    def _settle(self, settle_ms: int) -> float | None:
+        """Wait for the cradle to stop moving. Returns the measured tilt φ when an encoder exists, else None.
+
+        With an encoder the firmware's W command waits for mechanical stability (settle_ms is its timeout
+        margin); without one we can only sleep for settle_ms.
+        """
+        with self._lock:
+            t = self._tilt()
+            has_enc = t.meas_deg is not None
+        if not has_enc:
+            if settle_ms:
+                self._job_stop.wait(settle_ms / 1000)
+            return None
+        # W blocks inside the firmware for up to its timeout. The serial port has its own lock, so the rig
+        # lock is deliberately NOT held here: scan frames and status must keep flowing while the cradle settles.
+        try:
+            settled = t.wait_settled(settle_ms + 1000)
+            t.refresh()
+        except TiltError as e:
+            raise RigError(str(e)) from e
+        meas = t.meas_deg
+        if not settled:
+            self.log("warn", "encoder did not settle in time, using its last reading")
+        return self.config.mount.enc_to_phi(meas) if meas is not None else None
+
     def _run_job(self, params: JobParams, job_id: int, phis: np.ndarray) -> None:
         cfg = self.config
-        cols = {k: [] for k in ("step", "phi", "theta", "range", "quality", "t")}
+        cols = {k: [] for k in ("step", "phi", "phi_meas", "theta", "range", "quality", "t")}
         last_grid = 0.0
         t0 = time.monotonic()
         state, error = "done", None
@@ -444,10 +474,13 @@ class Rig:
                     state = "stopped"
                     break
                 self.move_servo(phi_deg=phi)
-                if params.settle_ms:
-                    if self._job_stop.wait(params.settle_ms / 1000):
-                        state = "stopped"
-                        break
+                phi_meas = self._settle(params.settle_ms)
+                if self._job_stop.is_set():
+                    state = "stopped"
+                    break
+                phi_used = phi if phi_meas is None else phi_meas
+                if phi_meas is not None and abs(phi_meas - phi) > 2.0:
+                    self.log("warn", f"step {i}: encoder reads φ {phi_meas:.1f}°, commanded {phi:.1f}°")
                 after = time.time()
                 frames = self.wait_frames(params.rotations + 1, after)[1:]  # drop the first (stale rotation)
                 ths, rs, qs, ts = [], [], [], []
@@ -460,9 +493,10 @@ class Rig:
                     ts.append(np.full(int(keep.sum()), f.t))
                 theta = np.concatenate(ths) if ths else np.zeros(0, np.float32)
                 rng = np.concatenate(rs) if rs else np.zeros(0, np.float32)
-                xyz = lidar_to_base(theta, rng, phi, cfg.mount)
+                xyz = lidar_to_base(theta, rng, phi_used, cfg.mount)
                 cols["step"].append(np.full(theta.shape[0], i, np.uint16))
                 cols["phi"].append(np.full(theta.shape[0], phi, np.float32))
+                cols["phi_meas"].append(np.full(theta.shape[0], np.nan if phi_meas is None else phi_meas, np.float32))
                 cols["theta"].append(theta.astype(np.float32))
                 cols["range"].append(rng.astype(np.float32))
                 cols["quality"].append(np.concatenate(qs) if qs else np.zeros(0, np.uint8))
@@ -486,25 +520,30 @@ class Rig:
 
         sid = None
         n_total = sum(a.shape[0] for a in cols["theta"])
-        if n_total:
-            arrays = {k: np.concatenate(v) for k, v in cols.items()}
-            sid = self.sessions.new_id(params.name)
-            meta = {
-                "id": sid,
-                "name": params.name,
-                "created": time.time(),
-                "n_points": int(n_total),
-                "n_steps": int(len(phis)),
-                "phi_start": params.phi_start,
-                "phi_end": params.phi_end,
-                "phi_step": params.phi_step,
-                "rotations": params.rotations,
-                "settle_ms": params.settle_ms,
-                "state": state,
-                "lidar": {k: self.scan_info.get(k) for k in ("model", "serial", "firmware")},
-                "mount": cfg.mount.model_dump(),
-            }
-            self.sessions.save(meta, arrays)
+        try:
+            if n_total:
+                arrays = {k: np.concatenate(v) for k, v in cols.items()}
+                sid = self.sessions.new_id(params.name)
+                meta = {
+                    "id": sid,
+                    "name": params.name,
+                    "created": time.time(),
+                    "n_points": int(n_total),
+                    "n_steps": int(len(phis)),
+                    "phi_start": params.phi_start,
+                    "phi_end": params.phi_end,
+                    "phi_step": params.phi_step,
+                    "rotations": params.rotations,
+                    "settle_ms": params.settle_ms,
+                    "state": state,
+                    "encoder": self.tilt.encoder if self.tilt else None,
+                    "lidar": {k: self.scan_info.get(k) for k in ("model", "serial", "firmware")},
+                    "mount": cfg.mount.model_dump(),
+                }
+                self.sessions.save(meta, arrays)
+        except Exception as e:  # noqa: BLE001  (a job must never stay "running" because the save failed)
+            log.exception("job %d: saving the session failed", job_id)
+            state, error, sid = "error", f"save failed: {type(e).__name__}: {e}", None
         with self._lock:
             self.job.update(state=state, error=error, eta_s=0.0, session_id=sid, finished=time.time())
             self.session_loaded = sid

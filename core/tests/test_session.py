@@ -13,6 +13,7 @@ def test_round_trip_and_exports(tmp_path):
     arrays = {
         "step": np.zeros(n, np.uint16),
         "phi": np.full(n, -30.0, np.float32),
+        "phi_meas": np.r_[np.full(n - 2, -31.0, np.float32), np.full(2, np.nan, np.float32)],
         "theta": np.linspace(0, 90, n, dtype=np.float32),
         "range": np.linspace(1, 2, n, dtype=np.float32),
         "quality": np.full(n, 50, np.uint8),
@@ -26,10 +27,21 @@ def test_round_trip_and_exports(tmp_path):
     np.testing.assert_array_equal(a["theta"], arrays["theta"])
     xyz = s.points(sid)
     assert xyz.shape == (n, 3)
+    # measured phi is used where present, commanded where NaN
+    used = SessionStore.phi_used(a)
+    assert used[0] == -31.0 and used[-1] == -30.0
+    # a legacy session without phi_meas still loads
+    import numpy as _np
+
+    legacy = {k: v for k, v in arrays.items() if k != "phi_meas"}
+    s.save({**meta, "id": "legacy-1"}, legacy)
+    assert _np.isnan(s.arrays("legacy-1")["phi_meas"]).all()
+    assert s.points("legacy-1").shape == (n, 3)
+    s.delete("legacy-1")
     ply = s.ply(xyz).decode()
     assert ply.startswith("ply\n") and f"element vertex {n}" in ply and ply.count("\n") == 7 + n
     csv = s.csv(sid).decode().splitlines()
-    assert csv[0] == "phi,theta,range,quality,x,y,z" and len(csv) == n + 1
+    assert csv[0] == "phi,phi_meas,theta,range,quality,x,y,z" and len(csv) == n + 1
     s.delete(sid)
     assert s.list() == []
     with pytest.raises(KeyError):

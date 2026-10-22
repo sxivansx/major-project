@@ -48,15 +48,17 @@ Logs go to stderr only. stdout is frames only.
 | Command | Reply | Notes |
 |---|---|---|
 | `I` | `OBSLAM-TILT v1` | identify, used for port auto-detect |
-| `?` | `STATUS angle=<deg> min=<deg> max=<deg> range=<180\|270> us_min=<us> us_max=<us>` | |
-| `T <deg>` | `OK <deg>` | move immediately, clamped to [min,max]; reply after the pulse is set, not after settle |
+| `?` | `STATUS angle=<deg> meas=<deg\|nan> min=<deg> max=<deg> range=<180\|270> us_min=<us> us_max=<us> enc=<ok\|nomag\|weak\|strong\|err\|none> settled=<0\|1>` | `meas` = AS5600 reading on the servo-degree scale |
+| `T <deg>` | `OK <deg> [<meas>]` | move immediately, clamped to [min,max]; reply after the pulse is set, not after settle. `<meas>` present only with an encoder |
+| `W [ms]` | `OK <meas> settled=<0\|1>` | block until the encoder is stable (\|Δ\| < 0.15° over 150 ms) or `ms` elapses (default 1500, max 10000). Without an encoder: fixed 300 ms, `settled=1` |
+| `E` / `E zero` / `E dir` | `ENC raw=<0..4095> deg=<deg> zero=<deg> dir=<1\|-1> status=<…>` / `OK <meas>` | encoder diagnostics; `zero` aligns `meas` to the current commanded angle, `dir` flips direction; both persisted |
 | `S <deg> <ms>` | `OK <deg>` | ease to angle over ms, reply when done |
 | `H` | `OK <deg>` | go to RANGE/2 |
 | `L <min> <max>` | `OK` | soft limits, persisted in NVS |
 | `C <us_min> <us_max> <range>` | `OK` | pulse calibration (default 500 2500 270), persisted in NVS |
 | anything else | `ERR <msg>` | |
 
-Defaults: DS3218 signal on **GPIO 13**, 50 Hz, 500–2500 µs, range 270. Servo power is a separate 5–6 V supply, GND shared with the ESP32. Never from the ESP32 5 V pin.
+Defaults: GS2010MG 180° servo, signal on **GPIO 13**, 50 Hz, 500–2500 µs, range 180 (home 90). Servo power is a separate 5–6 V supply, GND shared with the ESP32. Never from the ESP32 5 V pin. AS5600 encoder on I2C (ESP32-S3: SDA 8 / SCL 9; ESP32: 21 / 22), optional: without it `meas=nan`, `enc=none`, and the core falls back to the commanded angle after `settle_ms`.
 
 ## 3. core ↔ web: REST + WebSocket
 
@@ -67,13 +69,14 @@ Server on `http://127.0.0.1:8000`. In dev, Vite on `:5173` proxies `/api` and `/
 - **Lidar frame**: origin at the S2 optical centre, x = 0° mark, y = 90° *counter-clockwise* from above, z up. Native angle is clockwise, so `theta_ccw = -angle_deg`.
 - **Base frame**: origin on the base plate under the tilt axis, x along the tilt axis, z up. Tilt axis at `z = axis_z_mm` (80 from CAD).
 - Point transform: `p_lidar = (r cos θ, r sin θ, 0)` → `Rz(lidar_yaw) · p + (0, 0, h)` → `Rx(φ)` → `+ (0, 0, axis_z)`.
-- `φ` (tilt, deg): `φ = sign · (servo_deg − center_deg)`, sign = −1 if `invert`. φ = 0 means scan plane horizontal. Positive φ = right-hand rotation about +x.
+- `φ` (tilt, deg): commanded `φ = sign · (servo_deg − center_deg)`, sign = −1 if `invert`; measured `φ = sign' · (meas_deg − enc_center_deg)`, sign' = −1 if `enc_invert`. φ = 0 means scan plane horizontal. Positive φ = right-hand rotation about +x. The rig uses the measured φ for geometry whenever the encoder reports one, and warns when it differs from the commanded φ by more than 2°.
 
 ### Config (GET/PUT `/api/config`)
 
 ```json
 {
-  "mount": {"axis_z_mm": 80, "h_mm": 0, "lidar_yaw_deg": 0, "center_deg": 135, "invert": false},
+  "mount": {"axis_z_mm": 80, "h_mm": 0, "lidar_yaw_deg": 0, "center_deg": 90, "invert": false,
+            "enc_center_deg": 90, "enc_invert": false},
   "grid":  {"cell_m": 0.05, "z_min_m": -0.5, "z_max_m": 2.5, "layer": "max"},
   "lidar": {"min_quality": 10, "min_range_m": 0.1, "max_range_m": 30}
 }
@@ -115,8 +118,9 @@ Status object:
   "lidar": {"connected": true, "source": "s2", "port": "/dev/cu.usbserial-0001", "baud": 1000000,
             "model": "S2M1", "serial": "...", "firmware": "1.02", "hardware": 18, "health": "good",
             "scan_hz": 10.1, "pts_per_rev": 3184, "range_min_m": 0.21, "range_max_m": 12.4},
-  "servo": {"connected": true, "port": "/dev/cu.usbmodem1101", "servo_deg": 135.0, "phi_deg": 0.0,
-            "min_deg": 0, "max_deg": 270, "range": 270},
+  "servo": {"connected": true, "port": "/dev/cu.usbmodem1101", "servo_deg": 90.0, "phi_deg": 0.0,
+            "min_deg": 0, "max_deg": 180, "range": 180,
+            "meas_deg": 90.4, "phi_meas_deg": 0.4, "encoder": "ok", "settled": true},
   "job": null,
   "live_points": 0,
   "session_loaded": null,
@@ -165,5 +169,5 @@ Cell (ix, iy) covers x ∈ [x0 + ix·cell, x0 + (ix+1)·cell), same for y.
 ## 4. Session on disk
 
 `sessions/<id>/meta.json` (SessionMeta) + `sessions/<id>/sweeps.npz` with equal-length arrays:
-`step u16, phi f32 (deg), theta f32 (deg, native clockwise), range f32 (m), quality u8, t f64`.
-Points are derived on load from the mount config in `meta.json`, so re-calibrating `h` or `center_deg` never needs a re-scan.
+`step u16, phi f32 (commanded tilt, deg), phi_meas f32 (encoder tilt, deg, NaN without an encoder), theta f32 (deg, native clockwise), range f32 (m), quality u8, t f64`.
+Points are derived on load from the mount config in `meta.json`, using `phi_meas` where finite and `phi` otherwise, so re-calibrating `h` or a centre never needs a re-scan.

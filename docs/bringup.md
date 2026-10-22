@@ -13,12 +13,13 @@ Pass: live 2D scan moving, a sim sweep (-60..60, step 2) finishes with a height 
 
 ## 1. Servo board
 
-1. Wiring: DS3218 red → separate 5–6 V supply (≥3 A). Black → that supply's GND **and** an ESP32 GND pin. Signal → GPIO 13. Never the ESP32 5 V pin.
+1. Wiring: servo (GS2010MG) red → separate 5–6 V supply (≥3 A). Black → that supply's GND **and** an ESP32 GND pin. Signal → GPIO 13. Never the ESP32 5 V pin. AS5600: 3.3 V, GND, SDA/SCL → GPIO 8/9 on an S3 (21/22 on a plain ESP32), magnet centred on the axle end, 0.5–3 mm gap.
 2. Plug the ESP32 in over USB, find it: `ls /dev/cu.*` (usually `/dev/cu.usbmodem*` or `/dev/cu.usbserial-*`).
 3. Flash: `make flash PORT=/dev/cu.usbmodemXXXX` (add `FQBN=esp32:esp32:esp32s3` for an S3).
-4. Dashboard → Servo → pick the port → connect. Opening the port resets the board and the cradle snaps to centre (135°), so keep hands clear. In the raw console: `?` then `T 135`.
+4. Dashboard → Servo → pick the port → connect. Opening the port resets the board and the cradle snaps to centre (90°), so keep hands clear. In the raw console: `?` then `T 90`.
+5. Encoder: send `E`. Adjust the magnet gap until `status=ok` (not `nomag`/`weak`/`strong`). Then `T 60`, `T 120`: `meas` must follow `angle` in the same direction; if it runs backwards, `E dir`.
 
-Pass: `STATUS angle=135 ...` and the cradle moves to roughly level.
+Pass: `STATUS angle=90 meas=… enc=ok …` and the cradle moves to roughly level.
 
 ## 2. LiDAR
 
@@ -37,8 +38,8 @@ If `--info` fails: nothing else may hold the port (RoboStudio, `screen`). Unplug
 
 ## 3. Calibrate the mount (config panel)
 
-1. **Servo centre:** with the LiDAR connected and the servo at 135°, look at the 2D scan of a flat wall straight ahead. Move the servo until the wall range is minimal and symmetric (plane horizontal). That servo angle is `center_deg`.
-2. **Direction:** move the servo +20°. If the scan plane went *down* at the front of the LiDAR (the side opposite the cable) set `invert: true`. Convention: positive φ is a right-hand rotation about +x (the tilt axis).
+1. **Servo centre:** with the LiDAR connected and the servo at 90°, look at the 2D scan of a flat wall straight ahead. Move the servo until the wall range is minimal and symmetric (plane horizontal). In "Mount and filters" click **Use current** next to Centre (servo °), then **Use measured** next to Centre (meas °) so the encoder scale is zeroed at the same position. (Alternatively send `E zero` in the raw console, which makes `meas` equal the servo angle there.)
+2. **Direction:** move the servo +20°. If the scan plane went *down* at the front of the LiDAR (the side opposite the cable) set `invert: true`; if the encoder's φ in the servo panel moved the opposite way to the commanded φ, set the encoder Invert too. Convention: positive φ is a right-hand rotation about +x (the tilt axis).
 3. **`h_mm`:** vertical distance from the tilt axis to the S2's optical window centre, measured with a ruler on the rig. Sign: positive if the window is above the axis.
 4. **`lidar_yaw_deg`:** angle between the S2's 0° mark and the tilt axis direction, measured on the cradle. 0 if the cable points along the axle.
 5. Save. Sessions store raw sweeps, so all of this can be re-done later without re-scanning.

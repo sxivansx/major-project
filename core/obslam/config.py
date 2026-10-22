@@ -12,8 +12,10 @@ class MountConfig(BaseModel):
     axis_z_mm: float = 80.0  # tilt axis height above the base plate (from CAD)
     h_mm: float = 0.0  # scan-plane offset from the tilt axis, measured on the rig
     lidar_yaw_deg: float = 0.0  # rotation of the lidar's 0° mark about its own z, in the cradle
-    center_deg: float = 135.0  # servo degrees at which the scan plane is horizontal
+    center_deg: float = 90.0  # servo degrees at which the scan plane is horizontal (GS2010MG 180°)
     invert: bool = False  # servo direction vs. phi sign
+    enc_center_deg: float = 90.0  # AS5600 reading (servo-degree scale) at which the plane is horizontal
+    enc_invert: bool = False  # encoder direction vs. phi sign
 
     def servo_to_phi(self, servo_deg: float) -> float:
         sign = -1.0 if self.invert else 1.0
@@ -22,6 +24,10 @@ class MountConfig(BaseModel):
     def phi_to_servo(self, phi_deg: float) -> float:
         sign = -1.0 if self.invert else 1.0
         return self.center_deg + sign * phi_deg
+
+    def enc_to_phi(self, meas_deg: float) -> float:
+        sign = -1.0 if self.enc_invert else 1.0
+        return sign * (meas_deg - self.enc_center_deg)
 
 
 class GridConfig(BaseModel):

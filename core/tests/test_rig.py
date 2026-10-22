@@ -45,7 +45,8 @@ def test_connect_and_status(rig):
     s = rig.status()
     assert s["lidar"]["connected"] and s["lidar"]["model"] == "SIM"
     assert s["lidar"]["pts_per_rev"] > 3000 and s["lidar"]["scan_hz"] > 20
-    assert s["servo"]["servo_deg"] == 135.0 and s["servo"]["phi_deg"] == 0.0
+    assert s["servo"]["servo_deg"] == 90.0 and s["servo"]["phi_deg"] == 0.0
+    assert s["servo"]["meas_deg"] == 90.0 and s["servo"]["phi_meas_deg"] == 0.0 and s["servo"]["encoder"] == "sim"
     assert any(isinstance(m, bytes) and m[0] == wire.KIND_SCAN for m in rig.msgs)
     with pytest.raises(RigError):
         rig.connect_lidar("sim")
@@ -57,11 +58,11 @@ def test_servo_moves_and_limits(rig):
     with pytest.raises(RigError):
         rig.move_servo(servo_deg=10)
     rig.connect_servo("sim")
-    assert rig.move_servo(phi_deg=30) == 165.0
+    assert rig.move_servo(phi_deg=30) == 120.0
     assert rig.status()["servo"]["phi_deg"] == 30.0
     with pytest.raises(RigError):
         rig.move_servo(servo_deg=300)
-    assert rig.home_servo() == 135.0
+    assert rig.home_servo() == 90.0
     assert rig.servo_raw("?").startswith("STATUS")
 
 
@@ -87,6 +88,10 @@ def test_job_end_to_end(rig):
     assert meta["n_points"] == rig.job["points"] and meta["n_steps"] == 5
     # the saved sweep reproduces the live cloud
     np.testing.assert_allclose(rig.sessions.points(sid), rig.live_points(), atol=1e-6)
+    # the sim encoder agrees with the command, and both are stored
+    a = rig.sessions.arrays(sid)
+    np.testing.assert_allclose(a["phi_meas"], a["phi"])
+    assert meta["encoder"] == "sim"
     g = rig.grid(cell=0.1)
     assert g.w > 10 and np.isfinite(g.data).sum() > 100
     # floor cells sit at ~0, walls near 3 m across the x extent

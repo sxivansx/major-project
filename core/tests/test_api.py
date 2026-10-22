@@ -70,7 +70,7 @@ def test_sim_job_over_http_and_ws(client):
     g2 = wire.decode_grid(client.get("/api/grid?cell=0.2").content)
     assert g2.w == g.w and g2.h == g.h
     assert client.get(f"/api/sessions/{sid}/export.ply").text.startswith("ply\n")
-    assert client.get(f"/api/sessions/{sid}/export.csv").text.startswith("phi,theta")
+    assert client.get(f"/api/sessions/{sid}/export.csv").text.startswith("phi,phi_meas,theta")
     assert client.post(f"/api/sessions/{sid}/load").json()["session_loaded"] == sid
     assert client.delete(f"/api/sessions/{sid}").status_code == 204
     assert client.get("/api/sessions").json() == []

@@ -13,7 +13,7 @@ import numpy as np
 from .config import MountConfig
 from .geometry import lidar_to_base
 
-ARRAYS = ("step", "phi", "theta", "range", "quality", "t")
+ARRAYS = ("step", "phi", "phi_meas", "theta", "range", "quality", "t")  # phi_meas NaN = no encoder
 _ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 
 
@@ -39,7 +39,10 @@ class SessionStore:
         sid = meta["id"]
         d = self._dir(sid)
         d.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(d / "sweeps.npz", **{k: np.asarray(arrays[k]) for k in ARRAYS})
+        cols = {k: np.asarray(arrays[k]) for k in ARRAYS if k in arrays}
+        if "phi_meas" not in cols:
+            cols["phi_meas"] = np.full(cols["phi"].shape[0], np.nan, np.float32)
+        np.savez_compressed(d / "sweeps.npz", **cols)
         (d / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
         return sid
 
@@ -66,7 +69,15 @@ class SessionStore:
         if not f.exists():
             raise KeyError(sid)
         with np.load(f) as z:
-            return {k: z[k] for k in ARRAYS}
+            out = {k: z[k] for k in ARRAYS if k in z.files}
+        if "phi_meas" not in out:  # sessions recorded before the encoder existed
+            out["phi_meas"] = np.full(out["phi"].shape[0], np.nan, np.float32)
+        return out
+
+    @staticmethod
+    def phi_used(a: dict[str, np.ndarray]) -> np.ndarray:
+        """Measured tilt where the encoder had it, commanded otherwise."""
+        return np.where(np.isfinite(a["phi_meas"]), a["phi_meas"], a["phi"]).astype(np.float32)
 
     def delete(self, sid: str) -> None:
         d = self._dir(sid)
@@ -78,7 +89,7 @@ class SessionStore:
         meta = self.get(sid)
         a = self.arrays(sid)
         m = mount or MountConfig.model_validate(meta.get("mount", {}))
-        return lidar_to_base(a["theta"], a["range"], a["phi"], m)
+        return lidar_to_base(a["theta"], a["range"], self.phi_used(a), m)
 
     @staticmethod
     def ply(xyz: np.ndarray) -> bytes:
@@ -94,10 +105,11 @@ class SessionStore:
     def csv(self, sid: str) -> bytes:
         a = self.arrays(sid)
         xyz = self.points(sid)
-        rows = ["phi,theta,range,quality,x,y,z"]
+        rows = ["phi,phi_meas,theta,range,quality,x,y,z"]
         for i in range(xyz.shape[0]):
+            pm = a["phi_meas"][i]
             rows.append(
-                f"{a['phi'][i]:.3f},{a['theta'][i]:.4f},{a['range'][i]:.4f},{int(a['quality'][i])},"
+                f"{a['phi'][i]:.3f},{pm:.3f},{a['theta'][i]:.4f},{a['range'][i]:.4f},{int(a['quality'][i])},"
                 f"{xyz[i, 0]:.4f},{xyz[i, 1]:.4f},{xyz[i, 2]:.4f}"
             )
         return ("\n".join(rows) + "\n").encode()
