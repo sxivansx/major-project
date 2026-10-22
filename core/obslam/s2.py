@@ -81,15 +81,29 @@ class S2ScanSource(ScanSource):
         return ScanFrame(t, pts["angle"].copy(), pts["range"].copy(), pts["quality"].copy())
 
     def _capture_stderr(self) -> None:
-        if self._proc and self._proc.stderr and not self._stop.is_set():
+        """After stdout EOF: a non-zero exit is an error (last stderr line, JSON-decoded if the bridge
+        emitted one); a clean exit is just the end of the stream."""
+        p = self._proc
+        if p is None or self._stop.is_set():
+            return
+        try:
+            p.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        last = ""
+        if p.stderr:
             try:
-                err = self._proc.stderr.read().decode(errors="replace").strip()
+                err = p.stderr.read().decode(errors="replace").strip()
             except ValueError:
                 err = ""
-            if err:
-                self.error = err.splitlines()[-1]
-            elif self._proc.poll() is not None:
-                self.error = f"bridge exited with code {self._proc.returncode}"
+            last = err.splitlines()[-1] if err else ""
+        if last.startswith("{"):
+            try:
+                last = json.loads(last).get("error", last)
+            except ValueError:
+                pass
+        if p.returncode not in (0, None):
+            self.error = last or f"bridge exited with code {p.returncode}"
 
     def _close(self) -> None:
         p, self._proc = self._proc, None
