@@ -59,19 +59,33 @@ class AIClient:
         transport: httpx.BaseTransport | None = None,
         timeout: float = 40.0,
     ):
+        # explicit keys (even "") are final; keys found in the environment are re-read when missing,
+        # so a key pasted into core/.env after startup works without a restart
+        self._explicit = (key is not None, typesafe_key is not None)
         self.key = key if key is not None else load_env("OPENROUTER_API_KEY")
         self.typesafe_key = typesafe_key if typesafe_key is not None else load_env("TYPESAFE_API_KEY")
-        default_model = "jev-latest" if self.typesafe_key else "typesafe/jev-1.14"
-        self.decisions_model = decisions_model or os.environ.get("OBSLAM_DECISIONS_MODEL") or default_model
+        self._model_override = decisions_model or os.environ.get("OBSLAM_DECISIONS_MODEL")
         self.prose_model = prose_model
         self._http = httpx.Client(timeout=timeout, transport=transport)
 
+    def _refresh_keys(self) -> None:
+        if not self._explicit[0] and not self.key:
+            self.key = load_env("OPENROUTER_API_KEY")
+        if not self._explicit[1] and not self.typesafe_key:
+            self.typesafe_key = load_env("TYPESAFE_API_KEY")
+
+    @property
+    def decisions_model(self) -> str:
+        return self._model_override or ("jev-latest" if self.typesafe_key else "typesafe/jev-1.14")
+
     @property
     def decisions_available(self) -> bool:
+        self._refresh_keys()
         return bool(self.typesafe_key or self.key)
 
     @property
     def prose_available(self) -> bool:
+        self._refresh_keys()
         return bool(self.key)
 
     @property
