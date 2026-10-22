@@ -189,3 +189,12 @@ def test_ops_layers_round_trip(room_cloud):
 def test_empty_cloud():
     res = analyze(np.zeros((0, 3), np.float32))
     assert res.findings["points"] == 0 and res.findings["obstacles"] == [] and res.findings["floor"]["fitted"] is False
+
+
+def test_first_steps_of_a_sweep_do_not_fit_a_floor():
+    # a ±75° sweep's first three steps put floor lines 3 mm apart (y = 0.08/tan φ): no plane, no 75° "tilt"
+    m = MountConfig(axis_z_mm=80, h_mm=0)
+    sim = SimScanSource(lambda: 0.0, m, noise_m=0.012, dropout=0.0)
+    parts = [lidar_to_base(f.angle, f.range, phi, m) for phi in (-75.0, -73.0, -71.0) for f in [sim.scan_at(phi)]]
+    res = analyze(np.concatenate(parts), OpsParams(cell_m=0.1), scanner_z_m=0.08)
+    assert res.findings["floor"]["fitted"] is False and "narrow" in res.findings["floor"]["reason"]

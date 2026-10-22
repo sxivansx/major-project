@@ -247,6 +247,13 @@ def create_app(
     @app.get(f"{api}/ops/findings")
     async def ops_findings(cell: float | None = None, max_step: float | None = None, max_slope: float | None = None):
         res = await asyncio.to_thread(run_analysis, ops_params(cell, max_step, max_slope))
+        job = rig.status()["job"]
+        res.findings["scan"] = {
+            "in_progress": bool(job and job["state"] == "running"),
+            "step": job["step"] if job else 0,
+            "n_steps": job["n_steps"] if job else 0,
+            "session": rig.session_loaded,
+        }
         return res.findings
 
     @app.get(f"{api}/ops/layers")

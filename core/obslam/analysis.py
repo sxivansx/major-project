@@ -70,6 +70,10 @@ def fit_floor(xyz: np.ndarray, band_m: float) -> tuple[np.ndarray | None, dict]:
     sel = xyz[np.abs(z - z0) <= band_m]
     if sel.shape[0] < 50:
         return None, {"points": int(sel.shape[0]), "fitted": False}
+    # a plane through a single sweep line is meaningless: the band must spread in both x and y
+    spread = np.ptp(sel[:, :2], axis=0)
+    if spread.min() < 0.5:
+        return None, {"points": int(sel.shape[0]), "fitted": False, "reason": "floor band too narrow to fit a plane (partial sweep?)"}
     a = np.c_[sel[:, 0], sel[:, 1], np.ones(sel.shape[0])].astype(np.float64)
     coef, *_ = np.linalg.lstsq(a, sel[:, 2].astype(np.float64), rcond=None)
     resid = sel[:, 2] - a @ coef
