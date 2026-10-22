@@ -175,6 +175,12 @@ export function ServoPanel() {
           <dd>{fmt(servoDeg, 1, "°")}</dd>
           <dt>phi_deg</dt>
           <dd>{fmt(phiDeg, 1, "°")}</dd>
+          <dt>encoder</dt>
+          <dd>
+            {servo?.encoder ?? "–"}
+            {servo?.meas_deg != null ? ` · ${fmt(servo.meas_deg, 1)}° (φ ${fmt(servo.phi_meas_deg, 1)}°)` : ""}
+            {servo?.settled === false ? " · moving" : ""}
+          </dd>
           <dt>Mapping</dt>
           <dd>
             {mount

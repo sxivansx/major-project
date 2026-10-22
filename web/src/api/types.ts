@@ -26,6 +26,10 @@ export interface ServoStatus {
   min_deg?: number | null;
   max_deg?: number | null;
   range?: number | null;
+  meas_deg?: number | null;
+  phi_meas_deg?: number | null;
+  encoder?: string | null;
+  settled?: boolean | null;
 }
 
 export type JobState = "running" | "done" | "stopped" | "error";
@@ -76,6 +80,8 @@ export interface Config {
     lidar_yaw_deg: number;
     center_deg: number;
     invert: boolean;
+    enc_center_deg: number;
+    enc_invert: boolean;
   };
   grid: {
     cell_m: number;

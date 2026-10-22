@@ -13,6 +13,8 @@ type Form = {
   lidar_yaw_deg: string;
   center_deg: string;
   invert: boolean;
+  enc_center_deg: string;
+  enc_invert: boolean;
   min_quality: string;
   min_range_m: string;
   max_range_m: string;
@@ -25,6 +27,8 @@ function fromConfig(c: Config): Form {
     lidar_yaw_deg: String(c.mount.lidar_yaw_deg),
     center_deg: String(c.mount.center_deg),
     invert: c.mount.invert,
+    enc_center_deg: String(c.mount.enc_center_deg ?? c.mount.center_deg),
+    enc_invert: c.mount.enc_invert ?? false,
     min_quality: String(c.lidar.min_quality),
     min_range_m: String(c.lidar.min_range_m),
     max_range_m: String(c.lidar.max_range_m),
@@ -63,7 +67,7 @@ export function MountPanel() {
 
   const num = (k: keyof Form) => Number(form[k]);
   const valid =
-    (["axis_z_mm", "h_mm", "lidar_yaw_deg", "center_deg", "min_quality", "min_range_m", "max_range_m"] as const).every(
+    (["axis_z_mm", "h_mm", "lidar_yaw_deg", "center_deg", "enc_center_deg", "min_quality", "min_range_m", "max_range_m"] as const).every(
       (k) => form[k] !== "" && Number.isFinite(num(k)),
     ) && num("min_range_m") < num("max_range_m");
   const dirty = JSON.stringify(form) !== JSON.stringify(fromConfig(config));
@@ -82,6 +86,8 @@ export function MountPanel() {
         lidar_yaw_deg: num("lidar_yaw_deg"),
         center_deg: num("center_deg"),
         invert: form.invert,
+        enc_center_deg: num("enc_center_deg"),
+        enc_invert: form.enc_invert,
       },
       lidar: {
         min_quality: Math.round(num("min_quality")),
@@ -103,6 +109,7 @@ export function MountPanel() {
   };
 
   const servoDeg = servo?.connected ? servo.servo_deg ?? null : null;
+  const measDeg = servo?.connected ? servo.meas_deg ?? null : null;
 
   const numField = (label: string, k: keyof Form, step: number, title?: string) => (
     <div className="field" title={title}>
@@ -139,6 +146,30 @@ export function MountPanel() {
           <div className="row">
             <input type="checkbox" checked={form.invert} onChange={(e) => set("invert", e.target.checked)} />
             <span className="hint">φ = {form.invert ? "−" : ""}(servo − {form.center_deg || "centre"})</span>
+          </div>
+        </div>
+
+        <div className="section-title">Encoder to tilt (AS5600)</div>
+        <div className="field" title="Encoder reading (servo-degree scale) at which the scan plane is horizontal">
+          <label>Centre (meas °)</label>
+          <div className="row">
+            <input type="number" step={0.1} value={form.enc_center_deg} onChange={(e) => set("enc_center_deg", e.target.value)} />
+            <button
+              disabled={measDeg === null}
+              title={measDeg === null ? "no encoder reading" : `set to the current reading (${fmt(measDeg, 1)}°)`}
+              onClick={() => measDeg !== null && set("enc_center_deg", String(measDeg))}
+            >
+              Use measured
+            </button>
+          </div>
+        </div>
+        <div className="field" title="Tick if the encoder counts the opposite way to φ">
+          <label>Invert</label>
+          <div className="row">
+            <input type="checkbox" checked={form.enc_invert} onChange={(e) => set("enc_invert", e.target.checked)} />
+            <span className="hint">
+              {servo?.encoder && servo.encoder !== "none" ? `encoder ${servo.encoder}` : "no encoder: commanded angle is used"}
+            </span>
           </div>
         </div>
 
