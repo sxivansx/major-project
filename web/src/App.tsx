@@ -4,6 +4,7 @@ import { ws } from "./api/ws";
 import { clientLog, useStore, type Tab } from "./store/store";
 import { ConnectionPanel } from "./components/ConnectionPanel";
 import { ServoPanel } from "./components/ServoPanel";
+import { MountPanel } from "./components/MountPanel";
 import { JobPanel } from "./components/JobPanel";
 import { LiveTab } from "./components/LiveTab";
 import { CloudTab } from "./components/CloudTab";
@@ -50,6 +51,7 @@ export default function App() {
         <ConnectionPanel />
         <ServoPanel />
         <JobPanel />
+        <MountPanel />
       </aside>
       <main className="main">
         <nav className="tabs">

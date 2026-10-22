@@ -286,6 +286,25 @@ export function HeightMapPanel() {
           <input type="checkbox" checked={showSurface} onChange={(e) => setUi({ showSurface: e.target.checked })} />
           surface in 3D
         </label>
+        <button
+          className="small"
+          disabled={!grid}
+          title="Download the map as a PNG for the report"
+          onClick={() => {
+            const c = canvasRef.current;
+            if (!c || !grid) return;
+            c.toBlob((blob) => {
+              if (!blob) return;
+              const a = document.createElement("a");
+              a.href = URL.createObjectURL(blob);
+              a.download = `heightmap-${grid.layer}-${grid.cell_m}m.png`;
+              a.click();
+              URL.revokeObjectURL(a.href);
+            });
+          }}
+        >
+          PNG
+        </button>
       </div>
       {err && (
         <div className="error" style={{ padding: "0 8px" }}>
