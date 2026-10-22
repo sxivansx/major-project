@@ -119,7 +119,8 @@ class AIClient:
 
     def complete(self, system: str, user: str, max_tokens: int = 1200, temperature: float = 0.2) -> tuple[str, float]:
         """Gemini 3.5 Flash reasons before answering and the reasoning counts against max_tokens, so
-        keep effort low, drop the reasoning from the reply, and treat a truncated reply as a failure."""
+        ask for minimal effort (it cannot be disabled), drop the reasoning from the reply, and treat a
+        truncated reply as a failure. Measured 22 Oct 2026: minimal → 0 reasoning tokens, ~$0.001/call."""
         if not self.prose_available:
             raise AIError("prose unavailable: no OPENROUTER_API_KEY")
         data = self._post(
@@ -129,7 +130,7 @@ class AIClient:
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "max_tokens": max_tokens,
                 "temperature": temperature,
-                "reasoning": {"effort": "low", "exclude": True},
+                "reasoning": {"effort": "minimal", "exclude": True},  # 0 reasoning tokens on gemini-3.5-flash; "low" burns ~400+
                 "usage": {"include": True},
             },
             self.key,
