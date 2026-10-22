@@ -110,11 +110,75 @@ class SimTilt(TiltSource):
         return "ERR unknown command"
 
 
+class _TcpLine:
+    """A serial.Serial look-alike over a TCP socket (the ESP32's tilt service on port 8900)."""
+
+    def __init__(self, host: str, port: int, timeout: float = 2.0):
+        import socket
+
+        self._sock = socket.create_connection((host, port), timeout=5)
+        self._sock.settimeout(timeout)
+        self._buf = b""
+        self.timeout = timeout
+
+    def write(self, data: bytes) -> None:
+        self._sock.sendall(data)
+
+    def readline(self) -> bytes:
+        import socket
+
+        self._sock.settimeout(self.timeout)
+        while b"\n" not in self._buf:
+            try:
+                chunk = self._sock.recv(4096)
+            except socket.timeout:
+                return b""
+            if not chunk:
+                return b""
+            self._buf += chunk
+        line, _, self._buf = self._buf.partition(b"\n")
+        return line + b"\n"
+
+    def reset_input_buffer(self) -> None:
+        self._buf = b""
+        self._sock.setblocking(False)
+        try:
+            while self._sock.recv(65536):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+        finally:
+            self._sock.setblocking(True)
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def open_link(port: str, baud: int = 115200):
+    """`tcp://host[:port]` → socket link; anything else → serial port."""
+    if port.startswith("tcp://"):
+        hp = port[len("tcp://") :]
+        host, _, p = hp.partition(":")
+        try:
+            return _TcpLine(host, int(p or 8900))
+        except OSError as e:
+            raise TiltError(f"cannot reach {port}: {e}") from e
+    try:
+        return serial.Serial(port, baud, timeout=2)
+    except serial.SerialException as e:
+        raise TiltError(str(e)) from e
+
+
 class SerialTilt(TiltSource):
+    """The ESP32 tilt firmware over USB serial, or over TCP when the port is `tcp://host:8900`."""
+
     def __init__(self, port: str, baud: int = 115200):
         self.port = port
         self.baud = baud
-        self._ser: serial.Serial | None = None
+        self._ser = None
         self._lock = threading.Lock()
         self.servo_deg = 0.0
         self.min_deg, self.max_deg, self.range = 0.0, 180.0, 180
@@ -123,10 +187,7 @@ class SerialTilt(TiltSource):
         self.settled = None
 
     def connect(self) -> None:
-        try:
-            self._ser = serial.Serial(self.port, self.baud, timeout=2)
-        except serial.SerialException as e:
-            raise TiltError(str(e)) from e
+        self._ser = open_link(self.port, self.baud)
         # Opening the port resets most ESP32 dev boards; wait for the boot banner, then identify.
         deadline = time.time() + 4.0
         ident = None

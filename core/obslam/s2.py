@@ -36,6 +36,9 @@ class S2ScanSource(ScanSource):
     def _argv(self, *extra: str) -> list[str]:
         if not self.bridge.exists():
             raise RuntimeError(f"bridge not built: {self.bridge} (run `make -C driver`)")
+        if self.port.startswith("tcp://"):
+            # the ESP32 relays the LiDAR's UART over Wi-Fi: tcp://192.168.x.y:8899
+            return [str(self.bridge), "--tcp", self.port[len("tcp://") :], *extra]
         return [str(self.bridge), "--serial", self.port, "--baud", str(self.baud), *extra]
 
     def info(self) -> dict:

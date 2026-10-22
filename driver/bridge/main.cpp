@@ -100,9 +100,10 @@ void logf(const char* fmt, ...) {
 }
 
 void usage(FILE* to) {
-    fputs("usage: s2bridge --serial <port> [--baud 1000000] [--info]\n"
+    fputs("usage: s2bridge (--serial <port> [--baud 1000000] | --tcp <host:port>) [--info]\n"
           "  --serial <port>  e.g. /dev/cu.usbserial-0001\n"
-          "  --baud <n>       default 1000000 (RPLIDAR S2)\n"
+          "  --tcp <host:port> the ESP32's LiDAR relay, e.g. 192.168.4.7:8899\n"
+          "  --baud <n>       default 1000000 (RPLIDAR S2/S3, serial only)\n"
           "  --info           print one JSON line with device info and exit\n"
           "stream mode writes binary frames to stdout; see docs/api.md section 1\n",
           to);
@@ -209,6 +210,7 @@ bool write_frame(FILE* out, const sl_lidar_response_measurement_node_hq_t* nodes
 
 int main(int argc, char** argv) {
     const char* port = nullptr;
+    const char* tcp = nullptr;  // host:port of the ESP32's LiDAR relay (TCP 8899)
     int baud = kDefaultBaud;
     bool info_only = false;
 
@@ -216,6 +218,8 @@ int main(int argc, char** argv) {
         const char* a = argv[i];
         if (strcmp(a, "--serial") == 0 && i + 1 < argc) {
             port = argv[++i];
+        } else if (strcmp(a, "--tcp") == 0 && i + 1 < argc) {
+            tcp = argv[++i];
         } else if (strcmp(a, "--baud") == 0 && i + 1 < argc) {
             char* end = nullptr;
             long v = strtol(argv[++i], &end, 10);
@@ -235,10 +239,26 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (!port) {
-        emit_error("--serial <port> is required");
+    if (!port && !tcp) {
+        emit_error("--serial <port> or --tcp <host:port> is required");
         usage(stderr);
         return 1;
+    }
+    std::string tcp_host;
+    int tcp_port = 0;
+    if (tcp) {
+        const char* colon = strrchr(tcp, ':');
+        if (!colon || colon == tcp) {
+            emit_error("--tcp expects host:port, got %s", tcp);
+            return 1;
+        }
+        tcp_host.assign(tcp, colon - tcp);
+        tcp_port = atoi(colon + 1);
+        if (tcp_port <= 0 || tcp_port > 65535) {
+            emit_error("--tcp: bad port in %s", tcp);
+            return 1;
+        }
+        port = tcp;  // for messages
     }
 
     // Keep the real stdout private for frames. The SDK printf()s to stdout
@@ -271,7 +291,7 @@ int main(int argc, char** argv) {
     // Probe the port first. The SDK's connect() reports success even when the
     // open fails (openChannelAndBind shadows its own result variable), so this
     // is the only place a precise reason (missing, busy, not a tty) is known.
-    {
+    if (!tcp) {
         int fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
         if (fd < 0) {
             emit_error("cannot open serial port %s: %s%s", port, strerror(errno),
@@ -288,9 +308,9 @@ int main(int argc, char** argv) {
 
     Lidar lidar;
 
-    Result<IChannel*> ch = createSerialPortChannel(port, baud);
+    Result<IChannel*> ch = tcp ? createTcpChannel(tcp_host, tcp_port) : createSerialPortChannel(port, baud);
     if (!ch || !*ch) {
-        emit_error("cannot create serial channel for %s", port);
+        emit_error("cannot create %s channel for %s", tcp ? "tcp" : "serial", port);
         return 1;
     }
     lidar.channel = *ch;
