@@ -143,8 +143,8 @@ def test_ask_routes_to_a_tool(app_client):
     r = app_client.post("/api/ai/ask", json={"question": f"can we reach {target}?", "cell": 0.1})
     assert r.status_code == 200, r.text
     a = r.json()
-    assert a["intent"] == "route" and a["target"] == target and "route" in a["tool"]
-    assert "found" in a["tool"]["route"] and a["answer"]
+    assert a["intent"] == "route" and a["target"] == target
+    assert isinstance(a["tool"]["found"], bool) and a["answer"]  # route result at the top level of tool
     r2 = app_client.post("/api/ai/ask", json={"question": "give me a summary"}).json()
     assert r2["intent"] == "sitrep" and "sitrep" in r2["tool"]
     assert app_client.post("/api/ai/ask", json={"question": "  "}).status_code == 400

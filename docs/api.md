@@ -104,11 +104,11 @@ Persisted to `core/config.json`.
 | GET | `/grid` | `?cell=0.05&layer=max&z_min=&z_max=` | binary grid frame (kind 3 payload) |
 | GET | `/ops/findings` | `?cell=0.1&max_step=0.15&max_slope=25` | Findings JSON (below) for the live cloud |
 | GET | `/ops/layers` | same query | binary kind-4 frame: classes + height above floor |
-| POST | `/ops/route` | `{"from_xy":[x,y],"to_xy":[x,y],"cell":0.1}` | `{"found":true,"start_snapped_m":0.3,"length_m":4.2,"cells":40,"marginal_cells":0,"verdict":"passable"\|"marginal","max_step_m":0.08,"path":[[x,y],…]}` or `{"found":false,"reason":"…"}` |
+| POST | `/ops/route` | `{"from_xy":[x,y],"to_xy":[x,y],"cell":0.1,"max_step":0.15,"max_slope":25}` (send the same params as the layers so the route is judged on the classification shown) | `{"found":true,"start_snapped_m":0.3,"goal_snapped_m":0.4,"length_m":4.2,"cells":40,"marginal_cells":0,"verdict":"passable"\|"marginal","max_step_m":0.08,"path":[[x,y],…]}` or `{"found":false,"reason":"…"}`. The start snaps to the nearest passable cell within 1 m; the goal snaps within 0.6 m but only to cells reachable from the start (an object's flat top is an island, never a destination) |
 | GET | `/ai/status` | | `{"available":bool,"reason":"…","models":{"decisions":"typesafe/jev-1.14","prose":"google/gemini-2.5-flash"}}` |
 | POST | `/ai/triage` | `{"cell":0.1}` | Jev ranking of findings: `{"items":[{"id":"V1","kind":"void","attention":0.82,"confidence":0.7,"why":"…"}],"rescan":{"recommended":false,"p":0.2,"confidence":0.8},"cost_usd":0.0003}` |
 | POST | `/ai/sitrep` | `{"cell":0.1}` | `{"text":"five-line situation report","facts":{…findings…},"model":"…","cost_usd":…}` |
-| POST | `/ai/ask` | `{"question":"…"}` | `{"intent":"route\|measure\|list_voids\|list_obstacles\|coverage\|sitrep\|other","confidence":0.9,"tool":{…result…},"answer":"…"}` |
+| POST | `/ai/ask` | `{"question":"…"}` | `{"intent":"route\|measure\|list_voids\|list_obstacles\|coverage\|sitrep\|other","confidence":0.9,"target":"O3"\|null,"tool":{"intent":…,"target":…, …result…},"answer":"…","cost_usd":…}`. For `route` the route result's own fields (`found`, `path`, `length_m`…) sit at the top level of `tool`; for `measure` under `tool.measure`; lists under `tool.voids` / `tool.obstacles`; `coverage` under `tool.coverage` + `tool.next_station` |
 | GET | `/sessions` | | `[SessionMeta]` |
 | GET | `/sessions/{id}` | | SessionMeta |
 | GET | `/sessions/{id}/points` | | binary: `u32 n`, n × (f32 x,y,z) base frame |
@@ -178,6 +178,7 @@ Binary, kind 4 **operator layers** (`GET /api/ops/layers` only, never pushed):
 u8 kind=4, u8 pad, u16 pad, u32 w, u32 h, f32 cell_m, f32 x0_m, f32 y0_m,
 h × w × u8 class, then h × w × f32 height above the fitted floor (NaN = not known)
 ```
+The f32 block starts at byte 24 + w·h, which is 4-byte aligned only when w·h is a multiple of 4; clients must copy through a DataView otherwise (the dashboard does).
 Classes: 0 unknown (sweep gap too wide, or past the last return), 1 passable, 2 marginal, 3 blocked, 4 shadow (occluded by a nearer object: scan from elsewhere), 5 blind (the stripe along the tilt axle no scan plane can reach: rotate the scanner 90°).
 
 ### Findings (`GET /api/ops/findings`)

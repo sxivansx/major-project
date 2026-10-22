@@ -319,10 +319,9 @@ ANSWER_SYSTEM = (
 def template_answer(intent: str, tool: dict) -> str:
     """Plain-words answer from the tool result when no prose model is configured."""
     if intent == "route":
-        r = tool.get("route") or {}
-        if r.get("found"):
-            return f"Route to {tool.get('target')}: {r['length_m']} m, {r['verdict']}, max step {r['max_step_m']} m."
-        return f"No passable route to {tool.get('target')}: {r.get('reason', 'unknown')}."
+        if tool.get("found"):
+            return f"Route to {tool.get('target')}: {tool['length_m']} m, {tool['verdict']}, max step {tool['max_step_m']} m."
+        return f"No passable route to {tool.get('target')}: {tool.get('reason', 'no target or unknown')}."
     if intent == "measure":
         m = tool.get("measure") or {}
         return f"{m.get('id')}: {m.get('distance_m')} m away at {m.get('bearing_deg')}°, {m.get('area_m2')} m²."
@@ -359,7 +358,8 @@ def ask(ai: AIClient, question: str, findings: dict, route_to: Callable[[float, 
     tool: dict = {"intent": intent, "target": target if target != "none" else None}
     if intent == "route" and target in by_id:
         it = by_id[target][1]
-        tool["route"] = route_to(it["x_m"], it["y_m"]) or {"found": False, "reason": "no passable route"}
+        # the route result sits at the top level of `tool` (found, path, length_m…), as the contract says
+        tool.update(route_to(it["x_m"], it["y_m"]) or {"found": False, "reason": "no passable route"})
     elif intent == "measure" and target in by_id:
         it = by_id[target][1]
         tool["measure"] = {k: it.get(k) for k in ("id", "distance_m", "bearing_deg", "area_m2", "clearance_m", "height_m", "depth_m") if it.get(k) is not None}
