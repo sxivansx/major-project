@@ -10,3 +10,16 @@ firmware/  ESP32 sketch that tilts the DS3218 over a serial line protocol
 docs/      API and protocol contracts
 sessions/  captured sweeps (gitignored)
 ```
+
+## Quick start
+
+```bash
+make setup                      # builds the S2 bridge, python venv, web deps (needs clang, uv, bun)
+make sim                        # simulated lidar + servo; dashboard at http://localhost:5173
+make dev                        # real hardware; connect from the dashboard
+make build && make serve        # single process on http://127.0.0.1:8000
+make flash PORT=/dev/cu.usbmodemXXXX   # ESP32 servo firmware (FQBN=esp32:esp32:esp32s3 for an S3)
+make test
+```
+
+First night with the rig: follow `docs/bringup.md` top to bottom.
