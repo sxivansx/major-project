@@ -8,7 +8,7 @@ import numpy as np
 
 from .grid import LAYER_ID, LAYERS, Grid
 
-KIND_SCAN, KIND_POINTS, KIND_GRID = 1, 2, 3
+KIND_SCAN, KIND_POINTS, KIND_GRID, KIND_OPS = 1, 2, 3, 4
 
 _SCAN_HDR = struct.Struct("<BxxxIdfI")  # kind, seq, t, phi, n  → 24 bytes
 _POINTS_HDR = struct.Struct("<BxxxIIfI")  # kind, job_id, step, phi, n → 20 bytes
@@ -56,6 +56,26 @@ def decode_grid(buf: bytes) -> Grid:
     assert kind == KIND_GRID
     data = np.frombuffer(buf, "<f4", w * h, _GRID_HDR.size).reshape(h, w)
     return Grid(LAYERS[layer], cell, x0, y0, w, h, z_min, z_max, data)
+
+
+_OPS_HDR = struct.Struct("<BBHIIfff")  # kind=4, pad, pad, w, h, cell, x0, y0 → 24 bytes
+
+
+def encode_ops_layers(w: int, h: int, cell: float, x0: float, y0: float, classes, rel_height) -> bytes:
+    """Operator layers: u8 class per cell (0 unknown, 1 passable, 2 marginal, 3 blocked, 4 shadow, 5 blind)
+    followed by f32 height above the fitted floor (NaN empty). Both row-major, row = y."""
+    c = np.ascontiguousarray(classes, dtype="u1").reshape(h * w)
+    r = np.ascontiguousarray(rel_height, dtype="<f4").reshape(h * w)
+    return _OPS_HDR.pack(KIND_OPS, 0, 0, w, h, cell, x0, y0) + c.tobytes() + r.tobytes()
+
+
+def decode_ops_layers(buf: bytes) -> dict:
+    kind, _, _, w, h, cell, x0, y0 = _OPS_HDR.unpack_from(buf)
+    assert kind == KIND_OPS
+    o = _OPS_HDR.size
+    classes = np.frombuffer(buf, "u1", w * h, o).reshape(h, w)
+    rel = np.frombuffer(buf, "<f4", w * h, o + w * h).reshape(h, w)
+    return {"w": w, "h": h, "cell": cell, "x0": x0, "y0": y0, "classes": classes, "rel": rel}
 
 
 def encode_session_points(xyz) -> bytes:

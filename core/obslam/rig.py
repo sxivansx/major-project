@@ -89,6 +89,11 @@ class Rig:
         self._live: list[np.ndarray] = []
         self._live_cat: np.ndarray | None = None
         self.session_loaded: str | None = None
+        self.phi_max_deg = 60.0  # of the sweep that produced the live cloud
+
+    def scanner_z_m(self) -> float:
+        m = self.config.mount
+        return (m.axis_z_mm + m.h_mm) / 1000.0
 
     # ---- publishing -------------------------------------------------------------------------
     def publish_json(self, obj: dict) -> None:
@@ -416,6 +421,7 @@ class Rig:
             self._live.clear()
             self._live_cat = None
             self.session_loaded = None
+            self.phi_max_deg = float(max(abs(params.phi_start), abs(params.phi_end)))
             self._job_stop.clear()
             self._job_thread = threading.Thread(
                 target=self._run_job, args=(params, job_id, phis), name=f"job-{job_id}", daemon=True
@@ -573,10 +579,12 @@ class Rig:
             xyz = self.sessions.points(sid)
         except KeyError:
             raise RigError(f"no session {sid}") from None
+        meta = self.sessions.get(sid)
         with self._lock:
             self._live = [xyz]
             self._live_cat = None
             self.session_loaded = sid
+            self.phi_max_deg = float(max(abs(meta.get("phi_start", 60)), abs(meta.get("phi_end", 60))))
         for i in range(0, xyz.shape[0], POINTS_CHUNK):
             self._publish(wire.encode_points(0, i // POINTS_CHUNK, 0.0, xyz[i : i + POINTS_CHUNK]))
         self._publish(wire.encode_grid(self.grid()))

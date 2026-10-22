@@ -205,6 +205,50 @@ def create_app(
             raise HTTPException(400, "cell must be > 0")
         return await asyncio.to_thread(rig.metrics, cell, z_min, z_max)
 
+    # ---- operator products -------------------------------------------------------------------
+    from .analysis import OpsParams, analyze, plan_route
+
+    def ops_params(cell: float | None, max_step: float | None, max_slope: float | None) -> OpsParams:
+        p = OpsParams()
+        if cell is not None:
+            if cell <= 0:
+                raise HTTPException(400, "cell must be > 0")
+            p.cell_m = cell
+        if max_step is not None:
+            p.max_step_m = max_step
+        if max_slope is not None:
+            p.max_slope_deg = max_slope
+        return p
+
+    def run_analysis(p: OpsParams):
+        return analyze(rig.live_points(), p, scanner_z_m=rig.scanner_z_m(), phi_max_deg=rig.phi_max_deg)
+
+    @app.get(f"{api}/ops/findings")
+    async def ops_findings(cell: float | None = None, max_step: float | None = None, max_slope: float | None = None):
+        res = await asyncio.to_thread(run_analysis, ops_params(cell, max_step, max_slope))
+        return res.findings
+
+    @app.get(f"{api}/ops/layers")
+    async def ops_layers(cell: float | None = None, max_step: float | None = None, max_slope: float | None = None):
+        res = await asyncio.to_thread(run_analysis, ops_params(cell, max_step, max_slope))
+        g = res.grid
+        return Response(wire.encode_ops_layers(g.w, g.h, g.cell, g.x0, g.y0, res.classes, res.rel_max), media_type="application/octet-stream")
+
+    class RouteRequest(BaseModel):
+        from_xy: list[float]
+        to_xy: list[float]
+        cell: float | None = None
+        max_step: float | None = None
+        max_slope: float | None = None
+
+    @app.post(f"{api}/ops/route")
+    async def ops_route(body: RouteRequest):
+        if len(body.from_xy) != 2 or len(body.to_xy) != 2:
+            raise HTTPException(400, "from_xy and to_xy are [x, y] in metres")
+        res = await asyncio.to_thread(run_analysis, ops_params(body.cell, body.max_step, body.max_slope))
+        route = plan_route(res.classes, res.grid, tuple(body.from_xy), tuple(body.to_xy), res.rel_max, snap_m=OpsParams().snap_m)
+        return route or {"found": False, "reason": "no passable route (goal blocked, unknown, or unreachable)"}
+
     def grid_args(cell, layer, z_min, z_max):
         if layer is not None and layer not in LAYERS:
             raise HTTPException(400, f"layer must be one of {LAYERS}")
