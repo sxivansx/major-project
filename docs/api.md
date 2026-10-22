@@ -204,7 +204,7 @@ A void is a cell whose returns have a vertical gap ≥ 0.4 m starting within 0.1
 
 ### AI layer (`/api/ai/*`)
 
-Both endpoints consume the findings JSON, never points. `OPENROUTER_API_KEY` in `core/.env` or the environment; without it `/ai/status` reports `available: false` and the other calls return 503. Jev (`typesafe/jev-1.14`, OpenRouter Decisions API) answers typed questions with a probability and a confidence; Gemini Flash writes prose from the findings plus Jev's verdicts. Guardrails: prose is labelled as an assistant summary, never says "survivor" (only "possible void", "bearing with confidence"), and every number in it comes from the findings.
+All three consume the findings JSON, never points. `OPENROUTER_API_KEY` in `core/.env` (see `core/.env.example`) or the environment; without it `/ai/status` reports `available: false`, `/ai/triage` and `/ai/ask` return 503, and `/ai/sitrep` returns the deterministic template (`"model": "template"`). OpenRouter errors surface as 502 with the upstream message. Models: Jev `typesafe/jev-1.14` on the Decisions API for every judgment (rankings, rescan verdict, question intent and target), `google/gemini-3.5-flash` for prose; override with `OBSLAM_DECISIONS_MODEL` / `OBSLAM_PROSE_MODEL`. Guardrails: every ranking `why` is a template over the finding's own numbers (Jev cannot write text); prose that mentions a survivor, victim or body is discarded for the template; the UI labels all of it as assistant output.
 
 ## 4. Session on disk
 

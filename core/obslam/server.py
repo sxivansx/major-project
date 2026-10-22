@@ -89,6 +89,23 @@ class RawLine(BaseModel):
     line: str
 
 
+class RouteRequest(BaseModel):
+    from_xy: list[float]
+    to_xy: list[float]
+    cell: float | None = None
+    max_step: float | None = None
+    max_slope: float | None = None
+
+
+class AIRequest(BaseModel):
+    cell: float | None = None
+
+
+class AskRequest(BaseModel):
+    question: str
+    cell: float | None = None
+
+
 def create_app(
     config_path: Path = CONFIG_PATH,
     sessions_dir: Path = SESSIONS_DIR,
@@ -96,10 +113,14 @@ def create_app(
     bridge: Path = BRIDGE,
     autostart_sim: bool = False,
     sim_hz: float = 10.0,
+    ai_client=None,
 ) -> FastAPI:
+    from .ai import AIClient
+
     bc = Broadcaster()
     config = load_config(config_path)
     rig = Rig(config, SessionStore(sessions_dir), bc.publish, bridge_path=bridge, sim_hz=sim_hz)
+    ai = ai_client or AIClient()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -234,13 +255,6 @@ def create_app(
         g = res.grid
         return Response(wire.encode_ops_layers(g.w, g.h, g.cell, g.x0, g.y0, res.classes, res.rel_max), media_type="application/octet-stream")
 
-    class RouteRequest(BaseModel):
-        from_xy: list[float]
-        to_xy: list[float]
-        cell: float | None = None
-        max_step: float | None = None
-        max_slope: float | None = None
-
     @app.post(f"{api}/ops/route")
     async def ops_route(body: RouteRequest):
         if len(body.from_xy) != 2 or len(body.to_xy) != 2:
@@ -248,6 +262,45 @@ def create_app(
         res = await asyncio.to_thread(run_analysis, ops_params(body.cell, body.max_step, body.max_slope))
         route = plan_route(res.classes, res.grid, tuple(body.from_xy), tuple(body.to_xy), res.rel_max, snap_m=OpsParams().snap_m)
         return route or {"found": False, "reason": "no passable route (goal blocked, unknown, or unreachable)"}
+
+    # ---- AI layer -----------------------------------------------------------------------------
+    from . import ai as ai_mod
+
+    @app.exception_handler(ai_mod.AIError)
+    async def _ai_error(_: Request, e: ai_mod.AIError):
+        return JSONResponse({"error": str(e)}, status_code=503 if "unavailable" in str(e) else 502)
+
+    @app.get(f"{api}/ai/status")
+    def ai_status():
+        return ai.status()
+
+    @app.post(f"{api}/ai/triage")
+    async def ai_triage(body: AIRequest):
+        res = await asyncio.to_thread(run_analysis, ops_params(body.cell, None, None))
+        return await asyncio.to_thread(ai_mod.triage, ai, res.findings)
+
+    @app.post(f"{api}/ai/sitrep")
+    async def ai_sitrep(body: AIRequest):
+        res = await asyncio.to_thread(run_analysis, ops_params(body.cell, None, None))
+        tri = None
+        if ai.available:
+            try:
+                tri = await asyncio.to_thread(ai_mod.triage, ai, res.findings)
+            except ai_mod.AIError as e:
+                log.warning("triage before sitrep failed: %s", e)
+        return await asyncio.to_thread(ai_mod.sitrep, ai, res.findings, tri)
+
+    @app.post(f"{api}/ai/ask")
+    async def ai_ask(body: AskRequest):
+        if not body.question.strip():
+            raise HTTPException(400, "question is empty")
+        p = ops_params(body.cell, None, None)
+        res = await asyncio.to_thread(run_analysis, p)
+
+        def route_to(x: float, y: float):
+            return plan_route(res.classes, res.grid, (0.0, 0.0), (x, y), res.rel_max, snap_m=p.snap_m)
+
+        return await asyncio.to_thread(ai_mod.ask, ai, body.question, res.findings, route_to)
 
     def grid_args(cell, layer, z_min, z_max):
         if layer is not None and layer not in LAYERS:

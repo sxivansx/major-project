@@ -11,3 +11,4 @@ sessions/
 .DS_Store
 core/config.json
 core/.venv/
+core/.env
