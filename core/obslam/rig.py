@@ -399,6 +399,11 @@ class Rig:
             if self.scan is None:
                 raise RigError("lidar not connected")
             self._tilt()
+            if self.scan_source != "sim" and isinstance(self.tilt, SimTilt):
+                raise RigError(
+                    "the servo is simulated, so the real LiDAR would not tilt: connect the ESP32 servo "
+                    "before sweeping (the Live scan tab works without it)"
+                )
             phis = params.phis()
             for phi in (float(phis[0]), float(phis[-1])):
                 s = self.config.mount.phi_to_servo(phi)

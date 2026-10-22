@@ -103,6 +103,15 @@ def test_job_end_to_end(rig):
     assert rig.live_points().shape[0] == meta["n_points"] and rig.session_loaded == sid
 
 
+def test_real_lidar_with_sim_servo_refuses_to_sweep(rig):
+    rig.connect_servo("sim")
+    rig.connect_lidar("sim")
+    rig.scan_source = "s2"  # pretend the lidar is the real one
+    with pytest.raises(RigError, match="servo is simulated"):
+        rig.start_job(JobParams(phi_start=-10, phi_end=10, phi_step=10, settle_ms=0))
+    rig.scan_source = "sim"
+
+
 def test_job_stop(rig):
     rig.connect_servo("sim")
     rig.connect_lidar("sim")
