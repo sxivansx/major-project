@@ -140,6 +140,15 @@ def test_route_on_synthetic_grid():
     assert r3 and 0 < r3["goal_snapped_m"] <= 0.6
     gx, gy = r3["path"][-1]
     assert not (0.8 <= gx < 1.2 and 0.8 <= gy < 1.2)
+    # a flat top ringed by blocked cells is an island: never a destination, even though "passable"
+    cls2 = cls.copy()
+    cls2[2:7, 13:18] = BLOCKED
+    cls2[3:6, 14:17] = PASSABLE  # the island, x 1.4..1.7, y 0.3..0.6
+    assert plan_route(cls2, g, (0.15, 0.15), (1.55, 0.45), rel) is None
+    r4 = plan_route(cls2, g, (0.15, 0.15), (1.55, 0.45), rel, snap_goal_m=0.6)
+    assert r4 and r4["goal_snapped_m"] > 0
+    gx, gy = r4["path"][-1]
+    assert not (1.3 <= gx < 1.8 and 0.2 <= gy < 0.7), "endpoint must be outside the ring, not on the island"
     # start too far from anything open fails
     assert plan_route(cls, g, (-5.0, -5.0), (1.85, 0.15), rel, snap_m=1.0) is None
 

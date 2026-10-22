@@ -324,11 +324,38 @@ def plan_route(cls: np.ndarray, g: Grid, start_xy, goal_xy, rel: np.ndarray | No
         return int(xs_all[k]), int(ys_all[k]), float(d[k])
 
     s = snap(start_xy, snap_m)
-    t = snap(goal_xy, snap_goal_m)
-    if s is None or t is None:
+    if s is None:
         return None
     sx, sy, snapped = s
-    gx, gy, goal_snapped = t
+
+    # everything reachable from the start with the planner's own moves; the goal must lie in it
+    # (a flat object top is "passable" but ringed by blocked cells: an island, never a destination)
+    reach = np.zeros((H, W), bool)
+    reach[sy, sx] = True
+    stack = [(sx, sy)]
+    while stack:
+        cx, cy = stack.pop()
+        for dy, dx in _N8:
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < W and 0 <= ny < H) or not passable[ny, nx] or reach[ny, nx]:
+                continue
+            if dx and dy and not (passable[cy, nx] and passable[ny, cx]):
+                continue
+            reach[ny, nx] = True
+            stack.append((nx, ny))
+    ys_r, xs_r = np.nonzero(reach)
+    rxs = (xs_r + 0.5) * g.cell + g.x0
+    rys = (ys_r + 0.5) * g.cell + g.y0
+    gx, gy = to_cell(*goal_xy)
+    goal_snapped = 0.0
+    if not (0 <= gx < W and 0 <= gy < H and reach[gy, gx]):
+        if snap_goal_m <= 0 or xs_r.size == 0:
+            return None
+        d = np.hypot(rxs - goal_xy[0], rys - goal_xy[1])
+        k = int(np.argmin(d))
+        if d[k] > snap_goal_m:
+            return None
+        gx, gy, goal_snapped = int(xs_r[k]), int(ys_r[k]), float(d[k])
     cost = np.where(cls == MARGINAL, 3.0, 1.0)
     open_heap = [(0.0, 0.0, (sx, sy))]
     came: dict[tuple[int, int], tuple[int, int] | None] = {(sx, sy): None}
