@@ -16,7 +16,7 @@ Pass: live 2D scan moving, a sim sweep (-60..60, step 2) finishes with a height 
 1. Wiring: DS3218 red → separate 5–6 V supply (≥3 A). Black → that supply's GND **and** an ESP32 GND pin. Signal → GPIO 13. Never the ESP32 5 V pin.
 2. Plug the ESP32 in over USB, find it: `ls /dev/cu.*` (usually `/dev/cu.usbmodem*` or `/dev/cu.usbserial-*`).
 3. Flash: `make flash PORT=/dev/cu.usbmodemXXXX` (add `FQBN=esp32:esp32:esp32s3` for an S3).
-4. Dashboard → Servo → pick the port → connect. In the raw console: `?` then `T 135`.
+4. Dashboard → Servo → pick the port → connect. Opening the port resets the board and the cradle snaps to centre (135°), so keep hands clear. In the raw console: `?` then `T 135`.
 
 Pass: `STATUS angle=135 ...` and the cradle moves to roughly level.
 
