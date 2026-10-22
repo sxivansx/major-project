@@ -40,7 +40,7 @@ class GridConfig(BaseModel):
 class LidarConfig(BaseModel):
     min_quality: int = 10
     min_range_m: float = 0.1
-    max_range_m: float = 30.0
+    max_range_m: float = 40.0  # RPLIDAR S3: 40 m on 70% reflectivity, 15 m on 10%
 
 
 class Config(BaseModel):

@@ -70,7 +70,7 @@ export function LidarConnect() {
     <div className="sensor-connect">
       <div className="sensor-row">
         <select value={source} onChange={(e) => setSource(e.target.value as "s2" | "sim")} title="Source">
-          <option value="s2">s2 (RPLIDAR S2M1)</option>
+          <option value="s2">s2 (RPLIDAR S3)</option>
           <option value="sim">sim (simulator)</option>
         </select>
         <input

@@ -1,6 +1,6 @@
 # major-project (OBSLAM payload tool)
 
-Internal tool for the OBSLAM LiDAR payload: drives an RPLIDAR S2M1 on a servo-tilted cradle, captures step-and-scan sweeps, builds a 2.5D elevation map and shows it on a dashboard.
+Internal tool for the OBSLAM LiDAR payload: drives an RPLIDAR S3 on a servo-tilted cradle, captures step-and-scan sweeps, builds a 2.5D elevation map and shows it on a dashboard.
 
 ```
 driver/    C++ bridge over Slamtec rplidar_sdk (S2 needs 1 Mbaud + the S-series scan format)

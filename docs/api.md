@@ -5,7 +5,7 @@ Four processes, three contracts. Everything is little-endian.
 ```
 ESP32 (firmware/) ──USB serial, ASCII lines──┐
                                              ├── core server (Python, :8000) ──REST + WS──> web dashboard
-RPLIDAR S2M1 ──USB 1 Mbaud──> s2bridge (C++) ─┘   stdout binary frames
+RPLIDAR S3 ──USB 1 Mbaud──> s2bridge (C++) ─┘   stdout binary frames
 ```
 
 ## 1. s2bridge (driver/bridge) → core: stdout frames
@@ -78,7 +78,7 @@ Server on `http://127.0.0.1:8000`. In dev, Vite on `:5173` proxies `/api` and `/
   "mount": {"axis_z_mm": 80, "h_mm": 0, "lidar_yaw_deg": 0, "center_deg": 90, "invert": false,
             "enc_center_deg": 90, "enc_invert": false},
   "grid":  {"cell_m": 0.05, "z_min_m": -0.5, "z_max_m": 2.5, "layer": "max"},
-  "lidar": {"min_quality": 10, "min_range_m": 0.1, "max_range_m": 30}
+  "lidar": {"min_quality": 10, "min_range_m": 0.1, "max_range_m": 40}
 }
 ```
 Persisted to `core/config.json`.
