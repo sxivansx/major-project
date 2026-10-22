@@ -19,7 +19,10 @@ s2bridge --serial <port> --info                print one JSON line, exit 0
 
 `--info` JSON line:
 ```json
-{"model":"S2M1","model_id":97,"firmware":"1.02","hardware":18,"serial":"ABCD...","health":"good","health_code":0}
+{"model":"S2M1","model_id":113,"firmware":"1.02","hardware":18,"serial":"ABCD...","health":"good","health_code":0}
+```
+`model` comes from the SDK's own model table (major id 7 = S2 family); `model_id` is the raw byte. Confirm against the real unit on first run.
+```
 ```
 Errors: one JSON line on stderr `{"error":"..."}` and exit 1.
 
