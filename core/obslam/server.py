@@ -260,7 +260,8 @@ def create_app(
         if len(body.from_xy) != 2 or len(body.to_xy) != 2:
             raise HTTPException(400, "from_xy and to_xy are [x, y] in metres")
         res = await asyncio.to_thread(run_analysis, ops_params(body.cell, body.max_step, body.max_slope))
-        route = plan_route(res.classes, res.grid, tuple(body.from_xy), tuple(body.to_xy), res.rel_max, snap_m=OpsParams().snap_m)
+        p = OpsParams()
+        route = plan_route(res.classes, res.grid, tuple(body.from_xy), tuple(body.to_xy), res.rel_max, snap_m=p.snap_m, snap_goal_m=p.snap_goal_m)
         return route or {"found": False, "reason": "no passable route (goal blocked, unknown, or unreachable)"}
 
     # ---- AI layer -----------------------------------------------------------------------------
@@ -298,7 +299,7 @@ def create_app(
         res = await asyncio.to_thread(run_analysis, p)
 
         def route_to(x: float, y: float):
-            return plan_route(res.classes, res.grid, (0.0, 0.0), (x, y), res.rel_max, snap_m=p.snap_m)
+            return plan_route(res.classes, res.grid, (0.0, 0.0), (x, y), res.rel_max, snap_m=p.snap_m, snap_goal_m=max(p.snap_goal_m, 1.0))
 
         return await asyncio.to_thread(ai_mod.ask, ai, body.question, res.findings, route_to)
 

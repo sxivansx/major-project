@@ -70,6 +70,8 @@ def test_room_findings(room_cloud):
         hit = [o for o in found if bx[0] - 0.2 < o["x_m"] < bx[3] + 0.2 and bx[1] - 0.2 < o["y_m"] < bx[4] + 0.2]
         assert hit, f"box {bx} not detected"
         assert abs(max(o["height_m"] for o in hit) - bx[5]) < 0.1
+        assert not any(o["wall"] for o in hit if abs(o["height_m"] - bx[5]) < 0.1), "a rubble box is not a wall"
+    assert any(o["wall"] for o in found if o["height_m"] > 2.5), "the room walls are flagged wall-like"
     # traversability: walls and box faces blocked, the sampled floor passable
     cls = res.classes
     assert (cls == PASSABLE).sum() > 100
@@ -132,7 +134,12 @@ def test_route_on_synthetic_grid():
     assert plan_route(cls, g, (0.15, 0.15), (0.05, 1.0), rel) is None  # goal in the wall
     # start in the wall snaps to the nearest open cell
     r2 = plan_route(cls, g, (0.05, 0.05), (1.85, 0.15), rel)
-    assert r2 and 0 < r2["start_snapped_m"] < 0.2
+    assert r2 and 0 < r2["start_snapped_m"] < 0.2 and r2["goal_snapped_m"] == 0
+    # routing "to" the block lands on its edge when goal snapping is allowed
+    r3 = plan_route(cls, g, (0.15, 0.15), (1.0, 1.0), rel, snap_goal_m=0.6)
+    assert r3 and 0 < r3["goal_snapped_m"] <= 0.6
+    gx, gy = r3["path"][-1]
+    assert not (0.8 <= gx < 1.2 and 0.8 <= gy < 1.2)
     # start too far from anything open fails
     assert plan_route(cls, g, (-5.0, -5.0), (1.85, 0.15), rel, snap_m=1.0) is None
 

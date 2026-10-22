@@ -159,9 +159,12 @@ def facts_from(findings: dict) -> dict:
 
 
 def describe(kind: str, item: dict) -> str:
+    if kind == "obstacle" and item.get("wall"):
+        kind = "wall"
     val = {
         "void": f"covered void, clearance {item.get('clearance_m')} m",
         "obstacle": f"obstacle {item.get('height_m')} m high",
+        "wall": f"wall-like structure {item.get('height_m')} m high (boundary, not debris)",
         "depression": f"depression {item.get('depth_m')} m deep",
         "shadow": "unseen region",
     }[kind]
@@ -203,7 +206,7 @@ def triage(ai: AIClient, findings: dict, max_items: int = 24) -> dict:
         ranked.append(
             {
                 "id": it["id"],
-                "kind": kind,
+                "kind": "wall" if kind == "obstacle" and it.get("wall") else kind,
                 "attention": round(min(1.0, max(0.0, score / (len(LEVELS) - 1))), 3),
                 "confidence": round(float(a.get("confidence", 0.0)), 3),
                 "why": describe(kind, it),

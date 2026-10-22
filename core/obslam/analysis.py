@@ -44,6 +44,9 @@ class OpsParams:
     inpaint_cells: int = 3  # bridge sweep-line gaps up to this many cells wide
     inpaint_tol_m: float = 0.30  # only when the surrounding known cells agree within this
     snap_m: float = 1.0  # route start may snap this far to the nearest known cell
+    snap_goal_m: float = 0.6  # route goal may snap this far (routing "to" an object means to its edge)
+    wall_min_h_m: float = 1.8  # an obstacle this tall, or larger than wall_min_area_m2, is flagged as wall-like
+    wall_min_area_m2: float = 1.5
     z_min_m: float = -1.0
     z_max_m: float = 3.0
 
@@ -292,31 +295,40 @@ def visibility(filled: np.ndarray, tall: np.ndarray, rel: np.ndarray, rng: np.nd
 
 
 # ---- route ---------------------------------------------------------------------------------------
-def plan_route(cls: np.ndarray, g: Grid, start_xy, goal_xy, rel: np.ndarray | None = None, snap_m: float = 1.0) -> dict | None:
+def plan_route(cls: np.ndarray, g: Grid, start_xy, goal_xy, rel: np.ndarray | None = None, snap_m: float = 1.0, snap_goal_m: float = 0.0) -> dict | None:
     """A* over the class grid, 8-connected. Marginal cells cost 3x, everything else impassable.
-    The start snaps to the nearest passable cell within snap_m (the scanner's own footprint is never scanned)."""
+    The start snaps to the nearest passable cell within snap_m (the scanner's own footprint is never
+    scanned); the goal snaps within snap_goal_m (routing to an object means to its edge)."""
 
     def to_cell(x, y):
         return int(math.floor((x - g.x0) / g.cell)), int(math.floor((y - g.y0) / g.cell))
 
-    sx, sy = to_cell(*start_xy)
-    gx, gy = to_cell(*goal_xy)
     H, W = cls.shape
-    if not (0 <= gx < W and 0 <= gy < H):
-        return None
     passable = (cls == PASSABLE) | (cls == MARGINAL)
-    if not passable[gy, gx]:
+    ys_all, xs_all = np.nonzero(passable)
+    if xs_all.size == 0:
         return None
-    snapped = 0.0
-    if not (0 <= sx < W and 0 <= sy < H and passable[sy, sx]):
-        ys, xs = np.nonzero(passable)
-        if xs.size == 0:
+    cxs = (xs_all + 0.5) * g.cell + g.x0
+    cys = (ys_all + 0.5) * g.cell + g.y0
+
+    def snap(xy, limit):
+        x, y = to_cell(*xy)
+        if 0 <= x < W and 0 <= y < H and passable[y, x]:
+            return x, y, 0.0
+        if limit <= 0:
             return None
-        d = np.hypot((xs + 0.5) * g.cell + g.x0 - start_xy[0], (ys + 0.5) * g.cell + g.y0 - start_xy[1])
+        d = np.hypot(cxs - xy[0], cys - xy[1])
         k = int(np.argmin(d))
-        if d[k] > snap_m:
+        if d[k] > limit:
             return None
-        sx, sy, snapped = int(xs[k]), int(ys[k]), float(d[k])
+        return int(xs_all[k]), int(ys_all[k]), float(d[k])
+
+    s = snap(start_xy, snap_m)
+    t = snap(goal_xy, snap_goal_m)
+    if s is None or t is None:
+        return None
+    sx, sy, snapped = s
+    gx, gy, goal_snapped = t
     cost = np.where(cls == MARGINAL, 3.0, 1.0)
     open_heap = [(0.0, 0.0, (sx, sy))]
     came: dict[tuple[int, int], tuple[int, int] | None] = {(sx, sy): None}
@@ -356,6 +368,7 @@ def plan_route(cls: np.ndarray, g: Grid, start_xy, goal_xy, rel: np.ndarray | No
     return {
         "found": True,
         "start_snapped_m": round(snapped, 2),
+        "goal_snapped_m": round(goal_snapped, 2),
         "length_m": round(length, 2),
         "cells": len(path),
         "marginal_cells": n_marginal,
@@ -414,6 +427,8 @@ def analyze(xyz: np.ndarray, p: OpsParams | None = None, scanner_z_m: float | No
         void_mask = np.isfinite(gap)
         depression_mask = filled & (rel_min <= -p.depression_m)
     obstacles = _regions(obstacle_mask, gmax, rel_max, p.min_region_cells, "O", "height_m", max_jump=p.region_max_jump_m)
+    for o in obstacles:
+        o["wall"] = bool(o["height_m"] >= p.wall_min_h_m or o["area_m2"] >= p.wall_min_area_m2)
     voids = _regions(void_mask, gmax, gap, p.min_region_cells, "V", "clearance_m", max_jump=p.region_max_jump_m)
     depressions = _regions(depression_mask, gmax, -rel_min, p.min_region_cells, "D", "depth_m", max_jump=p.region_max_jump_m)
     shadow_regions = _regions(shadow, gmax, np.zeros_like(rel_max), max(p.min_region_cells, 6), "S", "_", connectivity=8)
