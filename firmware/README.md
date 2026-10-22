@@ -1,6 +1,8 @@
 # firmware: tilt servo controller
 
-One Arduino sketch, `servo_tilt/servo_tilt.ino`, for an ESP32 that drives the GS2010MG servo tilting the LiDAR cradle and reads the cradle angle back from an AS5600 magnetic encoder on the tilt axle. The Mac talks to it over USB serial with the line protocol in `docs/api.md` section 2 (that file is the contract; this README only covers wiring, building and a hand test).
+One Arduino sketch, `servo_tilt/servo_tilt.ino`, for an ESP32 that drives the GS2010MG servo tilting the LiDAR cradle and reads the cradle angle back from an AS5600 magnetic encoder on the tilt axle. The Mac talks to it over USB serial (or TCP over Wi-Fi) with the line protocol in `docs/api.md` section 2 (that file is the contract; this README only covers wiring, building and a hand test).
+
+On the ESP32-S3 it also relays the RPLIDAR: the LiDAR's 1 Mbaud UART is wired to the S3, and its bytes are passed through unchanged, both ways, to the Mac, either over the board's second USB socket or over Wi-Fi (TCP 8899). Slamtec's SDK in `s2bridge` decodes them on the Mac exactly as if the LiDAR were plugged in directly.
 
 The encoder is optional: the sketch probes for it at boot and a board without one behaves exactly like the earlier servo-only firmware (`enc=none`, no `meas` values).
 
@@ -8,8 +10,18 @@ Works on either board, pick one and use its FQBN below:
 
 | Board | FQBN |
 |---|---|
+| ESP32-S3 DevKitC-1 (the target board) | `esp32:esp32:esp32s3:CDCOnBoot=cdc` |
 | ESP32 DevKit (plain ESP32, CP2102/CH340 USB-UART) | `esp32:esp32:esp32` |
-| ESP32-S3 DevKitC-1 (the target board) | `esp32:esp32:esp32s3` |
+
+What each build has:
+
+| Feature | ESP32-S3 | plain ESP32 |
+|---|---|---|
+| Tilt protocol over USB | native **USB** socket (`/dev/cu.usbmodem*`) | the one USB socket |
+| LiDAR USB pass-through | **UART** socket (`/dev/cu.usbserial-*`), 1,000,000 baud | not built (one USB socket); boot prints a `NOTE` |
+| Wi-Fi, mDNS, TCP 8899 / 8900 | yes | not built; `N` answers `ERR no wifi`, `?` reports `ip=none` |
+
+`CDCOnBoot=cdc` matters on the S3: it puts `Serial` (the tilt protocol) on the native USB socket and frees UART0 (`Serial0`, the CP2102N "UART" socket) for the LiDAR bytes. Built without it, `Serial` and `Serial0` are the same object; the sketch then swaps the sockets (tilt on UART, LiDAR on native USB) so the two still never share a link, but the documented setup is `CDCOnBoot=cdc`.
 
 ## Wiring
 
@@ -65,6 +77,32 @@ Rules:
                               +----------------+
 ```
 
+### LiDAR (RPLIDAR S3, ESP32-S3 only)
+
+The RPLIDAR's UART is 3.3 V logic at 1,000,000 baud and connects straight to the S3, no level shifter.
+
+| RPLIDAR wire | Goes to |
+|---|---|
+| TX (data out of the LiDAR) | ESP32-S3 **GPIO 18** (`LIDAR_RX_PIN`) |
+| RX (data into the LiDAR) | ESP32-S3 **GPIO 17** (`LIDAR_TX_PIN`) |
+| GND | ESP32 GND, **and** the LiDAR supply's GND (common ground) |
+| 5 V | **its own 5 V supply** (≥1.5 A), or the power side of the Slamtec USB adapter. **Not** the ESP32's 5 V pin |
+
+Rules:
+
+- The LiDAR pulls about **1.2 A while the motor spins up** (~450 mA running). Through the ESP32's 5 V pin that comes from the USB port and browns the board out, so it needs a separate 5 V source with its ground tied to the ESP32's.
+- TX goes to RX: LiDAR **TX → GPIO 18**, LiDAR **RX ← GPIO 17**. Swapped wires give `lidar_rx=0` in `?` while the motor spins.
+- To use other pins, change `#define LIDAR_RX_PIN 18` / `#define LIDAR_TX_PIN 17` in the sketch (any free GPIO works, UART1 is routed through the GPIO matrix). Avoid the S3 strapping pins (0, 3, 45, 46), the flash/PSRAM pins (26–37 on modules with octal PSRAM), USB D−/D+ (19, 20), UART0 (43, 44), and the AS5600 pins (8, 9).
+
+### The two USB cables (ESP32-S3 DevKitC-1)
+
+| Socket on the board | macOS port | Carries |
+|---|---|---|
+| **USB** (native, ESP32-S3 USB-Serial/JTAG) | `/dev/cu.usbmodemXXXX` | the tilt protocol (`I`, `?`, `T`, …) at any baud; also used for flashing |
+| **UART** (CP2102N bridge) | `/dev/cu.usbserial-XXXX` (or `/dev/cu.SLAB_USBtoUART`) | the raw LiDAR byte stream, 1,000,000 baud, for `s2bridge --serial` |
+
+Plug both into the Mac. Over Wi-Fi neither cable needs to carry data (power only).
+
 ## Toolchain
 
 ```sh
@@ -76,7 +114,7 @@ arduino-cli core install esp32:esp32          # ~300 MB, takes a few minutes
 arduino-cli lib install ESP32Servo
 ```
 
-The AS5600 driver is a few register reads on `Wire` (part of the ESP32 core); no extra library.
+The AS5600 driver is a few register reads on `Wire` (part of the ESP32 core); Wi-Fi, mDNS and the TCP servers use the core's `WiFi`, `ESPmDNS` and `Network` libraries. No extra library.
 
 ## Compile and flash
 
@@ -89,19 +127,14 @@ arduino-cli compile --fqbn esp32:esp32:esp32 firmware/servo_tilt
 arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/cu.usbserial-0001 firmware/servo_tilt
 ```
 
-ESP32-S3 DevKitC-1 (plug the USB cable into the port labelled **UART**, not **USB**):
-
-```sh
-arduino-cli compile --fqbn esp32:esp32:esp32s3 firmware/servo_tilt
-arduino-cli upload  --fqbn esp32:esp32:esp32s3 -p /dev/cu.usbserial-0001 firmware/servo_tilt
-```
-
-If you would rather talk to the S3 over its native **USB** port instead, build with the CDC option and the serial protocol then appears on that port as `/dev/cu.usbmodem*`:
+ESP32-S3 DevKitC-1 (the target; always with `CDCOnBoot=cdc`, see the board table above). Flash over either socket; the native **USB** one is shown:
 
 ```sh
 arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc firmware/servo_tilt
 arduino-cli upload  --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc -p /dev/cu.usbmodem1101 firmware/servo_tilt
 ```
+
+Over the **UART** socket instead: same FQBN, `-p /dev/cu.usbserial-XXXX`. With Wi-Fi in, the S3 image is about 980 KB (74% of the default 1.25 MB app partition).
 
 If the upload sits at `Connecting........` hold the **BOOT** button, tap **RST**/**EN**, release BOOT, and retry.
 
@@ -120,7 +153,7 @@ Unplug and replug the board and see which entry appears. Typical names:
 - `/dev/cu.usbserial-0001`, `/dev/cu.usbserial-XXXX` (CP2102)
 - `/dev/cu.wchusbserialXXXX` (CH340)
 - `/dev/cu.SLAB_USBtoUART` (older CP210x driver)
-- `/dev/cu.usbmodemXXXX` (ESP32-S3 native USB)
+- `/dev/cu.usbmodemXXXX` (ESP32-S3 native USB: the tilt protocol)
 
 `arduino-cli board list` shows the same ports with the detected board where it can.
 
@@ -129,22 +162,23 @@ Unplug and replug the board and see which entry appears. Typical names:
 With `screen` (press Enter after each command; `screen` sends `\r`, which the firmware accepts):
 
 ```sh
-screen /dev/cu.usbserial-0001 115200
+screen /dev/cu.usbmodem1101 115200        # ESP32-S3: the native USB socket
+screen /dev/cu.usbserial-0001 115200      # plain ESP32
 ```
 
 Or with arduino-cli:
 
 ```sh
-arduino-cli monitor -p /dev/cu.usbserial-0001 -c baudrate=115200
+arduino-cli monitor -p /dev/cu.usbmodem1101 -c baudrate=115200
 ```
 
-Opening the port resets the board (the USB-UART bridge pulls DTR/RTS), so you first see the ROM boot chatter, then `OBSLAM-TILT v1`, and the servo goes to the middle of its range. Then type (replies shown for a board with the encoder fitted and zeroed; without one, drop the trailing `meas` token on `OK` lines and expect `meas=nan enc=none settled=0` in `STATUS`):
+On the plain ESP32, opening the port resets the board (the USB-UART bridge pulls DTR/RTS), so you first see the ROM boot chatter, then the `NOTE` lines and `OBSLAM-TILT v1`, and the servo goes to the middle of its range. The S3's native USB port does not reset on open; press **RST** to see the boot lines. Then type (replies shown for a board with the encoder fitted and zeroed; without one, drop the trailing `meas` token on `OK` lines and expect `meas=nan enc=none settled=0` in `STATUS`):
 
 ```
 I
 OBSLAM-TILT v1
 ?
-STATUS angle=90 meas=90.09 min=0 max=180 range=180 us_min=500 us_max=2500 enc=ok settled=1
+STATUS angle=90 meas=90.09 min=0 max=180 range=180 us_min=500 us_max=2500 enc=ok settled=1 lidar_rx=0 lidar_tx=0 lidar_drop=0 lidar_ovf=0 ip=192.168.1.42 tcp_rx=0 tcp_tx=0
 T 120
 OK 120 90.09
 W
@@ -168,6 +202,79 @@ ERR bad args
 ```
 
 Leave `screen` with `Ctrl-A` then `k`, then `y`. Leave the arduino-cli monitor with `Ctrl-C`.
+
+## LiDAR pass-through over USB (ESP32-S3)
+
+With the LiDAR wired and powered and both cables in, run against the **UART** socket's port:
+
+```sh
+./driver/build/s2bridge --serial /dev/cu.usbserial-XXXX --baud 1000000 --info
+```
+
+It should print the `{"model":...,"health":"good",...}` line. Then send `?` on the tilt port: `lidar_tx` counts the SDK's command bytes that reached the LiDAR and `lidar_rx` its reply and scan bytes (about 100,000 a second while scanning).
+
+The counters in `?`, all since boot, from the ESP's point of view:
+
+| Field | Meaning |
+|---|---|
+| `lidar_rx` | bytes read from the LiDAR and handed to a host link (USB or TCP 8899) |
+| `lidar_tx` | bytes written to the LiDAR (from USB or TCP 8899) |
+| `lidar_drop` | bytes the firmware discarded because the host link could not keep up (UART ring at its high-water mark, or a TCP client left with a chunk in flight) |
+| `lidar_ovf` | UART overflow events from the driver itself (bytes lost before the firmware saw them; the count is events, not bytes). Should stay 0 |
+| `tcp_rx` / `tcp_tx` | bytes received from / sent to the TCP 8899 client |
+
+A rising `lidar_drop` means the Mac is not reading fast enough; a rising `lidar_ovf` means the loop was held up (for example a `N` that re-joined Wi-Fi, which can block up to 1 s). On the plain ESP32 all of these stay 0.
+
+## Wi-Fi (ESP32-S3)
+
+### Set the network
+
+Once, over the USB tilt port (stored in NVS, survives reboots and reflashes):
+
+```
+N myhotspot mypassword
+OK
+NET ip=192.168.1.42
+```
+
+`OK` comes straight away; the `NET ip=…` line follows when the S3 has joined and got an address (also after every reconnect). For an open network send `N myhotspot` with no password. The SSID and password cannot contain spaces (the parser splits on them); a WPA2 password must be 8–63 characters, an SSID 1–32. Sending `N` with new values replaces the old ones and re-joins.
+
+The firmware re-joins by itself when the link drops (the Wi-Fi driver's auto-reconnect, plus a forced reconnect every 15 s while it stays down). Modem power-save is off, so latency stays flat.
+
+### Find the IP
+
+Any of:
+
+- `?` on the USB tilt port: `ip=192.168.1.42` (`ip=none` while not joined)
+- `N` alone:
+
+  ```
+  NET ssid=myhotspot ip=192.168.1.42 rssi=-58 clients_lidar=0 clients_tilt=0
+  ```
+
+  `rssi` is in dBm (`none` while not joined); `clients_lidar` / `clients_tilt` are 1 while a client holds TCP 8899 / 8900. `ssid=none` means no network is stored.
+- mDNS: `obslam-tilt.local` (`ping obslam-tilt.local` on the Mac).
+
+### Ports
+
+| Port | What |
+|---|---|
+| **8899** | raw LiDAR bridge: bytes in go to the LiDAR, LiDAR bytes come out. Same bytes as the USB pass-through. While a client is connected the USB pass-through's LiDAR → Mac direction is paused (one consumer at a time) and resumes when it leaves; USB → LiDAR keeps working, so do not run both at once. |
+| **8900** | the tilt line protocol, same commands and replies as on USB. Each reply goes back to the link its command came from. |
+
+One client per port; a new connection replaces the old one (the old socket is closed).
+
+### Test from the Mac
+
+```sh
+ping -c1 obslam-tilt.local                                # prints the IP, if you don't have it from `?`
+./driver/build/s2bridge --tcp 192.168.x.y:8899 --info       # numeric IP: the SDK's TCP channel parses an address
+nc 192.168.x.y 8900
+?
+STATUS angle=90 ... ip=192.168.x.y tcp_rx=... tcp_tx=...
+```
+
+(`nc` sends `\n` after each line; quit with `Ctrl-C`.)
 
 ## Encoder setup
 
@@ -234,5 +341,8 @@ The same detector drives `settled=` in `STATUS`, evaluated continuously from the
 - The encoder is polled at about 100 Hz from the main loop (non-blocking, two short I2C reads at 400 kHz: STATUS, then RAW ANGLE 0x0C/0x0D). The unscaled RAW ANGLE register is used on purpose, so nothing programmed into the chip's own ZPOS/MPOS registers can shift the reading; zero and direction are applied in the firmware. If a read fails the status goes to `err`, the last good value is kept, and polling backs off to 10 Hz until the chip answers again. If the chip is missing at boot (three probes, 10 ms apart), the I2C bus is released and never touched again.
 - `meas` is wrapped into a 360° window centred on `range/2` (so −90..270 for a 180 servo), which keeps it continuous a little past either end of the travel instead of jumping to 359.
 - Pulse resolution is 0.3 µs on the plain ESP32 (16-bit LEDC timer) and 1.2 µs on the S3 (14-bit), so the smallest step is well under 0.2°. ESP32Servo's default is 10 bits (~1.8° steps on a 180 servo); the sketch overrides it after `attach()`. The AS5600 resolves 0.088° (12 bits).
-- Command letters are accepted in either case (`e zero` works too). Lines are trimmed; blank lines get no reply; lines over 63 characters get `ERR line too long`.
-- The core should wait about 1.5 s after opening the port and discard any pending input before sending `I`, since the auto-reset puts boot output on the line.
+- Command letters are accepted in either case (`e zero` works too). Lines are trimmed; blank lines get no reply; lines over 127 characters get `ERR line too long`.
+- The core should wait about 1.5 s after opening the port and discard any pending input before sending `I`, since the auto-reset puts boot output on the line. Boot output now includes `NOTE …` lines before the banner.
+- Two kinds of unsolicited line can appear on the USB tilt port: `NOTE …` at boot and `NET ip=…` whenever Wi-Fi gets an address. Both are printed between commands, never inside a reply, but a parser waiting for a reply should skip lines starting with `NOTE ` or `NET ip=`. Neither is sent on TCP 8900.
+- The LiDAR bytes are copied in chunks (up to 512 bytes LiDAR → Mac, 64 bytes Mac → LiDAR) with zero-timeout reads and writes capped to the receiver's free space, from the main loop and from inside every blocking command (`S`, `W`), so scan data keeps flowing during moves. The UART1 receive ring is 16 KB (~160 ms of scan data).
+- Wi-Fi credentials are stored as `wifi_ssid` / `wifi_pass` in the `tilt` NVS namespace; `N` never echoes the password.

@@ -3,8 +3,12 @@
 // Drives one GS2010MG 180-degree servo (50 Hz PWM) that tilts the LiDAR cradle,
 // reads the cradle angle back from an AS5600 magnetic encoder on the tilt axle
 // (I2C; optional, a board without one behaves exactly like the pre-encoder
-// firmware), and talks to the core server over USB serial. The protocol is the
-// contract in docs/api.md, section 2:
+// firmware), and talks to the core server over USB serial. On the ESP32-S3 it
+// also carries the RPLIDAR's 1 Mbaud UART stream, unchanged and both ways,
+// between UART1 and the DevKitC-1's second USB socket, so the Slamtec SDK on
+// the Mac talks to the LiDAR as if it were plugged in directly (see the
+// "lidar" section and firmware/README.md). The protocol is the contract in
+// docs/api.md, section 2:
 //
 //   115200 8N1, '\n'-terminated ASCII lines ('\r' is accepted as a terminator
 //   too, so `screen` works), exactly one reply line per command. Angles are
@@ -15,6 +19,16 @@
 //   I                           -> OBSLAM-TILT v1
 //   ?                           -> STATUS angle=<deg> meas=<deg|nan> min=<deg> max=<deg> range=<180|270>
 //                                         us_min=<us> us_max=<us> enc=<ok|nomag|weak|strong|err|none> settled=<0|1>
+//                                         lidar_rx=<bytes from lidar> lidar_tx=<bytes to lidar>
+//                                         lidar_drop=<bytes dropped, host link full> lidar_ovf=<uart overflow events>
+//                                         ip=<ip|none> tcp_rx=<bytes from 8899 client> tcp_tx=<bytes to 8899 client>
+//   N                           -> NET ssid=<ssid|none> ip=<ip|none> rssi=<dBm|none> clients_lidar=<0|1> clients_tilt=<0|1>
+//   N <ssid> [<password>]       -> OK         store the Wi-Fi network in NVS and (re)join it (S3 only;
+//                                             plain ESP32: ERR no wifi). Unsolicited `NET ip=<ip>` on
+//                                             Serial each time the link gets an address.
+//
+//   The same protocol runs on TCP port 8900 (S3, Wi-Fi up); each reply goes
+//   back to the link its command came from. TCP 8899 is the raw LiDAR bridge.
 //   T <deg>                     -> OK <deg> [<meas>]   move now, clamped, reply once the pulse is set
 //   S <deg> <ms>                -> OK <deg> [<meas>]   ease linearly over <ms>, reply when done
 //   H                           -> OK <deg> [<meas>]   go to RANGE/2
@@ -28,8 +42,10 @@
 //   C <us_min> <us_max> <range> -> OK         pulse calibration, persisted in NVS
 //   anything else               -> ERR <msg>
 //
-// Boards: plain ESP32 DevKit (esp32:esp32:esp32) and ESP32-S3 DevKitC-1
-// (esp32:esp32:esp32s3). Compiles for both. See firmware/README.md.
+// Boards: ESP32-S3 DevKitC-1 (esp32:esp32:esp32s3:CDCOnBoot=cdc, the target:
+// tilt protocol on the native USB socket, LiDAR bytes on the UART socket) and
+// plain ESP32 DevKit (esp32:esp32:esp32, one USB socket, no pass-through).
+// Compiles for both. See firmware/README.md.
 
 #include <Arduino.h>
 #include <ESP32Servo.h>
@@ -41,6 +57,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#include <ESPmDNS.h>
+#include <WiFi.h>
+#include <errno.h>
+#include <lwip/sockets.h>
+#endif
 
 // ---------------------------------------------------------------- settings --
 
@@ -61,7 +84,7 @@
 
 #define EASE_STEP_MS     20        // one 50 Hz servo frame per easing step
 #define EASE_MAX_MS      60000     // `S` durations above this are rejected
-#define CMD_LINE_MAX     64        // longest accepted command line, incl. NUL
+#define CMD_LINE_MAX     128       // longest accepted command line, incl. NUL (N needs ~100)
 
 // Pulse bounds the ESP32Servo library itself enforces (MIN/MAX_PULSE_WIDTH).
 // `C` refuses anything outside these.
@@ -111,6 +134,57 @@
 #define WAIT_MAX_MS      10000
 #define WAIT_NOENC_MS    300       // `W` on a board without an encoder: fixed wait
 
+// LiDAR UART pass-through (ESP32-S3 only). The RPLIDAR (1 Mbaud TTL UART,
+// 3.3 V logic) hangs off UART1 and its bytes are copied unchanged, both ways,
+// to the Mac over the DevKitC-1's second USB socket. A plain ESP32 has one
+// USB socket, so there the pass-through is not built.
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define LIDAR_PASSTHROUGH   1
+#define LIDAR_RX_PIN        18      // LiDAR TX -> this pin
+#define LIDAR_TX_PIN        17      // LiDAR RX <- this pin
+#define LIDAR_BAUD          1000000
+#define LIDAR_RX_BUF        16384   // UART1 RX ring, ~160 ms of scan data
+#define LIDAR_TX_BUF        1024    // UART1 TX ring; SDK commands are a few bytes
+#define LIDAR_HOST_RX_BUF   4096
+#define LIDAR_HOST_TX_BUF   4096
+#define LIDAR_CHUNK         512     // LiDAR -> Mac bytes per pump call
+#define LIDAR_CMD_CHUNK     64      // Mac -> LiDAR bytes per pump call
+#define LIDAR_RX_HIGH_WATER (LIDAR_RX_BUF - 2 * LIDAR_CHUNK)
+#define LIDAR_RX_FIFO_FULL  64      // RX FIFO interrupt threshold: leaves 64 bytes
+                                    // (640 us at 1 Mbaud) of ISR latency margin
+#if ARDUINO_USB_CDC_ON_BOOT
+// Build CDCOnBoot=cdc (the documented one): Serial is the native USB socket
+// and carries the tilt protocol; Serial0 is UART0 on the CP2102N "UART"
+// socket and carries the LiDAR bytes.
+#define LIDAR_HOST          Serial0
+#define LIDAR_HOST_DESC     "UART socket"
+#elif ARDUINO_USB_MODE
+// Build without CDCOnBoot: Serial *is* Serial0 (the same object, the UART
+// socket), so the tilt protocol sits there and the LiDAR bytes go out of the
+// native USB socket through our own HWCDC instance. Same invariant (one host
+// link each), sockets swapped.
+#define LIDAR_HOST          LidarUsb
+#define LIDAR_HOST_IS_HWCDC 1
+#define LIDAR_HOST_DESC     "native USB socket"
+#else
+#error "ESP32-S3: build with USBMode=hwcdc (the default) and CDCOnBoot=cdc"
+#endif
+#endif
+
+// Wi-Fi (ESP32-S3 only): station mode with credentials from `N`, mDNS name
+// obslam-tilt.local, and two TCP servers, one client each (a new connection
+// replaces the old one):
+//   8899  raw LiDAR bridge to UART1, same bytes as the USB pass-through
+//   8900  the tilt line protocol, same parser and replies as on Serial
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define NET_ENABLED         1
+#define NET_HOSTNAME        "obslam-tilt"
+#define NET_LIDAR_PORT      8899
+#define NET_TILT_PORT       8900
+#define NET_POLL_MS         50      // accept / connection checks
+#define NET_RETRY_MS        15000   // kick a reconnect if still down after this
+#endif
+
 // ------------------------------------------------------------------- state --
 
 struct Cal {
@@ -148,9 +222,49 @@ static uint8_t settle_head  = 0;
 static uint8_t settle_count = 0;
 static bool    settled      = false;
 
-static char   line[CMD_LINE_MAX];
-static size_t line_len      = 0;
-static bool   line_overflow = false;
+// One line assembler per host link; replies go to the link the line came from.
+struct LineBuf {
+  char   buf[CMD_LINE_MAX];
+  size_t len;
+  bool   overflow;
+};
+static LineBuf serial_line = {};
+static Print  *out         = &Serial;  // reply link of the command being handled
+
+#ifdef LIDAR_HOST_IS_HWCDC
+static HWCDC LidarUsb;
+#endif
+// Pass-through counters, printed by `?` on every board (all zero without it).
+// 32-bit: lidar_rx wraps after 4 GiB, about 12 h of continuous scanning.
+static uint32_t          lidar_rx   = 0;  // bytes LiDAR -> Mac
+static uint32_t          lidar_tx   = 0;  // bytes Mac -> LiDAR
+static uint32_t          lidar_drop = 0;  // bytes discarded: host link full, RX ring at high water
+static volatile uint32_t lidar_ovf  = 0;  // UART1 driver overflow events (FIFO or ring); bytes unknown
+static uint32_t          tcp_rx     = 0;  // bytes the TCP 8899 client sent (-> LiDAR)
+static uint32_t          tcp_tx     = 0;  // bytes sent to the TCP 8899 client (LiDAR ->)
+
+#ifdef NET_ENABLED
+static char          net_ssid[33] = "";
+static char          net_pass[65] = "";
+static bool          net_started   = false;
+static bool          mdns_started  = false;
+static volatile bool net_got_ip    = false;  // set by the Wi-Fi event task
+static unsigned long net_down_since = 0;
+static unsigned long net_last_poll  = 0;
+
+static NetworkServer lidar_server(NET_LIDAR_PORT);
+static NetworkServer tilt_server(NET_TILT_PORT);
+static NetworkClient lidar_client;
+static NetworkClient tilt_client;
+static bool          lidar_client_on = false;
+static bool          tilt_client_on  = false;
+static LineBuf       tilt_line       = {};
+
+// LiDAR -> TCP bytes already taken off UART1 but not yet accepted by the socket.
+static uint8_t tcp_pend[LIDAR_CHUNK];
+static size_t  tcp_pend_off = 0;
+static size_t  tcp_pend_len = 0;
+#endif
 
 // ----------------------------------------------------------------- helpers --
 
@@ -299,6 +413,281 @@ static void encAlignHere() {
   settleReset();  // the window holds values on the old scale
 }
 
+// ------------------------------------------------------------------- lidar --
+
+#ifdef LIDAR_PASSTHROUGH
+
+// Bytes a UART accepts right now without blocking. availableForWrite()
+// reports the TX ring's free space, but falls back to the 128-byte FIFO's
+// free space once the ring is full, so anything at or below the FIFO size
+// counts as no room. The driver stores each write as ring items with their
+// own headers, hence the slack.
+static int uartRoom(int available_for_write) {
+  const int slack = 32;
+  return available_for_write > SOC_UART_FIFO_LEN + slack ? available_for_write - slack : 0;
+}
+
+static int hostRoom() {
+#ifdef LIDAR_HOST_IS_HWCDC
+  return LIDAR_HOST.availableForWrite();  // byte ring, zero timeout: never blocks
+#else
+  return uartRoom(LIDAR_HOST.availableForWrite());
+#endif
+}
+
+static void lidarInit() {
+  Serial1.setRxBufferSize(LIDAR_RX_BUF);
+  Serial1.setTxBufferSize(LIDAR_TX_BUF);
+  Serial1.begin(LIDAR_BAUD, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
+  Serial1.setRxFIFOFull(LIDAR_RX_FIFO_FULL);
+  // Runs in the core's UART event task: count what the driver itself lost.
+  Serial1.onReceiveError([](hardwareSerial_error_t e) {
+    if (e == UART_FIFO_OVF_ERROR || e == UART_BUFFER_FULL_ERROR) lidar_ovf = lidar_ovf + 1;
+  });
+
+  LIDAR_HOST.setRxBufferSize(LIDAR_HOST_RX_BUF);
+  LIDAR_HOST.setTxBufferSize(LIDAR_HOST_TX_BUF);
+#ifdef LIDAR_HOST_IS_HWCDC
+  LIDAR_HOST.setTxTimeoutMs(0);  // never wait for the Mac
+  LIDAR_HOST.begin();
+#else
+  LIDAR_HOST.begin(LIDAR_BAUD, SERIAL_8N1);
+#endif
+}
+
+#ifdef NET_ENABLED
+static void lidarClientDrop() {
+  lidar_client.stop();
+  lidar_client_on = false;
+  lidar_drop  += (uint32_t)tcp_pend_len;  // taken off the UART, never delivered
+  tcp_pend_len = 0;
+  tcp_pend_off = 0;
+}
+
+// LiDAR -> TCP client. Only new UART bytes are read once the previous chunk
+// is fully in the socket; send() is MSG_DONTWAIT, so a slow Wi-Fi link never
+// blocks the loop, it just leaves bytes in the UART ring.
+static int lidarToTcp(int avail) {
+  if (tcp_pend_len == 0 && avail > 0) {
+    int n = avail < LIDAR_CHUNK ? avail : LIDAR_CHUNK;
+    n = (int)Serial1.read(tcp_pend, (size_t)n);
+    tcp_pend_off = 0;
+    tcp_pend_len = (size_t)n;
+    lidar_rx += (uint32_t)n;
+    avail -= n;
+  }
+  if (tcp_pend_len > 0) {
+    int s = send(lidar_client.fd(), tcp_pend + tcp_pend_off, tcp_pend_len, MSG_DONTWAIT);
+    if (s > 0) {
+      tcp_pend_off += (size_t)s;
+      tcp_pend_len -= (size_t)s;
+      tcp_tx       += (uint32_t)s;
+    } else if (s < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
+      lidarClientDrop();  // peer gone; the USB pass-through takes over again
+    }
+  }
+  return avail;
+}
+#endif
+
+// One chunk per direction, never blocks: every read is zero-timeout and
+// every write is capped by the receiver's free space. Called from loop() and
+// from every wait loop, so it runs at a few kHz idle and at 1 kHz inside S/W.
+// LiDAR -> host bytes have one consumer at a time: the TCP 8899 client when
+// one is connected, the USB pass-through otherwise.
+static void lidarPump() {
+  static uint8_t buf[LIDAR_CHUNK];
+
+  // LiDAR -> Mac: scan data, ~100 KB/s while scanning.
+  int avail = Serial1.available();
+  if (avail > 0) {
+#ifdef NET_ENABLED
+    if (lidar_client_on) {
+      avail = lidarToTcp(avail);
+    } else
+#endif
+    {
+      int n = avail < LIDAR_CHUNK ? avail : LIDAR_CHUNK;
+      int room = hostRoom();
+      if (n > room) n = room;
+      if (n > 0) {
+        n = (int)Serial1.read(buf, (size_t)n);
+        LIDAR_HOST.write(buf, (size_t)n);
+        lidar_rx += (uint32_t)n;
+        avail -= n;
+      }
+    }
+    // Consumer stalled and the RX ring nearly full: discard the oldest
+    // chunk here, counted, instead of letting the driver drop silently.
+    if (avail > LIDAR_RX_HIGH_WATER) {
+      lidar_drop += (uint32_t)Serial1.read(buf, LIDAR_CHUNK);
+    }
+  }
+#ifdef NET_ENABLED
+  else if (lidar_client_on && tcp_pend_len > 0) {
+    lidarToTcp(0);  // finish the last chunk even when the LiDAR went quiet
+  }
+#endif
+
+  // Mac -> LiDAR: the SDK's short commands, from the USB link and the TCP
+  // client alike (only one of them is normally in use).
+  avail = LIDAR_HOST.available();
+  if (avail > 0) {
+    int n = avail < LIDAR_CMD_CHUNK ? avail : LIDAR_CMD_CHUNK;
+    int room = uartRoom(Serial1.availableForWrite());
+    if (n > room) n = room;
+    if (n > 0) {
+      n = (int)LIDAR_HOST.read(buf, (size_t)n);
+      Serial1.write(buf, (size_t)n);
+      lidar_tx += (uint32_t)n;
+    }
+  }
+#ifdef NET_ENABLED
+  if (lidar_client_on) {
+    avail = lidar_client.available();
+    if (avail > 0) {
+      int n = avail < LIDAR_CMD_CHUNK ? avail : LIDAR_CMD_CHUNK;
+      int room = uartRoom(Serial1.availableForWrite());
+      if (n > room) n = room;
+      if (n > 0) {
+        n = lidar_client.read(buf, (size_t)n);
+        if (n > 0) {
+          Serial1.write(buf, (size_t)n);
+          lidar_tx += (uint32_t)n;
+          tcp_rx   += (uint32_t)n;
+        }
+      }
+    }
+  }
+#endif
+}
+
+#endif  // LIDAR_PASSTHROUGH
+
+// ----------------------------------------------------------------- network --
+
+#ifdef NET_ENABLED
+
+static void fmtIp(char *buf, size_t n) {
+  if (WiFi.status() == WL_CONNECTED) {
+    IPAddress ip = WiFi.localIP();
+    snprintf(buf, n, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  } else {
+    snprintf(buf, n, "none");
+  }
+}
+
+// Start (first call) or re-point (after `N`) the station. Non-blocking apart
+// from the driver's own disconnect of a live link (<= 1 s, only on `N`).
+static void netStart() {
+  if (!net_ssid[0]) return;
+  if (!net_started) {
+    WiFi.persistent(false);  // credentials live in our NVS namespace only
+    WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) { net_got_ip = true; },
+                 ARDUINO_EVENT_WIFI_STA_GOT_IP);
+    WiFi.setHostname(NET_HOSTNAME);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);    // modem sleep adds 100+ ms latency spikes to the stream
+    WiFi.setAutoReconnect(true);
+    lidar_server.setNoDelay(true);
+    tilt_server.setNoDelay(true);
+    lidar_server.begin();
+    tilt_server.begin();
+    net_started = true;
+  }
+  WiFi.begin(net_ssid, net_pass[0] ? net_pass : nullptr);
+  net_down_since = millis();
+}
+
+static void loadNet() {
+  prefs.begin(NVS_NAMESPACE, true);
+  prefs.getString("wifi_ssid", net_ssid, sizeof(net_ssid));
+  prefs.getString("wifi_pass", net_pass, sizeof(net_pass));
+  prefs.end();
+}
+
+static void saveNet() {
+  prefs.begin(NVS_NAMESPACE, false);
+  prefs.putString("wifi_ssid", net_ssid);
+  prefs.putString("wifi_pass", net_pass);
+  prefs.end();
+}
+
+// Accepts and connection checks for the LiDAR bridge. Runs from service(),
+// so the bridge also follows clients while S or W block.
+static void netService() {
+  if (!net_started) return;
+  unsigned long now = millis();
+  if (now - net_last_poll < NET_POLL_MS) return;
+  net_last_poll = now;
+
+  if (lidar_server.hasClient()) {
+    NetworkClient c = lidar_server.accept();
+    if (c) {
+      if (lidar_client_on) lidarClientDrop();  // a new connection replaces the old one
+      lidar_client    = c;
+      lidar_client_on = true;
+    }
+  }
+  if (lidar_client_on && !lidar_client.connected()) lidarClientDrop();
+}
+
+// Wi-Fi housekeeping and the TCP tilt link. Runs from loop() only, between
+// commands, so the NET line never lands inside another command's reply and a
+// replaced tilt client never receives a half-handled command's reply.
+static void netLoop() {
+  if (!net_started) return;
+
+  if (net_got_ip) {
+    net_got_ip = false;
+    char ip[16];
+    fmtIp(ip, sizeof(ip));
+    Serial.printf("NET ip=%s\n", ip);
+    if (!mdns_started && MDNS.begin(NET_HOSTNAME)) mdns_started = true;
+  }
+
+  // The driver's auto-reconnect covers ordinary drops; this covers the rest
+  // (AP gone for a long time, auth failure that stopped retrying).
+  if (WiFi.status() == WL_CONNECTED) {
+    net_down_since = millis();
+  } else if (millis() - net_down_since > NET_RETRY_MS) {
+    WiFi.reconnect();
+    net_down_since = millis();
+  }
+
+  static unsigned long last = 0;
+  if (millis() - last >= NET_POLL_MS) {
+    last = millis();
+    if (tilt_server.hasClient()) {
+      NetworkClient c = tilt_server.accept();
+      if (c) {
+        if (tilt_client_on) tilt_client.stop();
+        tilt_client    = c;
+        tilt_client_on = true;
+        tilt_line.len      = 0;
+        tilt_line.overflow = false;
+      }
+    }
+    if (tilt_client_on && !tilt_client.connected()) {
+      tilt_client.stop();
+      tilt_client_on = false;
+    }
+  }
+}
+
+#endif  // NET_ENABLED
+
+// Everything that must keep running while a command blocks.
+static void service() {
+  encPoll();
+#ifdef NET_ENABLED
+  netService();
+#endif
+#ifdef LIDAR_PASSTHROUGH
+  lidarPump();
+#endif
+}
+
 // ------------------------------------------------------------------- servo --
 
 // deg must already be clamped.
@@ -310,11 +699,11 @@ static void applyAngle(float deg) {
   cur_deg = deg;
 }
 
-// Wait ms while keeping the encoder polled.
+// Wait ms while keeping the encoder polled and the LiDAR bytes moving.
 static void waitPolling(unsigned long ms) {
   unsigned long t0 = millis();
   while (millis() - t0 < ms) {
-    encPoll();
+    service();
     delay(1);
   }
 }
@@ -358,9 +747,9 @@ static void replyOkDeg(float deg) {
   fmtDeg(a, sizeof(a), deg);
   if (enc.present) {
     fmtMeas(m, sizeof(m));
-    Serial.printf("OK %s %s\n", a, m);
+    out->printf("OK %s %s\n", a, m);
   } else {
-    Serial.printf("OK %s\n", a);
+    out->printf("OK %s\n", a);
   }
 }
 
@@ -370,9 +759,19 @@ static void replyStatus() {
   fmtMeas(m, sizeof(m));
   fmtDeg(lo, sizeof(lo), cal.lim_min);
   fmtDeg(hi, sizeof(hi), cal.lim_max);
-  Serial.printf("STATUS angle=%s meas=%s min=%s max=%s range=%d us_min=%d us_max=%d enc=%s settled=%d\n",
+  char ip[16];
+#ifdef NET_ENABLED
+  fmtIp(ip, sizeof(ip));
+#else
+  snprintf(ip, sizeof(ip), "none");
+#endif
+  out->printf("STATUS angle=%s meas=%s min=%s max=%s range=%d us_min=%d us_max=%d enc=%s settled=%d"
+                " lidar_rx=%lu lidar_tx=%lu lidar_drop=%lu lidar_ovf=%lu ip=%s tcp_rx=%lu tcp_tx=%lu\n",
                 a, m, lo, hi, cal.range, cal.us_min, cal.us_max,
-                ENC_STATUS_STR[enc.status], (enc.present && settled) ? 1 : 0);
+                ENC_STATUS_STR[enc.status], (enc.present && settled) ? 1 : 0,
+                (unsigned long)lidar_rx, (unsigned long)lidar_tx,
+                (unsigned long)lidar_drop, (unsigned long)lidar_ovf,
+                ip, (unsigned long)tcp_rx, (unsigned long)tcp_tx);
 }
 
 // Magnet-spacing diagnostics. raw and deg are the chip's unzeroed reading;
@@ -382,7 +781,7 @@ static void replyEnc() {
   if (enc.present && enc.valid) fmtDeg(d, sizeof(d), encRawDeg());
   else                          snprintf(d, sizeof(d), "nan");
   fmtDeg(z, sizeof(z), enc.zero);
-  Serial.printf("ENC raw=%u deg=%s zero=%s dir=%d status=%s\n",
+  out->printf("ENC raw=%u deg=%s zero=%s dir=%d status=%s\n",
                 (unsigned)enc.raw, d, z, enc.dir, ENC_STATUS_STR[enc.status]);
 }
 
@@ -471,16 +870,16 @@ static bool parseF(const char *s, float *out) {
   return true;
 }
 
-static void replyBadArgs() { Serial.println("ERR bad args"); }
+static void replyBadArgs() { out->println("ERR bad args"); }
 
 // E zero / E dir need a reading with a magnet behind it.
 static bool encUsable() {
   if (!enc.present) {
-    Serial.println("ERR no encoder");
+    out->println("ERR no encoder");
     return false;
   }
   if (!enc.valid || enc.status == ENC_ERR || enc.status == ENC_NOMAG) {
-    Serial.printf("ERR enc=%s\n", ENC_STATUS_STR[enc.status]);
+    out->printf("ERR enc=%s\n", ENC_STATUS_STR[enc.status]);
     return false;
   }
   return true;
@@ -491,7 +890,7 @@ static void handleLine(char *s) {
   int   argc = tokenize(s, argv, 6);
   if (argc == 0) return;  // blank line: no reply
   if (argc > 4 || strlen(argv[0]) != 1) {
-    Serial.println(argc > 4 ? "ERR bad args" : "ERR unknown cmd");
+    out->println(argc > 4 ? "ERR bad args" : "ERR unknown cmd");
     return;
   }
 
@@ -502,7 +901,7 @@ static void handleLine(char *s) {
   switch (cmd) {
     case 'I':
       if (nargs != 0) { replyBadArgs(); return; }
-      Serial.println(BANNER);
+      out->println(BANNER);
       return;
 
     case '?':
@@ -542,19 +941,19 @@ static void handleLine(char *s) {
       if (!enc.present) {
         // Nothing to measure: a fixed settle delay so encoder-less callers
         // can still use W as their "wait for the servo" primitive.
-        delay(WAIT_NOENC_MS);
+        waitPolling(WAIT_NOENC_MS);
         fmtDeg(m, sizeof(m), cur_deg);
-        Serial.printf("OK %s settled=1\n", m);
+        out->printf("OK %s settled=1\n", m);
         return;
       }
       unsigned long budget = (unsigned long)ms;
       unsigned long t0     = millis();
       while (!settled && millis() - t0 < budget) {
-        encPoll();
+        service();
         delay(1);
       }
       fmtMeas(m, sizeof(m));
-      Serial.printf("OK %s settled=%d\n", m, settled ? 1 : 0);
+      out->printf("OK %s settled=%d\n", m, settled ? 1 : 0);
       return;
     }
 
@@ -578,8 +977,8 @@ static void handleLine(char *s) {
       saveEnc();
       char m[16];
       fmtMeas(m, sizeof(m));
-      Serial.print("OK ");
-      Serial.println(m);
+      out->print("OK ");
+      out->println(m);
       return;
     }
 
@@ -593,7 +992,7 @@ static void handleLine(char *s) {
       cal.lim_max = b;
       saveCal();
       // The servo is left where it is; the next move command clamps.
-      Serial.println("OK");
+      out->println("OK");
       return;
 
     case 'C': {
@@ -616,13 +1015,63 @@ static void handleLine(char *s) {
       applyAngle(clampTarget(cur_deg));
       // The meas wrap window follows range/2; refresh the cached value.
       if (enc.valid) enc.meas = encMeasFromRaw(enc.raw);
-      Serial.println("OK");
+      out->println("OK");
+      return;
+    }
+
+    case 'N': {
+#ifdef NET_ENABLED
+      if (nargs == 0) {
+        char ip[16], rssi[8];
+        fmtIp(ip, sizeof(ip));
+        if (WiFi.status() == WL_CONNECTED) snprintf(rssi, sizeof(rssi), "%d", (int)WiFi.RSSI());
+        else                               snprintf(rssi, sizeof(rssi), "none");
+        out->printf("NET ssid=%s ip=%s rssi=%s clients_lidar=%d clients_tilt=%d\n",
+                    net_ssid[0] ? net_ssid : "none", ip, rssi,
+                    lidar_client_on ? 1 : 0, tilt_client_on ? 1 : 0);
+        return;
+      }
+      // N <ssid> [<password>]: no password = open network. WPA2 needs 8..63.
+      size_t ls = strlen(argv[1]), lp = nargs == 2 ? strlen(argv[2]) : 0;
+      if (nargs > 2 || ls < 1 || ls > 32 || (nargs == 2 && (lp < 8 || lp > 63))) {
+        replyBadArgs();
+        return;
+      }
+      strcpy(net_ssid, argv[1]);
+      strcpy(net_pass, nargs == 2 ? argv[2] : "");
+      saveNet();
+      out->println("OK");  // before the reconnect, in case this came over TCP 8900
+      netStart();
+#else
+      out->println("ERR no wifi");
+#endif
       return;
     }
 
     default:
-      Serial.println("ERR unknown cmd");
+      out->println("ERR unknown cmd");
       return;
+  }
+}
+
+// Feed one received byte of a host link into its line assembler; a complete
+// line is handled with its replies going back to that same link.
+static void feedLine(LineBuf &lb, int ch, Print *link) {
+  if (ch == '\n' || ch == '\r') {
+    out = link;
+    if (lb.overflow) {
+      out->println("ERR line too long");
+    } else {
+      lb.buf[lb.len] = '\0';
+      handleLine(lb.buf);
+    }
+    out         = &Serial;
+    lb.len      = 0;
+    lb.overflow = false;
+  } else if (lb.len < CMD_LINE_MAX - 1) {
+    lb.buf[lb.len++] = (char)ch;
+  } else {
+    lb.overflow = true;
   }
 }
 
@@ -631,6 +1080,12 @@ static void handleLine(char *s) {
 void setup() {
   Serial.setRxBufferSize(512);
   Serial.begin(SERIAL_BAUD);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  // Serial is the native USB (HWCDC) port here. Cap how long a reply may wait
+  // for the Mac, so a host that stopped reading cannot stall the loop and,
+  // with it, the LiDAR pass-through.
+  Serial.setTxTimeoutMs(10);
+#endif
 
   loadCal();
 
@@ -650,31 +1105,49 @@ void setup() {
   applyAngle(clampTarget((float)cal.range / 2.0f));
 
   encInit();
+#ifdef LIDAR_PASSTHROUGH
+  lidarInit();
+#endif
+#ifdef NET_ENABLED
+  loadNet();
+  netStart();  // no-op until `N` has stored a network
+#endif
 
   delay(50);
+  // Note lines before the banner (the core discards boot output anyway).
+#ifdef LIDAR_PASSTHROUGH
+  Serial.printf("NOTE lidar pass-through: %s <-> UART1 (RX GPIO%d, TX GPIO%d) at %d\n",
+                LIDAR_HOST_DESC, LIDAR_RX_PIN, LIDAR_TX_PIN, LIDAR_BAUD);
+#else
+  Serial.println("NOTE lidar pass-through not built: needs the ESP32-S3");
+#endif
+#ifdef NET_ENABLED
+  if (net_ssid[0]) Serial.printf("NOTE wifi: joining %s as %s.local\n", net_ssid, NET_HOSTNAME);
+  else             Serial.println("NOTE wifi: no network stored, set one with N <ssid> <password>");
+#endif
   Serial.println(BANNER);
 }
 
 void loop() {
-  encPoll();
+  service();
+#ifdef NET_ENABLED
+  netLoop();
+#endif
 
   while (Serial.available() > 0) {
     int ch = Serial.read();
     if (ch < 0) break;
+    feedLine(serial_line, ch, &Serial);
+  }
 
-    if (ch == '\n' || ch == '\r') {
-      if (line_overflow) {
-        Serial.println("ERR line too long");
-      } else {
-        line[line_len] = '\0';
-        handleLine(line);
-      }
-      line_len      = 0;
-      line_overflow = false;
-    } else if (line_len < CMD_LINE_MAX - 1) {
-      line[line_len++] = (char)ch;
-    } else {
-      line_overflow = true;
+#ifdef NET_ENABLED
+  if (tilt_client_on) {
+    uint8_t buf[64];
+    int n = tilt_client.available();
+    if (n > 0) {
+      n = tilt_client.read(buf, n < (int)sizeof(buf) ? (size_t)n : sizeof(buf));
+      for (int i = 0; i < n; i++) feedLine(tilt_line, buf[i], &tilt_client);
     }
   }
+#endif
 }
