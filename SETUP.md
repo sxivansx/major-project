@@ -15,7 +15,10 @@ Check: `clang --version`, `uv --version`, `bun --version` all print a version.
 
 ## 2. Get the code
 
+The repo is private, so sign in to GitHub first (once per Mac):
+
 ```bash
+brew install gh && gh auth login                       # GitHub.com → HTTPS → log in with a browser
 git clone --recursive https://github.com/sxivansx/major-project.git
 cd major-project
 ```
@@ -28,7 +31,7 @@ Already cloned without `--recursive`? Run `git submodule update --init` (the Sla
 make setup        # = make driver (Slamtec SDK + s2bridge) + cd core && uv sync + cd web && bun install
 ```
 
-The driver build takes 1 to 2 minutes the first time. `make test` runs the Python tests and the web type check (about 40 s).
+The driver build takes under a minute. `make test` runs the Python tests and the web type check (about 40 s). The tests include timing checks: on a busy machine one can fail once; rerun before worrying.
 
 ## 4. API keys (`core/.env`)
 
