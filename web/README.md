@@ -1,4 +1,4 @@
-# web: obslam bench dashboard
+# web: On-board SLAM dashboard
 
 Internal bench tool for the RPLIDAR S2M1 on the servo-tilted cradle. Talks to the core server (`docs/api.md`, section 3) over REST and a WebSocket.
 

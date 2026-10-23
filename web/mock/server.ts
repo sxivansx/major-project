@@ -271,7 +271,7 @@ function toPly(s: SessionData): string {
   const lines: string[] = [
     "ply",
     "format ascii 1.0",
-    `comment obslam session ${s.meta.id}`,
+    `comment onboard-slam session ${s.meta.id}`,
     `element vertex ${n}`,
     "property float x",
     "property float y",
@@ -934,7 +934,7 @@ const server = Bun.serve<unknown>({
         return err(500, (e as Error).message);
       }
     }
-    return new Response("obslam mock core. REST under /api, stream at /ws. Run the dashboard with `bun run dev`.", {
+    return new Response("On-board SLAM mock core. REST under /api, stream at /ws. Run the dashboard with `bun run dev`.", {
       headers: { "content-type": "text/plain" },
     });
   },
