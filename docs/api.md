@@ -228,7 +228,7 @@ Goal: detect impulsive sounds (knocks, shouts, tapping) and estimate their **dir
 
 Both I2S units sample on the same BCLK/WS edges, so all four channels are simultaneous; I2S1 is started before I2S0 so both begin on the same WS frame.
 
-### 5.2 Firmware → core: TCP 8901 audio stream
+### 5.2 Firmware → core: audio stream (TCP 8901 'AUD1' or UDP 8902 'AUD2')
 
 One client at a time (a new one replaces the old). Streaming runs only while a client is connected. Little-endian frames:
 
@@ -247,18 +247,50 @@ n × 4 × i16       interleaved: s0m1 s0m2 s0m3 s0m4 s1m1 ...
 Frame size = 28 + n × 8 bytes: 128 KB/s at 16 kHz, 193 KB/s at 24 kHz, 384 KB/s at 48 kHz. Frames are never older than ~300 ms when sent: if the link is slower than the stream, the firmware skips the backlog down to the newest 50 ms, adds the skipped samples to `dropped`, and sets bit1 on the next frame sent (the `seq` gap gives the count). Over TCP the ESP32's lwIP send buffer (5,744 B) caps throughput at about 5,744 B / RTT, e.g. ~150 KB/s at a 38 ms Wi-Fi round trip, so on a slow link use 16 kHz.
 
 Tilt protocol additions (port 8900 / USB):
-- `A` → `AUDIO rate=<16000|24000|48000> shift=<8..16> clients=<0|1> frames=<n> dropped=<n> i2s_timeouts=<n>`. `frames` = frames captured since boot; `dropped` = samples per channel not delivered (backlog skipped or ring full).
+- `A` → `AUDIO rate=<16000|24000|48000> shift=<8..16> clients=<0|1> frames=<n> dropped=<n> i2s_timeouts=<n> udp=<ip:port|none>`. `frames` = frames captured since boot; `clients` = TCP 8901 clients; `dropped` = samples per channel not delivered (TCP backlog skipped, ring full, or UDP datagrams the stack refused); `udp` = the current UDP subscriber.
 - `A rate <16000|24000|48000>` → `OK` (persisted; applied within ~20 ms; the stream's next frames carry the new rate and n).
 - `A shift <8..16>` → `OK` (gain; lower shift = louder, clips sooner; persisted).
 - `A raw` → one diagnostic line: `RAW rate=… n=… fmt=philips data_bits=32 slot_bits=32 mask=both ws_width=32 ws_pol=0 bit_shift=1 left_align=1 big_endian=0 lsb_first=0 mclk_x=256 slave_bclk_div=8 pins=… shift=… pads_hi/4000=bclk4:…,ws5:…,din7:…,din6:… | i2s0.L(mic1) first=<8 hex words> min=… max=… nz=… ones=… toggle=<hex> | i2s0.R(mic2) … | i2s1.L(mic3) … | i2s1.R(mic4) …`. Raw 32-bit words of one block before the shift; `ones` counts 0xFFFFFFFF words, `toggle` ORs every bit that ever differed from the first word, `pads_hi` counts how often each pad read high in 4000 quick samples. Not for parsers.
 - `?` gains `audio=<on|off>`.
+
+#### UDP 8902: 'AUD2' datagrams (preferred over Wi-Fi)
+
+TCP is limited to lwIP's 5,744 B send window per round trip; UDP has no window, so the stream is limited only by Wi-Fi airtime and nothing queues behind a slow ACK.
+
+Subscription (no tilt link needed): the receiver sends the ASCII datagram `AUDS <port>` (e.g. `AUDS 50123`) to the scanner's UDP **8902** at least every 2 s. The scanner streams to the **source IP of that datagram** and the given port until ~5 s after the last `AUDS`, or until it receives `AUDX`. One subscriber at a time: the newest `AUDS` wins. While a UDP subscriber exists it gets the audio and a TCP 8901 client receives nothing (its `seq` jumps when TCP resumes).
+
+Each 10 ms frame is sent as `parts` datagrams of at most 1,400 B of samples (175 samples × 4 ch × 2 B), split evenly. Little-endian, 34-byte header:
+
+```
+u32  magic        0x32445541  ('AUD2')
+u32  seq          frame number (same counter as AUD1); all parts of a frame share it
+u64  t_us         esp_timer_get_time() at the first sample of the FRAME
+u32  sample_rate  16000 | 24000 | 48000
+u16  channels     4
+u16  n            samples per channel in the whole frame (= sample_rate / 100)
+u16  shift        right shift applied to the 32-bit I2S word
+u16  flags        bit0 = I2S read timeout in this frame, bit1 = datagrams dropped before this frame
+u8   part         0 .. parts-1
+u8   parts        datagrams in this frame
+u16  first        index (per channel) of this part's first sample within the frame
+u16  count        samples per channel in this part
+count × 4 × i16   interleaved: s(first)m1 m2 m3 m4, s(first+1)m1 ...
+```
+
+| Rate | n | parts × count | Datagram | Datagrams/s | Payload rate |
+|---|---|---|---|---|---|
+| 16 kHz | 160 | 1 × 160 | 1,314 B | 100 | 131 KB/s |
+| 24 kHz | 240 | 2 × 120 | 994 B | 200 | 199 KB/s |
+| 48 kHz | 480 | 3 × 160 | 1,314 B | 300 | 394 KB/s |
+
+All fit one 1,472 B UDP payload (no IP fragmentation). Receiver: a frame is complete when all `parts` arrived; place each part's samples at `first`; allow a few frames (~50 ms) of reordering, then treat a missing or partial frame as lost (a `seq` gap). Datagrams are built straight from the DMA block and sent non-blocking: nothing is queued on the scanner (latency ≈ 10 ms frame + Wi-Fi), and a datagram the stack cannot take at that moment is dropped, counted in `dropped`, and flagged (bit1) on the next frame.
 
 ### 5.3 Core
 
 Config (`/api/config`, new `audio` block):
 ```json
 "audio": {
-  "port": "tcp://192.168.1.49:8901",
+  "port": "udp://192.168.1.49:8902",   // udp://ip[:8902] (AUD2, recommended over Wi-Fi) or tcp://ip[:8901] (AUD1)
   "mics_mm": [[0,0,0],[0,0,0],[0,0,0],[0,0,0]],   // sound-port positions in the array frame, mm
   "array_yaw_deg": 0,          // bearing of the array's +x axis, clockwise from base +x (same convention as every bearing)
   "calibrated": false,
@@ -271,7 +303,7 @@ Endpoints:
 
 | Method | Path | Returns |
 |---|---|---|
-| POST | `/audio/connect` | `{"source":"tcp"\|"sim","port":"tcp://…:8901"}` → Status |
+| POST | `/audio/connect` | `{"source":"udp"\|"tcp"\|"sim","port":"udp://…:8902"}` → Status. `udp` (the default) binds an ephemeral local port, sends `AUDS <port>` every 1 s, reassembles AUD2 parts (5 frames of reordering; an incomplete frame counts as lost), reports `link: "connecting"` after 2 s of silence while it keeps subscribing, and sends `AUDX` on disconnect. Without `port` the configured one is used; a configured address of the other transport lends its host. Status gains `transport_note` recommending UDP while on TCP |
 | POST | `/audio/disconnect` | Status |
 | GET | `/audio/events?limit=50` | `[AudioEvent]`, newest first |
 | POST | `/audio/clear` | 204 |

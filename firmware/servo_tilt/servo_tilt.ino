@@ -28,7 +28,7 @@
 //                                             Serial each time the link gets an address.
 //
 //                                         ... buf=<used>/<cap> audio=<on|off>
-//   A                           -> AUDIO rate=<16000|24000|48000> shift=<8..16> clients=<0|1> frames=<n> dropped=<n> i2s_timeouts=<n>
+//   A                           -> AUDIO rate=<16000|24000|48000> shift=<8..16> clients=<0|1> frames=<n> dropped=<n> i2s_timeouts=<n> udp=<ip:port|none>
 //   A rate <16000|24000|48000>  -> OK         sample rate (default 24000), persisted
 //   A raw                       -> RAW ...    one-line dump of one raw block per unit/slot + applied config
 //   A shift <8..16>             -> OK         mic gain (right shift of the 32-bit slot), persisted
@@ -36,7 +36,8 @@
 //
 //   The same protocol runs on TCP port 8900 (S3, Wi-Fi up); each reply goes
 //   back to the link its command came from. TCP 8899 is the raw LiDAR bridge,
-//   TCP 8901 the four-microphone AUD1 stream (docs/api.md §5.2).
+//   TCP 8901 the four-microphone AUD1 stream, UDP 8902 the AUD2 datagram stream
+//   (subscribe with `AUDS <port>`; docs/api.md §5.2).
 //   T <deg>                     -> OK <deg> [<meas>]   move now, clamped, reply once the pulse is set
 //   S <deg> <ms>                -> OK <deg> [<meas>]   ease linearly over <ms>, reply when done
 //   H                           -> OK <deg> [<meas>]   go to RANGE/2
@@ -247,6 +248,16 @@
 #define AUD_LAG_MAX_FRAMES  30      // backlog above this (300 ms) is skipped, counted and flagged
 #define AUD_LAG_KEEP_FRAMES 5       // ... down to the newest 50 ms
 #define AUD_RAW_WAIT_MS     500     // `A raw` waits this long for the capture task
+// UDP audio (AUD2 datagrams). The Mac subscribes by sending `AUDS <port>` to
+// UDP 8902 at least every 2 s; frames go to its IP and that port until 5 s
+// after the last subscription, or `AUDX`. Newest subscriber wins; while a UDP
+// subscriber exists it gets the audio and TCP 8901 gets nothing.
+#define AUD_UDP_PORT        8902
+#define AUD_UDP_TIMEOUT_MS  5000
+#define AUD_UDP_POLL_MS     20
+#define AUD2_MAGIC          0x32445541u  // 'AUD2'
+#define AUD2_HDR_BYTES      34
+#define AUD2_MAX_SAMPLES    175     // per datagram: 175 x 4 ch x 2 B = 1,400 B of samples
 #endif
 
 // ------------------------------------------------------------------- state --
@@ -381,6 +392,33 @@ static i2s_std_config_t  aud_cfg0, aud_cfg1;      // the configs actually passed
 static volatile uint32_t aud_timeouts     = 0;   // I2S reads that timed out
 
 static NetworkServer aud_server(AUD_PORT);
+
+// AUD2: the AUD1 header plus part/parts/first/count, one datagram per part.
+struct __attribute__((packed)) Aud2Hdr {
+  uint32_t magic;        // 'AUD2'
+  uint32_t seq;          // frame number, same counter as AUD1
+  uint64_t t_us;         // first sample of the FRAME (not of this part)
+  uint32_t sample_rate;
+  uint16_t channels;
+  uint16_t n;            // samples per channel in the whole frame
+  uint16_t shift;
+  uint16_t flags;        // bit0 I2S timeout in this frame, bit1 datagrams dropped before this frame
+  uint8_t  part;         // 0 .. parts-1
+  uint8_t  parts;
+  uint16_t first;        // index of this part's first sample within the frame
+  uint16_t count;        // samples per channel in this part
+};
+static_assert(sizeof(Aud2Hdr) == AUD2_HDR_BYTES, "AUD2 header is 34 bytes");
+
+static int               aud_udp_rx_sock = -1;  // bound to 8902: subscriptions in (loop() only)
+static int               aud_udp_tx_sock = -1;  // audio out (capture task only)
+static portMUX_TYPE      aud_udp_mux     = portMUX_INITIALIZER_UNLOCKED;
+static bool              aud_udp_on      = false;  // under aud_udp_mux
+static uint32_t          aud_udp_ip      = 0;      // network order, under aud_udp_mux
+static uint16_t          aud_udp_port    = 0;      // host order, under aud_udp_mux
+static unsigned long     aud_udp_last    = 0;      // millis() of the last AUDS (loop() only)
+static volatile uint32_t aud_udp_sent    = 0;      // datagrams sent
+static volatile uint32_t aud_udp_fail    = 0;      // datagrams the stack refused (dropped)
 static NetworkClient aud_client;
 static bool          aud_client_on = false;
 static size_t        aud_send_off  = 0;          // bytes of the frame at aud_r already sent
@@ -884,13 +922,137 @@ static inline int16_t audSat(int32_t v, uint8_t shift) {
   return (int16_t)v;
 }
 
+// ---- UDP (AUD2)
+
+static bool audUdpGet(uint32_t *ip, uint16_t *port) {
+  portENTER_CRITICAL(&aud_udp_mux);
+  bool on = aud_udp_on;
+  *ip   = aud_udp_ip;
+  *port = aud_udp_port;
+  portEXIT_CRITICAL(&aud_udp_mux);
+  return on;
+}
+
+static void audUdpSet(bool on, uint32_t ip, uint16_t port) {
+  portENTER_CRITICAL(&aud_udp_mux);
+  aud_udp_on   = on;
+  aud_udp_ip   = ip;
+  aud_udp_port = port;
+  portEXIT_CRITICAL(&aud_udp_mux);
+}
+
+// Capture task: one frame as ceil(n / 175) equal parts. sendto() is
+// MSG_DONTWAIT on a non-blocking socket, so nothing ever queues here: a
+// datagram the stack cannot take right now (no buffers, radio busy) is
+// dropped, counted, and flagged (bit1) on the next frame.
+static void audUdpSendFrame(uint32_t ip, uint16_t port, uint32_t seq, uint64_t t_us,
+                            uint32_t n, uint16_t flags, uint8_t sh,
+                            const int32_t *raw0, const int32_t *raw1, bool *drop_pending) {
+  static uint8_t dg[AUD2_HDR_BYTES + AUD2_MAX_SAMPLES * AUD_CH * 2];
+  struct sockaddr_in to = {};
+  to.sin_family      = AF_INET;
+  to.sin_port        = htons(port);
+  to.sin_addr.s_addr = ip;
+
+  const uint32_t parts = (n + AUD2_MAX_SAMPLES - 1) / AUD2_MAX_SAMPLES;
+  const uint32_t per   = (n + parts - 1) / parts;
+  const uint16_t fl    = (uint16_t)(flags | (*drop_pending ? 2 : 0));
+  bool failed = false;
+  for (uint32_t p = 0; p < parts; p++) {
+    uint32_t first = p * per;
+    uint32_t count = (first + per <= n) ? per : n - first;
+    Aud2Hdr h;
+    h.magic       = AUD2_MAGIC;
+    h.seq         = seq;
+    h.t_us        = t_us;
+    h.sample_rate = aud_rate;
+    h.channels    = AUD_CH;
+    h.n           = (uint16_t)n;
+    h.shift       = sh;
+    h.flags       = fl;
+    h.part        = (uint8_t)p;
+    h.parts       = (uint8_t)parts;
+    h.first       = (uint16_t)first;
+    h.count       = (uint16_t)count;
+    memcpy(dg, &h, sizeof(h));
+    int16_t *pcm = (int16_t *)(dg + AUD2_HDR_BYTES);
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t j = first + i;
+      pcm[4 * i + 0] = audSat(raw0[2 * j + 0], sh);
+      pcm[4 * i + 1] = audSat(raw0[2 * j + 1], sh);
+      pcm[4 * i + 2] = audSat(raw1[2 * j + 0], sh);
+      pcm[4 * i + 3] = audSat(raw1[2 * j + 1], sh);
+    }
+    size_t len = AUD2_HDR_BYTES + count * AUD_CH * 2;
+    int s = sendto(aud_udp_tx_sock, dg, len, MSG_DONTWAIT, (struct sockaddr *)&to, sizeof(to));
+    if (s == (int)len) {
+      aud_udp_sent = aud_udp_sent + 1;
+    } else {
+      aud_udp_fail = aud_udp_fail + 1;
+      __atomic_fetch_add(&aud_dropped, count, __ATOMIC_RELAXED);
+      failed = true;
+    }
+  }
+  *drop_pending = failed;
+}
+
+static void audUdpInit() {
+  aud_udp_rx_sock = socket(AF_INET, SOCK_DGRAM, 0);
+  aud_udp_tx_sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (aud_udp_rx_sock < 0 || aud_udp_tx_sock < 0) return;
+  struct sockaddr_in a = {};
+  a.sin_family      = AF_INET;
+  a.sin_port        = htons(AUD_UDP_PORT);
+  a.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (bind(aud_udp_rx_sock, (struct sockaddr *)&a, sizeof(a)) < 0) {
+    close(aud_udp_rx_sock);
+    aud_udp_rx_sock = -1;
+    return;
+  }
+  fcntl(aud_udp_rx_sock, F_SETFL, fcntl(aud_udp_rx_sock, F_GETFL, 0) | O_NONBLOCK);
+  fcntl(aud_udp_tx_sock, F_SETFL, fcntl(aud_udp_tx_sock, F_GETFL, 0) | O_NONBLOCK);
+}
+
+// loop()/service(): take subscriptions, expire a silent subscriber.
+static void audUdpService() {
+  if (aud_udp_rx_sock < 0) return;
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < AUD_UDP_POLL_MS) return;
+  last = now;
+
+  for (int i = 0; i < 4; i++) {
+    char buf[32];
+    struct sockaddr_in from = {};
+    socklen_t fl = sizeof(from);
+    int r = recvfrom(aud_udp_rx_sock, buf, sizeof(buf) - 1, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+    if (r <= 0) break;
+    buf[r] = '\0';
+    while (r > 0 && (buf[r - 1] == '\n' || buf[r - 1] == '\r' || buf[r - 1] == ' ')) buf[--r] = '\0';
+    if (strncmp(buf, "AUDS ", 5) == 0) {
+      char *end = nullptr;
+      long port = strtol(buf + 5, &end, 10);
+      if (end == buf + 5 || *end != '\0' || port < 1 || port > 65535) continue;
+      audUdpSet(true, from.sin_addr.s_addr, (uint16_t)port);  // newest subscriber wins
+      aud_udp_last = now;
+    } else if (strcmp(buf, "AUDX") == 0) {
+      audUdpSet(false, 0, 0);
+    }
+  }
+
+  uint32_t ip;
+  uint16_t port;
+  if (audUdpGet(&ip, &port) && now - aud_udp_last > AUD_UDP_TIMEOUT_MS) audUdpSet(false, 0, 0);
+}
+
 // Capture task (core 0). Blocks only in i2s_channel_read, which sleeps on the
 // DMA queue, so it costs the core almost nothing and never touches loop().
 static void audTask(void *) {
   static int32_t raw0[AUD_N_MAX * 2];  // mic1, mic2 interleaved (L, R)
   static int32_t raw1[AUD_N_MAX * 2];  // mic3, mic4 interleaved (L, R)
-  uint32_t seq          = 0;
-  bool     drop_pending = false;
+  uint32_t seq              = 0;
+  bool     drop_pending     = false;  // TCP ring
+  bool     udp_drop_pending = false;  // UDP datagrams
   // Timestamps: a sample-counted timeline (10 000 us per frame) anchored to
   // esp_timer. A block's read returns at or after its last sample arrived, so
   // now - (k+1)*10 ms is an upper bound on the timeline's start; the minimum of
@@ -935,7 +1097,12 @@ static void audTask(void *) {
     uint64_t t_us = (uint64_t)(anchor + (int64_t)k * 10000);
     k++;
 
-    if (__atomic_load_n(&aud_streaming, __ATOMIC_ACQUIRE)) {
+    uint32_t udp_ip;
+    uint16_t udp_port;
+    if (aud_udp_tx_sock >= 0 && audUdpGet(&udp_ip, &udp_port)) {
+      // UDP wins: straight from the DMA block to the radio, no ring.
+      audUdpSendFrame(udp_ip, udp_port, seq, t_us, n, flags, aud_shift, raw0, raw1, &udp_drop_pending);
+    } else if (__atomic_load_n(&aud_streaming, __ATOMIC_ACQUIRE)) {
       uint32_t w = aud_w;
       uint32_t r = __atomic_load_n(&aud_r, __ATOMIC_ACQUIRE);
       if (w - r >= aud_ring_frames) {
@@ -1260,6 +1427,7 @@ static void service() {
 #endif
 #ifdef AUDIO_ENABLED
   audService();
+  audUdpService();
 #endif
 }
 
@@ -1637,10 +1805,17 @@ static void handleLine(char *s) {
     case 'A': {
 #ifdef AUDIO_ENABLED
       if (nargs == 0) {
-        out->printf("AUDIO rate=%lu shift=%u clients=%d frames=%lu dropped=%lu i2s_timeouts=%lu\n",
+        char udp[24] = "none";
+        uint32_t uip;
+        uint16_t uport;
+        if (audUdpGet(&uip, &uport)) {
+          const uint8_t *b = (const uint8_t *)&uip;  // network order: a.b.c.d
+          snprintf(udp, sizeof(udp), "%u.%u.%u.%u:%u", b[0], b[1], b[2], b[3], (unsigned)uport);
+        }
+        out->printf("AUDIO rate=%lu shift=%u clients=%d frames=%lu dropped=%lu i2s_timeouts=%lu udp=%s\n",
                     (unsigned long)aud_rate, (unsigned)aud_shift, aud_client_on ? 1 : 0,
                     (unsigned long)aud_frames, (unsigned long)aud_dropped,
-                    (unsigned long)aud_timeouts);
+                    (unsigned long)aud_timeouts, udp);
         return;
       }
       if (nargs == 1 && strcasecmp(argv[1], "raw") == 0) {
@@ -1754,6 +1929,7 @@ void setup() {
   if (aud_on) {
     aud_server.setNoDelay(true);
     aud_server.begin();
+    audUdpInit();
   }
 #endif
 

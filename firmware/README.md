@@ -266,6 +266,8 @@ Any of:
 |---|---|
 | **8899** | raw LiDAR bridge: bytes in go to the LiDAR, LiDAR bytes come out. Same bytes as the USB pass-through. While a client is connected the USB pass-through's LiDAR → Mac direction is paused (one consumer at a time) and resumes when it leaves; USB → LiDAR keeps working, so do not run both at once. |
 | **8900** | the tilt line protocol, same commands and replies as on USB. Each reply goes back to the link its command came from. |
+| **8901** (TCP) | microphone stream, `AUD1` frames (see "Microphones") |
+| **8902** (UDP) | microphone stream, `AUD2` datagrams to a subscriber (`AUDS <port>`); preferred over Wi-Fi |
 
 One client per port; a new connection replaces the old one (the old socket is closed).
 
@@ -283,7 +285,7 @@ STATUS angle=90 ... ip=192.168.x.y tcp_rx=... tcp_tx=... buf=.../1048576 audio=o
 
 ## Microphones (ESP32-S3)
 
-Four INMP441 MEMS microphones, captured **simultaneously** at 24 kHz (default; 16 or 48 kHz with `A rate`) and streamed on TCP **8901** in the `AUD1` frame format of `docs/api.md` §5.2. The array gives direction only; the core turns the stream into bearings.
+Four INMP441 MEMS microphones, captured **simultaneously** at 24 kHz (default; 16 or 48 kHz with `A rate`) and streamed either as `AUD2` UDP datagrams to a subscriber on port **8902** (preferred) or as `AUD1` frames on TCP **8901** (`docs/api.md` §5.2). The array gives direction only; the core turns the stream into bearings.
 
 ### Wiring recap (pin_connection.md §3)
 
@@ -325,13 +327,25 @@ What has **not** been verified yet (no hardware on the bench when this was writt
 - Frames only go into the ring while a client is connected. A new client starts on fresh audio (anything queued is skipped).
 - **Latency cap.** If the link is slower than the stream, the backlog can never drain, and sending it oldest-first only hides the loss behind a growing delay (that is what the first hardware test showed: 39 % of real time received with no gaps, because the drops were all queued behind the 6 s capture window). So when more than 30 frames (300 ms) are waiting, the sender skips to the newest 5. The skipped samples are added to `dropped` in `A`, `seq` jumps, and the next frame sent has flag bit 1 set. The checker's `lag=` column shows how far behind real time the stream is; it should stay under ~300 ms.
 - **Bandwidth.** Each frame is 28 + n × 8 bytes: **128 KB/s at 16 kHz, 193 KB/s at 24 kHz, 384 KB/s at 48 kHz**. TCP on the ESP32 can only have lwIP's 5,744-byte send buffer in flight, so the ceiling is about 5,744 B ÷ round-trip time: ~570 KB/s at 10 ms, ~190 KB/s at 30 ms, ~150 KB/s at 38 ms (what the first test on a home router implies). So 24 kHz needs a round trip under ~30 ms. The board's own `SLAM-Test` AP is usually fine; on a slow router use `A rate 16000`. The buffer size is compiled into the Arduino core's prebuilt lwIP and cannot be raised from the sketch.
-- **Not built yet: a UDP path.** It would remove that window ceiling: the same `AUD1` frames, split into 5 ms datagrams under the 1,472-byte MTU payload, sent with non-blocking `sendto()` to an address the Mac subscribes with (`A udp <port>` on 8900, renewed every few seconds or it stops). No acknowledgements means no RTT limit (only Wi-Fi airtime, several MB/s); a lost datagram is just a `seq` gap, which the core already handles.
+- **UDP (preferred over Wi-Fi).** The first board test showed what the TCP window costs on a home router: 57 % of frames lost at 24 kHz, ~9 % at 16 kHz, and the LiDAR on the same link slowed to ~6 Hz. Over UDP there is no window and nothing queues on the scanner:
+  - The Mac sends the ASCII datagram `AUDS <port>` to the scanner's UDP **8902** at least every 2 s. The scanner sends the audio to that datagram's source IP and the given port, and stops ~5 s after the last `AUDS`, or at once on `AUDX`. The newest subscriber wins. No tilt link is needed.
+  - While a UDP subscriber exists, UDP gets the audio and a TCP 8901 client gets nothing (its `seq` jumps when TCP resumes).
+  - The capture task builds the datagrams straight from the DMA block and sends them with non-blocking `sendto()`: nothing is queued (latency ≈ the 10 ms frame + Wi-Fi). A datagram the stack cannot take at that moment is dropped, counted in `dropped`, and flagged (bit 1) on the next frame.
+  - Each 10 ms frame becomes `parts` datagrams of at most 1,400 B of samples (`AUD2` header, 34 B: the `AUD1` fields plus `part`, `parts`, `first`, `count`). Datagram sizes and rates:
+
+    | Rate | Datagrams per frame | Datagram | Rate on air |
+    |---|---|---|---|
+    | 16 kHz | 1 × 160 samples | 1,314 B | 100/s, 131 KB/s |
+    | 24 kHz | 2 × 120 samples | 994 B | 200/s, 199 KB/s |
+    | 48 kHz | 3 × 160 samples | 1,314 B | 300/s, 394 KB/s |
+
+    All fit in one 1,472-byte UDP payload, so there is no IP fragmentation. Without acknowledgements there is no round-trip ceiling. The real limit is Wi-Fi airtime, several MB/s on a decent link, shared with the LiDAR's ~100 KB/s on TCP 8899.
 
 ### Commands (USB or TCP 8900)
 
 ```
 A
-AUDIO rate=24000 shift=14 clients=0 frames=1234 dropped=0 i2s_timeouts=0
+AUDIO rate=24000 shift=14 clients=0 frames=1234 dropped=0 i2s_timeouts=0 udp=192.168.1.20:50123
 A shift 12
 OK
 A rate 16000
@@ -340,6 +354,7 @@ A raw
 RAW rate=16000 n=160 fmt=philips data_bits=32 slot_bits=32 mask=both ws_width=32 ... | i2s0.L(mic1) first=... min=... max=... nz=... ones=... toggle=... | ...
 ```
 
+- `udp`: the current UDP subscriber (`ip:port`) or `none`. `clients` counts TCP 8901 clients only.
 - `frames`: frames captured since boot (100 per second at any rate, whether or not a client is connected).
 - `dropped`: samples per channel not delivered because the client fell behind (n per skipped frame).
 - `A rate <16000|24000|48000>` sets the sample rate and saves it in NVS (`aud_rate`). The capture task switches both units within ~20 ms; the new rate and n appear in the next frames' headers. All three keep the INMP441 inside its 0.5–3.2 MHz SCK range.
@@ -364,19 +379,23 @@ Expected configuration for the INMP441: `fmt=philips data_bits=32 slot_bits=32 m
 
 ### Checking the stream from the Mac
 
-`firmware/tools/audio_check.py` (Python 3, standard library only) connects to port 8901, validates every frame (magic, header fields, payload size, `seq` gaps, flags), and prints each channel's RMS and peak level in dBFS once a second:
+`firmware/tools/audio_check.py` (Python 3, standard library only) connects to TCP 8901, or with `--udp` subscribes on UDP 8902. It validates every frame (magic, header fields, sizes, `seq` gaps, flags) and prints, once a second, the frames received, frames lost and their percentage, `lag` (how far behind real time), and each channel's RMS and peak level in dBFS:
 
 ```sh
 python3 firmware/tools/audio_check.py 192.168.4.1                    # on the SLAM-Test AP
 python3 firmware/tools/audio_check.py 192.168.1.42 --wav mics.wav    # also save 4-channel 16-bit WAV
 python3 firmware/tools/audio_check.py 192.168.4.1:8901 --seconds 10
+python3 firmware/tools/audio_check.py 192.168.1.49 --udp                    # UDP: AUDS every 1 s, AUDX on exit
+python3 firmware/tools/audio_check.py 192.168.1.49 --udp --wav mics.wav --seconds 20
 ```
 
+With `--udp` the checker reassembles each frame from its parts, allows 5 frames (50 ms) of reordering, and counts a frame with a missing part as lost (`incomplete` in the totals). `--listen-port` fixes the local port (default: any free one); the Mac's firewall must allow incoming UDP for Python. Lost frames go into the WAV as silence, so the timeline stays true for TDOA checks.
+
 ```
- 100 fr  24k  shift=14  lag=   41ms  m1  -52.3/ -38.0  m2  -51.8/ -37.1  m3  -52.9/ -39.4  m4  -52.0/ -36.6
+ 100 fr  24k  shift=14  lost   0 ( 0.0%)  lag=   41ms  m1  -52.3/ -38.0  m2  -51.8/ -37.1  m3  -52.9/ -39.4  m4  -52.0/ -36.6
 ```
 
-Ctrl-C prints totals (frames, lost frames and gaps, flag counts, resyncs, clipped samples per mic, received rate). Exit status is 0 only if frames arrived and no header was malformed. A tap near one mic should raise that channel most; a channel stuck at `-inf` is a mic that is not driving its slot (dead, unpowered, or a wrong L/R strap putting two mics on one slot). Each line also shows the rate and `lag=` (how far behind real time the stream is).
+Ctrl-C prints totals (frames, lost frames and gaps, incomplete UDP frames, flag counts, resyncs, clipped samples per mic, received rate). Exit status is 0 only if frames arrived and no header was malformed. A tap near one mic should raise that channel most; a channel stuck at `-inf` is a mic that is not driving its slot (dead, unpowered, or a wrong L/R strap putting two mics on one slot). Each line also shows the rate and `lag=` (how far behind real time the stream is).
 
 ## Encoder setup
 
