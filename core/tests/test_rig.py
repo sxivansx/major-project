@@ -30,9 +30,26 @@ def kinds(msgs):
 
 
 def test_phis():
-    assert list(JobParams(phi_start=-10, phi_end=10, phi_step=10).phis()) == [-10, 0, 10]
-    assert list(JobParams(phi_start=10, phi_end=-10, phi_step=10).phis()) == [10, 0, -10]
+    # centre-out (default): 0 → start side, then the other side; level scanned once
+    assert list(JobParams(phi_start=-20, phi_end=20, phi_step=10).phis()) == [0, -10, -20, 10, 20]
+    assert list(JobParams(phi_start=20, phi_end=-20, phi_step=10).phis()) == [0, 10, 20, -10, -20]
+    assert list(JobParams(phi_start=-45, phi_end=45, phi_step=20).phis()) == [0, -20, -40, -45, 20, 40, 45]
+    # linear keeps the old order; one-sided ranges are linear anyway
+    assert list(JobParams(phi_start=-10, phi_end=10, phi_step=10, pattern="linear").phis()) == [-10, 0, 10]
+    assert list(JobParams(phi_start=10, phi_end=30, phi_step=10).phis()) == [10, 20, 30]
     assert list(JobParams(phi_start=5, phi_end=5, phi_step=1).phis()) == [5]
+
+
+def test_moves_never_cross_level_in_one_go(rig):
+    rig.connect_servo("sim")
+    seen = []
+    orig = rig.tilt.ease
+    rig.tilt.ease = lambda deg, ms: (seen.append(round(deg, 1)), orig(deg, ms))[1]
+    rig.move_servo(phi_deg=-40)          # level → -40: direct
+    rig.move_servo(phi_deg=-10)          # same side: direct
+    rig.move_servo(phi_deg=30)           # -10 → +30: via level (servo 90)
+    assert seen == [50.0, 80.0, 90.0, 120.0]
+    assert rig.home_servo() == 90.0      # home is level
 
 
 def test_connect_and_status(rig):

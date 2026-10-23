@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -41,10 +41,21 @@ class JobParams(BaseModel):
     phi_step: float = Field(2.0, gt=0)
     rotations: int = Field(1, ge=1)
     settle_ms: int = Field(300, ge=0)
+    # center_out: 0 → phi_start, back to 0, then 0 → phi_end (the cradle never crosses
+    # level in one move). linear: phi_start → phi_end in order.
+    pattern: Literal["center_out", "linear"] = "center_out"
 
     def phis(self) -> np.ndarray:
         if abs(self.phi_end - self.phi_start) < 1e-9:
             return np.array([self.phi_start])
+        lo, hi = min(self.phi_start, self.phi_end), max(self.phi_start, self.phi_end)
+        if self.pattern == "center_out" and lo < 0 < hi:
+            def half(limit: float) -> np.ndarray:  # 0, ±step, ... up to `limit`, ends exactly on it
+                n = int(np.floor(abs(limit) / self.phi_step + 1e-9))
+                v = np.arange(n + 1) * self.phi_step * np.sign(limit)
+                return v if abs(v[-1] - limit) < 1e-9 else np.r_[v, limit]
+            first, second = (half(lo), half(hi)) if self.phi_start < 0 else (half(hi), half(lo))
+            return np.r_[first, second[1:]]  # level is scanned once
         step = self.phi_step if self.phi_end > self.phi_start else -self.phi_step
         return np.arange(self.phi_start, self.phi_end + step / 2, step)
 
@@ -360,30 +371,39 @@ class Rig:
             raise RigError("servo not connected")
         return self.tilt
 
+    SERVO_SPEED_DPS = 60.0  # eased moves: degrees per second
+    LEVEL_TOL_DEG = 0.5
+
+    def _ease_to(self, t: TiltSource, servo_deg: float) -> float:
+        ms = int(abs(servo_deg - t.servo_deg) / self.SERVO_SPEED_DPS * 1000)
+        return t.ease(servo_deg, max(ms, 100))
+
     def move_servo(self, servo_deg: float | None = None, phi_deg: float | None = None) -> float:
+        """Eased move. Level (φ = 0, the configured centre) is home: a move from one side of
+        level to the other stops at level first, so the cradle never swings across in one go."""
         with self._lock:
             t = self._tilt()
+            mount = self.config.mount
             if servo_deg is None:
                 if phi_deg is None:
                     raise RigError("servo_deg or phi_deg required")
-                servo_deg = self.config.mount.phi_to_servo(phi_deg)
+                servo_deg = mount.phi_to_servo(phi_deg)
             if not (t.min_deg <= servo_deg <= t.max_deg):
                 raise RigError(f"servo {servo_deg:.1f}° outside limits [{t.min_deg}, {t.max_deg}]")
+            now_phi = mount.servo_to_phi(t.servo_deg)
+            to_phi = mount.servo_to_phi(servo_deg)
             try:
-                deg = t.move(servo_deg)
+                if abs(now_phi) > self.LEVEL_TOL_DEG and abs(to_phi) > self.LEVEL_TOL_DEG and now_phi * to_phi < 0:
+                    self._ease_to(t, mount.center_deg)
+                deg = self._ease_to(t, servo_deg)
             except TiltError as e:
                 raise RigError(str(e)) from e
         self.publish_status()
         return deg
 
     def home_servo(self) -> float:
-        with self._lock:
-            try:
-                deg = self._tilt().home()
-            except TiltError as e:
-                raise RigError(str(e)) from e
-        self.publish_status()
-        return deg
+        """Home is level: φ = 0 at the calibrated centre (Mount and filters → Centre)."""
+        return self.move_servo(phi_deg=0.0)
 
     def servo_raw(self, line: str) -> str:
         with self._lock:
@@ -534,6 +554,11 @@ class Rig:
         except Exception as e:  # noqa: BLE001
             log.exception("job %d crashed", job_id)
             state, error = "error", f"{type(e).__name__}: {e}"
+        # every sweep ends level, whatever happened
+        try:
+            self.home_servo()
+        except RigError as e:
+            log.warning("job %d: could not return to level: %s", job_id, e)
 
         sid = None
         n_total = sum(a.shape[0] for a in cols["theta"])

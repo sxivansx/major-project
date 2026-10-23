@@ -42,6 +42,10 @@ class TiltSource:
     def disconnect(self) -> None: ...
     def move(self, servo_deg: float) -> float: ...
     def home(self) -> float: ...
+
+    def ease(self, servo_deg: float, ms: int) -> float:
+        """Move at a steady speed over `ms` milliseconds (default: jump)."""
+        return self.move(servo_deg)
     def raw(self, line: str) -> str: ...
 
     def wait_settled(self, timeout_ms: int) -> bool:
@@ -104,6 +108,9 @@ class SimTilt(TiltSource):
             return f"OK {d:.1f} {d:.1f}"
         if line == "H":
             d = self.home()
+            return f"OK {d:.1f} {d:.1f}"
+        if line.startswith("S "):
+            d = self.move(float(line.split()[1]))
             return f"OK {d:.1f} {d:.1f}"
         if line.startswith("W"):
             return f"OK {self.servo_deg:.1f} settled=1"
@@ -285,6 +292,10 @@ class SerialTilt(TiltSource):
 
     def home(self) -> float:
         return self._ok(self.raw("H"))
+
+    def ease(self, servo_deg: float, ms: int) -> float:
+        """`S <deg> <ms>`: the firmware ramps the pulse and replies when it arrives."""
+        return self._ok(self.raw(f"S {servo_deg:.2f} {int(max(0, min(ms, 60000)))}"))
 
     def wait_settled(self, timeout_ms: int) -> bool:
         """`W <ms>` → `OK <meas> settled=<0|1>`; blocks on the firmware side."""

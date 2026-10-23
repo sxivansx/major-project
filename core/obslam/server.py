@@ -66,6 +66,8 @@ def list_serial_ports() -> list[dict]:
         path = p.device
         if sys.platform == "darwin" and path.startswith("/dev/tty."):
             path = "/dev/cu." + path[len("/dev/tty.") :]
+        if any(x in path for x in ("Bluetooth-Incoming-Port", "debug-console")):
+            continue  # Mac-internal ports, never a LiDAR or servo
         seen[path] = {"path": path, "description": p.description or "", "hwid": p.hwid or ""}
     return [seen[k] for k in sorted(seen)]
 
