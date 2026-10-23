@@ -390,7 +390,7 @@ class Rig:
             t = self._tilt()
             try:
                 reply = t.raw(line)
-                if line.strip().split()[:1] in (["C"], ["L"], ["?"]):
+                if line.strip().split()[:1] and line.strip().split()[0].upper() in ("C", "L", "?", "T", "S", "H", "W", "E"):
                     t.refresh()
             except TiltError as e:
                 raise RigError(str(e)) from e
