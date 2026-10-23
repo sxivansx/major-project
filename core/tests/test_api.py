@@ -28,7 +28,7 @@ def test_status_ports_config(client):
     cfg["mount"]["h_mm"] = 12.5
     assert client.put("/api/config", json=cfg).json()["mount"]["h_mm"] == 12.5
     assert client.get("/api/config").json()["mount"]["h_mm"] == 12.5
-    assert client.get("/").json()["name"] == "major-project"
+    assert client.get("/").json()["name"] == "onboard-slam"
 
 
 def test_rig_errors_are_400(client):

@@ -192,7 +192,7 @@ def create_app(
             rig.audio.speech.close()
             await asyncio.to_thread(rig.shutdown)
 
-    app = FastAPI(title="major-project", lifespan=lifespan)
+    app = FastAPI(title="onboard-slam", lifespan=lifespan)
     app.state.rig = rig
     app.state.broadcaster = bc
 
@@ -611,7 +611,7 @@ def create_app(
 
         @app.get("/")
         def index():
-            return {"name": "major-project", "docs": "/docs", "note": "build web/ for the dashboard"}
+            return {"name": "onboard-slam", "docs": "/docs", "note": "build web/ for the dashboard"}
 
     return app
 

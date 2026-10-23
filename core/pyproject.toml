@@ -1,7 +1,7 @@
 [project]
-name = "major-project"
+name = "onboard-slam"
 version = "0.1.0"
-description = "OBSLAM LiDAR payload bench server: S2 driver bridge, step-and-scan, 2.5D grid, dashboard API"
+description = "On-board SLAM bench server: S2 driver bridge, step-and-scan, 2.5D grid, dashboard API"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
