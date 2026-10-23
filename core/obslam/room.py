@@ -7,7 +7,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from typing import Callable
+
+import numpy as np
 
 from . import wire
 from .slam2d import RoomMapper, scan_to_points
@@ -17,6 +20,12 @@ log = logging.getLogger(__name__)
 
 STATE_PERIOD_S = 0.2
 GRID_PERIOD_S = 0.5
+STATION_ROTATIONS = 5  # a still station is the median of this many rotations (0.5 s at 10 Hz)
+STATION_WAIT_S = 3.0
+
+
+class RoomError(Exception):
+    pass
 
 
 class RoomSession:
@@ -34,20 +43,30 @@ class RoomSession:
         self._thread: threading.Thread | None = None
         self._was_lost = False
         self._t_state = self._t_grid = 0.0
+        self.held = False  # a tilt sweep is running: its tilted rotations must not reach the matcher
+        self.mode = "walk"  # walk: every rotation is tracked; stations: only still captures update the map
+        self.planned = 6
+        self._recent: deque[tuple[ScanFrame, float]] = deque(maxlen=12)
+        self._station_lock = threading.Lock()
 
     # ---- control ---------------------------------------------------------------------------------
-    def start(self, cell_m: float = 0.05) -> dict:
+    def start(self, cell_m: float = 0.05, mode: str = "walk", planned: int = 6) -> dict:
         self.stop()
         with self._lock:
             self.mapper = RoomMapper(cell=cell_m)
             self.state = "mapping"
+            self.mode = mode
+            self.planned = planned
             self.note = None
             self._slot = None
+            self._recent.clear()
             self._was_lost = False
             self._stop.clear()
-            self._thread = threading.Thread(target=self._run, name="room-map", daemon=True)
-            self._thread.start()
-        self._log("info", f"room mapping started ({cell_m * 100:.0f} cm cells)")
+            if mode == "walk":
+                self._thread = threading.Thread(target=self._run, name="room-map", daemon=True)
+                self._thread.start()
+        how = "walk mode" if mode == "walk" else f"station mode, {planned} stations planned"
+        self._log("info", f"room mapping started ({how}, {cell_m * 100:.0f} cm cells)")
         self._emit(force=True)
         return self.snapshot()
 
@@ -69,11 +88,60 @@ class RoomSession:
 
     # ---- lidar thread ----------------------------------------------------------------------------
     def feed(self, f: ScanFrame, phi_deg: float) -> None:
-        if self.state != "mapping":
+        if self.state != "mapping" or self.held:
+            return
+        if self.mode == "stations":
+            self._recent.append((f, phi_deg))
             return
         with self._cv:
             self._slot = (f, phi_deg)
             self._cv.notify()
+
+    def add_station(self) -> dict:
+        """Station mode: median of the next few rotations, located on the map and added to it."""
+        if self.state != "mapping" or self.mode != "stations" or self.mapper is None:
+            raise RoomError("start mapping in station mode first")
+        if not self._station_lock.acquire(blocking=False):
+            raise RoomError("a station is already being added")
+        try:
+            t0 = time.time()
+            deadline = time.monotonic() + STATION_WAIT_S
+            while time.monotonic() < deadline:
+                fresh = [(f, phi) for f, phi in list(self._recent) if f.t >= t0]
+                if len(fresh) >= STATION_ROTATIONS:
+                    break
+                time.sleep(0.05)
+            else:
+                raise RoomError("no LiDAR rotations arriving: is the LiDAR connected and spinning?")
+            if any(abs(phi) > 2 for _, phi in fresh):
+                raise RoomError("the LiDAR is tilted: stations need it level (φ 0°)")
+            fs = [f for f, _ in fresh[:STATION_ROTATIONS]]
+            pts = scan_to_points(np.concatenate([f.angle for f in fs]), np.concatenate([f.range for f in fs]), np.concatenate([f.quality for f in fs]))
+            t1 = time.perf_counter()
+            res = self.mapper.add_station(pts)
+            res["search_ms"] = round((time.perf_counter() - t1) * 1000)
+        finally:
+            self._station_lock.release()
+        if res["ok"]:
+            self._log("info", f"station {res['n']} of {self.planned} added at x {res['x']:.2f} m, y {res['y']:.2f} m ({res['inliers'] * 100:.0f}% matched)")
+        else:
+            self._log("warn", f"station not added: {res['reason']}")
+        self._emit(force=True)
+        return res
+
+    def station_pose(self) -> tuple[float, float, float] | None:
+        """Where the scanner stands in the room map, if mapping and on track: a sweep taken now is
+        placed there, so sweeps from several stations join into one cloud."""
+        m = self.mapper
+        if self.state != "mapping" or m is None or m.lost or m.key_pose is None:
+            return None
+        return m.pose
+
+    def hold(self, on: bool) -> None:
+        self.held = on
+        if not on:
+            with self._lock:
+                self._slot = None
 
     # ---- worker ----------------------------------------------------------------------------------
     def _run(self) -> None:
@@ -120,8 +188,8 @@ class RoomSession:
     def snapshot(self) -> dict:
         m = self.mapper
         if m is None:
-            return {"state": self.state, "pose": None, "path": [], "keyframes": 0, "scans": 0, "area_m2": 0.0, "match": None, "lost": False, "note": None}
-        return {"state": self.state, **m.state(), "note": self.note}
+            return {"state": self.state, "mode": self.mode, "planned": self.planned, "pose": None, "path": [], "keyframes": 0, "scans": 0, "area_m2": 0.0, "match": None, "lost": False, "note": None, "stations": [], "next": None}
+        return {"state": self.state, "mode": self.mode, "planned": self.planned, **m.state(), "note": self.note}
 
     def info(self) -> dict:
         out = self.snapshot()

@@ -24,6 +24,7 @@ from .audio_wire import KIND_AUDIO_PREVIEW
 from .config import Config, load_config, save_config
 from .grid import LAYERS
 from .rig import JobParams, Rig, RigError
+from .room import RoomError
 from .session import SessionStore, valid_id
 
 log = logging.getLogger(__name__)
@@ -130,6 +131,8 @@ class AudioCalibrate(BaseModel):
 
 class RoomStart(BaseModel):
     cell_m: float = Field(0.05, ge=0.02, le=0.2)
+    mode: Literal["walk", "stations"] = "walk"
+    planned: int = Field(6, ge=1, le=50)
 
 
 class SpeechToggle(BaseModel):
@@ -305,7 +308,15 @@ def create_app(
     async def room_start(body: RoomStart | None = None):
         if not rig.status()["lidar"]["connected"]:
             raise RigError("connect the LiDAR first")
-        return await asyncio.to_thread(rig.room.start, (body or RoomStart()).cell_m)
+        b = body or RoomStart()
+        return await asyncio.to_thread(rig.room.start, b.cell_m, b.mode, b.planned)
+
+    @app.post(f"{api}/room/station")
+    async def room_station():
+        try:
+            return await asyncio.to_thread(rig.room.add_station)
+        except RoomError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
 
     @app.post(f"{api}/room/stop")
     async def room_stop():
