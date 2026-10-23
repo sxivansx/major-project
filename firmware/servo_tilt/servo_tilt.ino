@@ -267,9 +267,17 @@ static bool          tilt_client_on  = false;
 static LineBuf       tilt_line       = {};
 
 // LiDAR -> TCP bytes already taken off UART1 but not yet accepted by the socket.
-static uint8_t tcp_pend[LIDAR_CHUNK];
-static size_t  tcp_pend_off = 0;
-static size_t  tcp_pend_len = 0;
+// LiDAR -> TCP goes through a large ring so Wi-Fi stalls delay the stream instead
+// of losing it: ~100 KB/s of scan data, 1 MB in PSRAM = ~10 s of stall cover
+// (the N16R8 has 8 MB). Falls back to 32 KB of internal RAM without PSRAM.
+#define TCP_RING_PSRAM  (1024 * 1024)
+#define TCP_RING_SRAM   (32 * 1024)
+#define TCP_SEND_MAX    8192            // bytes per send() call
+static uint8_t* tcp_ring = nullptr;
+static size_t   tcp_ring_cap = 0;
+static size_t   tcp_head = 0;           // next write
+static size_t   tcp_tail = 0;           // next send
+static size_t   tcp_pend_len = 0;       // bytes waiting in the ring
 #endif
 
 // ----------------------------------------------------------------- helpers --
@@ -462,37 +470,60 @@ static void lidarInit() {
 }
 
 #ifdef NET_ENABLED
+static void tcpRingInit() {
+  if (tcp_ring) return;
+  if (psramFound()) {
+    tcp_ring = (uint8_t*)ps_malloc(TCP_RING_PSRAM);
+    if (tcp_ring) tcp_ring_cap = TCP_RING_PSRAM;
+  }
+  if (!tcp_ring) {
+    tcp_ring = (uint8_t*)malloc(TCP_RING_SRAM);
+    tcp_ring_cap = tcp_ring ? TCP_RING_SRAM : 0;
+  }
+}
+
 static void lidarClientDrop() {
   lidar_client.stop();
   lidar_client_on = false;
   lidar_drop  += (uint32_t)tcp_pend_len;  // taken off the UART, never delivered
   tcp_pend_len = 0;
-  tcp_pend_off = 0;
+  tcp_head = tcp_tail = 0;
 }
 
 // LiDAR -> TCP client. Only new UART bytes are read once the previous chunk
 // is fully in the socket; send() is MSG_DONTWAIT, so a slow Wi-Fi link never
 // blocks the loop, it just leaves bytes in the UART ring.
 static int lidarToTcp(int avail) {
-  if (tcp_pend_len == 0 && avail > 0) {
-    int n = avail < LIDAR_CHUNK ? avail : LIDAR_CHUNK;
-    n = (int)Serial1.read(tcp_pend, (size_t)n);
-    tcp_pend_off = 0;
-    tcp_pend_len = (size_t)n;
+  if (!tcp_ring_cap) return avail;
+  // 1) UART -> ring: take everything that fits, in contiguous pieces.
+  while (avail > 0 && tcp_pend_len < tcp_ring_cap) {
+    size_t room = tcp_ring_cap - tcp_pend_len;
+    size_t run  = tcp_ring_cap - tcp_head;          // contiguous space up to the wrap
+    size_t n    = (size_t)avail;
+    if (n > room) n = room;
+    if (n > run)  n = run;
+    n = Serial1.read(tcp_ring + tcp_head, n);
+    if (n == 0) break;
+    tcp_head = (tcp_head + n) % tcp_ring_cap;
+    tcp_pend_len += n;
     lidar_rx += (uint32_t)n;
-    avail -= n;
+    avail -= (int)n;
   }
+  // 2) ring -> socket: one non-blocking send of the contiguous run at the tail.
   if (tcp_pend_len > 0) {
-    int s = send(lidar_client.fd(), tcp_pend + tcp_pend_off, tcp_pend_len, MSG_DONTWAIT);
+    size_t run = tcp_ring_cap - tcp_tail;
+    size_t n   = tcp_pend_len < run ? tcp_pend_len : run;
+    if (n > TCP_SEND_MAX) n = TCP_SEND_MAX;
+    int s = send(lidar_client.fd(), tcp_ring + tcp_tail, n, MSG_DONTWAIT);
     if (s > 0) {
-      tcp_pend_off += (size_t)s;
+      tcp_tail = (tcp_tail + (size_t)s) % tcp_ring_cap;
       tcp_pend_len -= (size_t)s;
       tcp_tx       += (uint32_t)s;
     } else if (s < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
       lidarClientDrop();  // peer gone; the USB pass-through takes over again
     }
   }
-  return avail;
+  return avail;  // > 0 only when the ring is full: the high-water discard below counts it
 }
 #endif
 
@@ -773,18 +804,22 @@ static void replyStatus() {
   fmtDeg(lo, sizeof(lo), cal.lim_min);
   fmtDeg(hi, sizeof(hi), cal.lim_max);
   char ip[16];
+  unsigned long buf_used = 0, buf_cap = 0;
 #ifdef NET_ENABLED
   fmtIp(ip, sizeof(ip));
+  buf_used = (unsigned long)tcp_pend_len;
+  buf_cap  = (unsigned long)tcp_ring_cap;
 #else
   snprintf(ip, sizeof(ip), "none");
 #endif
   out->printf("STATUS angle=%s meas=%s min=%s max=%s range=%d us_min=%d us_max=%d enc=%s settled=%d"
-                " lidar_rx=%lu lidar_tx=%lu lidar_drop=%lu lidar_ovf=%lu ip=%s tcp_rx=%lu tcp_tx=%lu\n",
+                " lidar_rx=%lu lidar_tx=%lu lidar_drop=%lu lidar_ovf=%lu ip=%s tcp_rx=%lu tcp_tx=%lu buf=%lu/%lu\n",
                 a, m, lo, hi, cal.range, cal.us_min, cal.us_max,
                 ENC_STATUS_STR[enc.status], (enc.present && settled) ? 1 : 0,
                 (unsigned long)lidar_rx, (unsigned long)lidar_tx,
                 (unsigned long)lidar_drop, (unsigned long)lidar_ovf,
-                ip, (unsigned long)tcp_rx, (unsigned long)tcp_tx);
+                ip, (unsigned long)tcp_rx, (unsigned long)tcp_tx,
+                buf_used, buf_cap);
 }
 
 // Magnet-spacing diagnostics. raw and deg are the chip's unzeroed reading;
@@ -1122,6 +1157,9 @@ void setup() {
   encInit();
 #ifdef LIDAR_PASSTHROUGH
   lidarInit();
+#ifdef NET_ENABLED
+  tcpRingInit();
+#endif
 #endif
 #ifdef NET_ENABLED
   loadNet();
