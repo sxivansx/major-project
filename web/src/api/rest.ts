@@ -11,6 +11,10 @@ import type {
   AudioEvent,
   AudioSource,
   Config,
+  RoomFrame,
+  RoomState,
+  SpeechEvent,
+  SpeechStatus,
   Findings,
   GridFrame,
   GridLayer,
@@ -24,7 +28,7 @@ import type {
   SessionMeta,
   Status,
 } from "./types";
-import { parseGrid, parseOpsLayers, parseSessionPoints } from "./frames";
+import { parseGrid, parseOpsLayers, parseRoom, parseSessionPoints } from "./frames";
 
 export class ApiError extends Error {
   constructor(
@@ -153,6 +157,17 @@ export const api = {
   audioEmit: (body: { bearing_deg: number; elevation_deg?: number; snr_db?: number; kind?: "knock" | "voice" }) =>
     request<unknown>("POST", "/audio/sim/emit", body),
   audioSources: () => request<{ active: AudioSource[]; history: AudioSource[] }>("GET", "/audio/sources"),
+  // spoken calls for help (§5.7)
+  speech: (limit = 50) => request<{ status: SpeechStatus | null; events: SpeechEvent[] }>("GET", `/audio/speech?limit=${limit}`),
+  speechEnable: (enabled: boolean) => request<SpeechStatus>("POST", "/audio/speech", { enabled }),
+  speechClear: () => request<void>("POST", "/audio/speech/clear"),
+
+  // room map (handheld 2D mapping)
+  roomStart: (cell_m?: number) => request<unknown>("POST", "/room/start", cell_m !== undefined ? { cell_m } : {}),
+  roomStop: () => request<unknown>("POST", "/room/stop"),
+  room: () => request<RoomState>("GET", "/room"),
+  roomGrid: async (): Promise<RoomFrame> => parseRoom(await requestBinary("/room/grid")),
+
   audioCalibrate: (body: { clicks: AudioCalibrateClick[]; apply?: boolean; refine_positions?: boolean }) =>
     request<AudioCalibrateResult>("POST", "/audio/calibrate", body),
 };

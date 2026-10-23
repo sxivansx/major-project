@@ -9,7 +9,7 @@
 import { useEffect, useState } from "react";
 import { create } from "zustand";
 import { api, errorText } from "../api/rest";
-import type { AudioEvent, AudioFrame, AudioSource, Status } from "../api/types";
+import type { AudioEvent, AudioFrame, AudioSource, SpeechEvent, Status } from "../api/types";
 import { clientLog, useStore } from "./store";
 
 export const RING_MS = 6000;
@@ -44,6 +44,8 @@ export interface AudioState {
   sources: AudioSource[]; // active sources (§5.6)
   sourcesSupported: boolean | null; // null until GET /audio/sources answered
   highlightSourceId: number | null; // "Show on map" from the Sound tab
+  speech: SpeechEvent[]; // newest first (§5.7)
+  speechError: string | null;
   selectedId: number | null;
   eventsError: string | null;
   levels: number[] | null; // dBFS per channel from the latest frame (throttled)
@@ -56,6 +58,8 @@ export const useAudio = create<AudioState>((set) => ({
   sources: [],
   sourcesSupported: null,
   highlightSourceId: null,
+  speech: [],
+  speechError: null,
   selectedId: null,
   eventsError: null,
   levels: null,
@@ -283,4 +287,49 @@ export function excludedList(st: Status | null | undefined): { mic: number; reas
   return raw
     .map((x) => (typeof x === "number" ? { mic: x, reason: "" } : { mic: x.mic ?? x.channel ?? 0, reason: x.reason ?? "" }))
     .filter((x) => x.mic > 0);
+}
+
+// ---- spoken calls for help (§5.7) ----
+
+export function speechAdd(ev: SpeechEvent): void {
+  useAudio.setState((s) => ({ speech: [ev, ...s.speech.filter((e) => e.id !== ev.id)].slice(0, 100) }));
+}
+
+export async function loadSpeech(): Promise<void> {
+  try {
+    const r = await api.speech(50);
+    useAudio.setState({ speech: [...(r.events ?? [])].sort((a, b) => b.t - a.t), speechError: null });
+  } catch (e) {
+    useAudio.setState({ speechError: errorText(e) });
+  }
+}
+
+export async function clearSpeech(): Promise<void> {
+  await api.speechClear();
+  useAudio.setState({ speech: [] });
+}
+
+export async function setSpeechEnabled(enabled: boolean): Promise<void> {
+  const st = await api.speechEnable(enabled);
+  // reflect it now; the next status message carries it too
+  const s = useStore.getState().status;
+  if (s?.audio) useStore.getState().setStatus({ ...s, audio: { ...s.audio, speech: st } });
+}
+
+// "call for help" in plain words: the exact words, or what it sounded like.
+export function speechWhy(ev: SpeechEvent): string {
+  if (ev.matched.length) return `said ${ev.matched.map((w) => `"${w}"`).join(", ")}`;
+  if (ev.sounds_like.length) return ev.sounds_like.map((x) => `sounds like "${x.word}" (heard "${x.heard}")`).join(", ");
+  if (ev.distress_p !== null && ev.distress_p !== undefined) return `sounds distressed (p ${ev.distress_p.toFixed(2)})`;
+  return "flagged";
+}
+
+export function speechBearingText(ev: SpeechEvent): string {
+  if (ev.bearing_deg === null || ev.bearing_deg === undefined) return "direction unknown";
+  return `${Math.round(ev.bearing_deg)}°${ev.bearing_sigma_deg != null ? ` ± ${Math.round(ev.bearing_sigma_deg)}°` : ""}`;
+}
+
+// The speech_help alarm reaches the status as its text ("call for help: …").
+export function speechAlarm(st: Status | null | undefined): string | null {
+  return (st?.alarms ?? []).find((a) => a.toLowerCase().startsWith("call for help")) ?? null;
 }

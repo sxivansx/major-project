@@ -2,7 +2,7 @@
 // Everything is little-endian (docs/api.md). Shared by the app, the mock
 // server and the headless check script, so keep this file dependency-free.
 
-import type { AudioFrame, BinaryFrame, GridFrame, GridLayer, OpsLayersFrame, PointsFrame, ScanFrame } from "./types";
+import type { AudioFrame, BinaryFrame, RoomFrame, GridFrame, GridLayer, OpsLayersFrame, PointsFrame, ScanFrame } from "./types";
 
 const LAYER_BY_CODE: GridLayer[] = ["max", "min", "mean", "count"];
 export const LAYER_CODE: Record<GridLayer, number> = { max: 0, min: 1, mean: 2, count: 3 };
@@ -164,6 +164,41 @@ export function encodeAudio(f: Omit<AudioFrame, "kind">): ArrayBuffer {
   return buf;
 }
 
+// Kind 6, room map: struct <BBHIIfff (kind=6, pad u8, pad u16, w, h, cell, x0, y0)
+// = 24 bytes, then w*h u8 cells, row-major, row index = y.
+export const ROOM_HEADER = 24;
+
+export function parseRoom(buf: ArrayBuffer): RoomFrame {
+  need(buf, ROOM_HEADER, "room header");
+  const dv = new DataView(buf);
+  const kind = dv.getUint8(0);
+  if (kind !== 6) throw new FrameError(`room: kind ${kind}, expected 6`);
+  const w = dv.getUint32(4, true);
+  const h = dv.getUint32(8, true);
+  const cell_m = dv.getFloat32(12, true);
+  const x0_m = dv.getFloat32(16, true);
+  const y0_m = dv.getFloat32(20, true);
+  need(buf, ROOM_HEADER + w * h, "room body");
+  const cells = new Uint8Array(buf, ROOM_HEADER, w * h);
+  return { kind: 6, w, h, cell_m, x0_m, y0_m, cells };
+}
+
+export function encodeRoom(f: Omit<RoomFrame, "kind">): ArrayBuffer {
+  const n = f.w * f.h;
+  const buf = new ArrayBuffer(ROOM_HEADER + n);
+  const dv = new DataView(buf);
+  dv.setUint8(0, 6);
+  dv.setUint8(1, 0);
+  dv.setUint16(2, 0, true);
+  dv.setUint32(4, f.w, true);
+  dv.setUint32(8, f.h, true);
+  dv.setFloat32(12, f.cell_m, true);
+  dv.setFloat32(16, f.x0_m, true);
+  dv.setFloat32(20, f.y0_m, true);
+  new Uint8Array(buf, ROOM_HEADER, n).set(f.cells.subarray(0, n));
+  return buf;
+}
+
 export function parseFrame(buf: ArrayBuffer): BinaryFrame {
   if (buf.byteLength < 1) throw new FrameError("empty binary frame");
   const kind = new Uint8Array(buf, 0, 1)[0];
@@ -178,6 +213,8 @@ export function parseFrame(buf: ArrayBuffer): BinaryFrame {
       return parseOpsLayers(buf);
     case 5:
       return parseAudio(buf);
+    case 6:
+      return parseRoom(buf);
     default:
       throw new FrameError(`unknown frame kind ${kind}`);
   }

@@ -172,7 +172,7 @@ export interface GridFrame {
   data: Float32Array; // h * w, row-major, row = y, NaN = empty
 }
 
-export type BinaryFrame = ScanFrame | PointsFrame | GridFrame | OpsLayersFrame | AudioFrame;
+export type BinaryFrame = ScanFrame | PointsFrame | GridFrame | OpsLayersFrame | AudioFrame | RoomFrame;
 
 // ---- operator layer: /api/ops/* and /api/ai/* (docs/api.md, section 3) ----
 
@@ -342,6 +342,7 @@ export interface AudioStatus {
   note?: string | null;
   array_yaw_deg?: number | null;
   sources_active?: number | null; // §5.6
+  speech?: SpeechStatus | null; // §5.7, null when there is no audio
   // mics dropped from direction finding (noise floor > 12 dB above the others), §5.6;
   // the shape is not pinned down, so numbers and {mic, reason} objects are both read
   excluded_mics?: (number | { mic?: number; channel?: number; reason?: string })[] | null;
@@ -434,4 +435,73 @@ export interface AudioFrame {
   levels_dbfs: Float32Array; // channels
   mins: Int16Array[]; // channels × n
   maxs: Int16Array[];
+}
+
+// ---- spoken calls for help (docs/api.md §5.7) ----
+
+export interface SpeechStatus {
+  enabled: boolean;
+  key: boolean; // SARVAM_API_KEY present
+  model?: string | null;
+  judge?: string | null;
+  segments?: number;
+  transcribed?: number;
+  dropped?: number;
+  rate_limited?: number;
+  errors?: number;
+  queued?: number;
+  last_error?: string | null;
+}
+
+export interface SpeechEvent {
+  id: number;
+  t: number; // unix seconds, core clock
+  duration_s: number;
+  transcript: string;
+  language: string | null;
+  matched: string[]; // help words heard exactly
+  sounds_like: { word: string; heard: string }[];
+  distress_p: number | null; // Jev
+  flagged: boolean;
+  bearing_deg: number | null;
+  bearing_sigma_deg: number | null;
+  confidence: number;
+  calibrated: boolean;
+  reasons: string[];
+  stt_ms?: number | null;
+  jev_ms?: number | null;
+  jev_error?: string | null;
+  cost_usd?: number | null;
+}
+
+// ---- room map: handheld 2D mapping ----
+
+// Kind 6: occupancy grid, 0 unknown, 1 free, 2 occupied; row index = y (row 0 at y0).
+export interface RoomFrame {
+  kind: 6;
+  w: number;
+  h: number;
+  cell_m: number;
+  x0_m: number;
+  y0_m: number;
+  cells: Uint8Array; // h * w
+}
+
+export interface RoomState {
+  state: "idle" | "mapping";
+  pose: { x: number; y: number; theta_deg: number } | null; // map frame, theta CCW from map +x
+  path: [number, number][]; // ≤ 500 points
+  keyframes: number;
+  scans: number;
+  area_m2: number; // free cells
+  match: { rms_mm: number | null; inliers: number | null; ok: boolean } | null;
+  lost: boolean;
+  note: string | null;
+  // where to carry the scanner next: a clear spot near the widest, nearest open edge (§3.5)
+  next?: {
+    station: { x: number; y: number; distance_m: number; bearing_deg: number; edge: { x: number; y: number; width_m: number } } | null;
+    open_edges: number;
+    complete: boolean;
+  } | null;
+  grid?: { w: number; h: number; cell: number; x0: number; y0: number } | null; // GET /api/room only
 }

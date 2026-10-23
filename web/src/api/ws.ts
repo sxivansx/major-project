@@ -7,8 +7,9 @@ import { FrameError, parseFrame } from "./frames";
 import type { Job, ScanFrame, Status, WsTextMessage } from "./types";
 import { cloud, cloudAppend } from "../store/cloud";
 import { clientLog, useStore } from "../store/store";
-import { audioAddEvent, audioPushFrame, audioSetSources } from "../store/audio";
-import type { AudioEvent, AudioSource } from "./types";
+import { audioAddEvent, audioPushFrame, audioSetSources, speechAdd } from "../store/audio";
+import { roomSetGrid, roomSetState } from "../store/room";
+import type { AudioEvent, AudioSource, RoomState, SpeechEvent } from "./types";
 
 const SCAN_MIN_MS = 100;
 const CLOUD_MIN_MS = 200;
@@ -161,6 +162,16 @@ class WsClient {
         audioSetSources(Array.isArray(m.active) ? m.active : []);
         break;
       }
+      case "speech_event": {
+        const { type: _t, ...ev } = msg as unknown as { type: "speech_event" } & SpeechEvent;
+        speechAdd(ev as SpeechEvent);
+        break;
+      }
+      case "room": {
+        const { type: _t, ...r } = msg as unknown as { type: "room" } & RoomState;
+        roomSetState(r as RoomState);
+        break;
+      }
       case "pong":
         break;
       default:
@@ -190,6 +201,9 @@ class WsClient {
         break;
       case 5:
         audioPushFrame(frame);
+        break;
+      case 6:
+        roomSetGrid(frame);
         break;
     }
   }
