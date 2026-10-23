@@ -6,11 +6,13 @@
 //
 // Against the real core this will move the servo and run a short sweep.
 
-import { encodeAudio, encodeOpsLayers, parseAudio, parseFrame, parseGrid, parseOpsLayers, parseSessionPoints } from "../src/api/frames";
-import type { AiAsk, AiSitrep, AiStatus, AiTriage, AudioCalibrateResult, AudioEvent, AudioSource, BinaryFrame, Config, Findings, Job, Metrics, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
+import { encodeAudio, encodeOpsLayers, encodeRoom, parseAudio, parseRoom, parseFrame, parseGrid, parseOpsLayers, parseSessionPoints } from "../src/api/frames";
+import type { AiAsk, AiSitrep, AiStatus, AiTriage, AudioCalibrateResult, AudioEvent, AudioSource, BinaryFrame, RoomState, SpeechEvent, SpeechStatus, Config, Findings, Job, Metrics, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
 import { FINDING_KINDS } from "../src/api/types";
 
 const BASE = process.env.CHECK_URL ?? "http://127.0.0.1:8000";
+// the mock answers "/" with a plain-text banner; checks that need scripted input are strict only there
+const IS_MOCK = await fetch(BASE + "/").then((r) => r.text()).then((t) => t.includes("mock core")).catch(() => false);
 const WS_URL = BASE.replace(/^http/, "ws") + "/ws";
 
 let failures = 0;
@@ -509,6 +511,55 @@ if (!stA.audio) {
     await req<Config>("PUT", "/config", cfgA);
   }
 
+  // spoken calls for help (§5.7)
+  const stSp = await req<Status>("GET", "/status");
+  if (!stSp.audio?.speech) console.log("  (speech skipped: status.audio.speech is missing)");
+  else {
+    const sp0 = await req<{ status: SpeechStatus; events: SpeechEvent[] }>("GET", "/audio/speech?limit=5");
+    ok(!!sp0.status && typeof sp0.status.enabled === "boolean" && typeof sp0.status.key === "boolean" && Array.isArray(sp0.events), `GET /audio/speech -> enabled ${sp0.status?.enabled}, key ${sp0.status?.key}, ${sp0.events?.length} events`);
+    const badSp = await fetch(BASE + "/api/audio/speech", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: "yes" }) });
+    ok(badSp.status === 400 || badSp.status === 422, `POST /audio/speech with a bad body -> ${badSp.status}`);
+    const off = await req<SpeechStatus>("POST", "/audio/speech", { enabled: false });
+    ok(off.enabled === false, "speech can be switched off");
+    if (sp0.status.key) {
+      col.text.length = 0;
+      const on = await req<SpeechStatus>("POST", "/audio/speech", { enabled: true });
+      ok(on.enabled === true, "speech switched on");
+      const got = await waitFor(() => col.text.some((m) => m.type === "speech_event"), 6000, "speech_event");
+      if (!got && !IS_MOCK) console.log("  (no speech within 6 s on a real core: event checks skipped)");
+      else {
+        ok(got, "speech_event arrives on the WebSocket");
+        const se = col.text.find((m) => m.type === "speech_event") as unknown as SpeechEvent;
+        ok(
+          typeof se.id === "number" && typeof se.t === "number" && typeof se.transcript === "string" && Array.isArray(se.matched) && Array.isArray(se.sounds_like) && typeof se.flagged === "boolean",
+          `speech #${se.id} "${se.transcript}" (${se.language}) flagged ${se.flagged}`,
+        );
+        ok((se.bearing_deg === null || (se.bearing_deg >= 0 && se.bearing_deg < 360)) && se.confidence >= 0 && se.confidence <= 1 && typeof se.calibrated === "boolean", `bearing ${se.bearing_deg}° ± ${se.bearing_sigma_deg}°, confidence ${se.confidence}`);
+        ok(se.distress_p === null || (se.distress_p >= 0 && se.distress_p <= 1), `Jev distress p ${se.distress_p}`);
+        ok(se.sounds_like.every((x) => typeof x.word === "string" && typeof x.heard === "string"), "sounds_like entries have word and heard");
+        if (se.flagged) {
+          await sleep(300);
+          const stF = await req<Status>("GET", "/status");
+          ok((stF.alarms ?? []).some((a) => a.toLowerCase().startsWith("call for help")), `alarm while flagged: ${(stF.alarms ?? []).find((a) => a.toLowerCase().startsWith("call for help"))}`);
+        }
+        const sp1 = await req<{ status: SpeechStatus; events: SpeechEvent[] }>("GET", "/audio/speech?limit=10");
+        ok(sp1.events.length >= 1 && sp1.events[0].id === se.id && sp1.events.every((e, i) => i === 0 || e.t <= sp1.events[i - 1].t), "GET /audio/speech lists it, newest first");
+        ok((sp1.status.segments ?? 0) >= 1, `speech counters: ${sp1.status.segments} segments, ${sp1.status.transcribed} transcribed`);
+        // any call for help younger than 25 s keeps the speech_help alarm up (30 s)
+        const nowS = Date.now() / 1000;
+        const freshHelp = sp1.events.find((e) => e.flagged && nowS - e.t < 25);
+        if (freshHelp) {
+          const stH = await req<Status>("GET", "/status");
+          ok((stH.alarms ?? []).some((a) => a.toLowerCase().startsWith("call for help")), `speech_help alarm up after "${freshHelp.transcript}"`);
+        }
+      }
+    }
+    const spc = await fetch(BASE + "/api/audio/speech/clear", { method: "POST" });
+    ok(spc.status === 204 || spc.status === 200, `POST /audio/speech/clear -> ${spc.status}`);
+    const sp2 = await req<{ status: SpeechStatus; events: SpeechEvent[] }>("GET", "/audio/speech");
+    ok(sp2.events.length === 0, "speech events cleared");
+  }
+
   const clr = await fetch(BASE + "/api/audio/clear", { method: "POST" });
   ok(clr.status === 204 || clr.status === 200, `POST /audio/clear -> ${clr.status}`);
   const evs2 = await req<AudioEvent[]>("GET", "/audio/events");
@@ -517,6 +568,54 @@ if (!stA.audio) {
   ok(sd.audio?.connected === false, "audio disconnect");
   const emOff = await fetch(BASE + "/api/audio/sim/emit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bearing_deg: 10 }) });
   ok(emOff.status === 409 || emOff.status === 400, `sim/emit while disconnected -> ${emOff.status}`);
+}
+
+// ---- 6d. room map (handheld 2D mapping) ----
+console.log("\nRoom map");
+{
+  // kind-6 codec round trip, odd sizes
+  const cells = new Uint8Array([0, 1, 2, 1, 0, 2, 2, 1, 0, 0, 1, 2, 1, 1, 0]);
+  const buf = encodeRoom({ w: 5, h: 3, cell_m: 0.05, x0_m: -1.25, y0_m: 0.5, cells });
+  ok(buf.byteLength === 24 + 15, `kind-6 frame is ${buf.byteLength} bytes (24 + 5·3)`);
+  const f = parseRoom(buf);
+  ok(f.kind === 6 && f.w === 5 && f.h === 3 && Math.abs(f.cell_m - 0.05) < 1e-6 && Math.abs(f.x0_m + 1.25) < 1e-6 && Math.abs(f.y0_m - 0.5) < 1e-6, "kind-6 header round trip");
+  ok(Array.from(f.cells).join() === Array.from(cells).join() && parseFrame(buf).kind === 6, "kind-6 cells round trip, parseFrame dispatches kind 6");
+}
+const roomProbe = await fetch(BASE + "/api/room");
+if (roomProbe.status === 404) console.log("  (skipped: this core has no /api/room)");
+else {
+  const r0 = (await roomProbe.json()) as RoomState;
+  ok(r0.state === "idle" || r0.state === "mapping", `GET /room -> state ${r0.state}`);
+  col.frames.length = 0;
+  col.text.length = 0;
+  await req<unknown>("POST", "/room/start", { cell_m: 0.05 });
+  await waitFor(() => col.frames.some((x) => x.kind === 6) && col.text.some((m) => m.type === "room"), 4000, "room frames");
+  await sleep(2000);
+  const rf = col.frames.filter((x) => x.kind === 6);
+  const rm = col.text.filter((m) => m.type === "room") as unknown as RoomState[];
+  ok(rf.length >= 1 && rf.length <= 7, `${rf.length} kind-6 frames in ~2 s (≤ 2 Hz)`);
+  ok(rm.length >= 5, `${rm.length} room messages (~5 Hz while mapping)`);
+  const last = rm[rm.length - 1];
+  ok(last && last.state === "mapping" && !!last.pose && typeof last.pose.theta_deg === "number", `mapping, pose (${last?.pose?.x}, ${last?.pose?.y}) heading ${last?.pose?.theta_deg}°`);
+  ok(Array.isArray(last?.path) && last.path.length <= 500 && last.path.every((p) => p.length === 2), `path ${last?.path?.length} points (≤ 500)`);
+  ok(typeof last?.keyframes === "number" && typeof last?.scans === "number" && typeof last?.area_m2 === "number" && typeof last?.lost === "boolean", `keyframes ${last?.keyframes}, scans ${last?.scans}, area ${last?.area_m2} m², lost ${last?.lost}`);
+  ok(!!last?.match && typeof last.match.ok === "boolean" && (last.match.inliers === null || (last.match.inliers >= 0 && last.match.inliers <= 1)), `match ${last?.match?.rms_mm} mm, inliers ${last?.match?.inliers}`);
+  const g = rf[rf.length - 1];
+  if (g && g.kind === 6) {
+    ok(g.cells.length === g.w * g.h && Array.from(g.cells).every((v) => v <= 3), `grid ${g.w}×${g.h} @ ${g.cell_m.toFixed(3)} m, values 0..3`);
+    ok(Math.abs(g.cell_m - 0.05) < 1e-6, "cell_m from the start request");
+    const free = Array.from(g.cells).filter((v) => v === 1).length;
+    ok(free > 0 && Array.from(g.cells).some((v) => v === 2), `${free} free cells and some occupied`);
+  }
+  const r1 = await req<RoomState>("GET", "/room");
+  ok(!!r1.grid && r1.grid.w > 0 && r1.grid.h > 0 && typeof r1.grid.cell === "number", `GET /room has grid ${r1.grid?.w}×${r1.grid?.h}`);
+  const gg = parseRoom(await reqBin("/room/grid"));
+  ok(gg.w === r1.grid?.w && gg.h === r1.grid?.h && Math.abs(gg.x0_m - (r1.grid?.x0 ?? NaN)) < 1e-4, "GET /room/grid matches the grid info");
+  await req<unknown>("POST", "/room/stop");
+  const r2 = await req<RoomState>("GET", "/room");
+  ok(r2.state === "idle", "stop -> idle");
+  const kept = parseRoom(await reqBin("/room/grid"));
+  ok(kept.w === gg.w && kept.h === gg.h, "the map is kept after stop");
 }
 
 // ---- 7. config ----

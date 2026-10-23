@@ -15,6 +15,8 @@ import type { Config, GridLayer, Job, JobRequest, SessionMeta, Status } from "..
 import { AI_MODELS, OPS_DEFAULTS, aiAsk, aiSitrep, aiTriage, analyze, fitPlaneNear, nearestPassable, planRoute, type OpsParams, type OpsResult } from "./ops";
 import { computeGrid, fakeScan, filterQuality, scanToPoints, type FakeScan, type Mount } from "./world";
 import { AUDIO_DEFAULT, AudioSim } from "./audio";
+import { SpeechSim } from "./speech";
+import { RoomSim } from "./room";
 
 const PORT = Number(process.env.PORT ?? 8000);
 // MOCK_AI=off mimics a core without an OpenRouter key: /ai/status unavailable,
@@ -48,7 +50,34 @@ const audio = new AudioSim(
   (ev) => broadcast(JSON.stringify({ type: "audio_event", ...ev })),
   (active) => broadcast(JSON.stringify({ type: "audio_sources", active })),
 );
-Object.defineProperty(status, "audio", { get: () => audio.status, enumerable: true });
+// spoken calls for help (§5.7): speech status rides on status.audio (null without audio)
+const speech = new SpeechSim(
+  () => {
+    const f = opsResult(OPS_DEFAULTS).findings;
+    return (f.voids[0] ?? f.shadows[0])?.bearing_deg ?? 144;
+  },
+  () => !!config.audio?.calibrated,
+  (ev) => broadcast(JSON.stringify({ type: "speech_event", ...ev })),
+  (level, msg) => sendLog(level, msg),
+);
+Object.defineProperty(status, "audio", {
+  get: () => (audio.status.connected ? { ...audio.status, speech: speech.status() } : { ...audio.status, speech: null }),
+  enumerable: true,
+});
+// alarms: the speech_help alarm text while a call for help is fresh
+Object.defineProperty(status, "alarms", {
+  get: () => {
+    const a = speech.alarm();
+    return a ? [a] : [];
+  },
+  enumerable: true,
+});
+
+// handheld room mapping
+const room = new RoomSim(
+  (r) => broadcast(JSON.stringify({ type: "room", ...r })),
+  (buf) => broadcast(buf),
+);
 
 // The ESP32-S3 Wi-Fi relay: tcp://host:8899 (lidar) and tcp://host:8900 (servo)
 const isTcpPort = (p: string | undefined) => /^tcp:\/\/[^/\s:]+:\d+$/i.test(p ?? "");
@@ -738,6 +767,7 @@ async function handleApi(req: Request, path: string): Promise<Response> {
     if (b.source === "tcp" && !/^tcp:\/\/[^/\s:]+:\d+$/i.test(b.port ?? "")) return err(422, "port must be tcp://host:8901");
     await sleep(200);
     audio.start(b.source, b.source === "sim" ? "sim" : b.port!);
+    speech.start();
     if (b.source === "tcp") config.audio!.port = b.port!;
     sendLog("info", `audio connected (${b.source}${b.source === "tcp" ? " " + b.port : ""})`);
     sendStatus();
@@ -745,6 +775,7 @@ async function handleApi(req: Request, path: string): Promise<Response> {
   }
   if (path === "/audio/disconnect" && m === "POST") {
     audio.stop();
+    speech.stop();
     sendLog("info", "audio disconnected");
     sendStatus();
     return json(status);
@@ -767,6 +798,38 @@ async function handleApi(req: Request, path: string): Promise<Response> {
     return json(audio.emit(((bearing % 360) + 360) % 360, Number(b.elevation_deg ?? 0) || 0, Number(b.snr_db ?? 20) || 20, kind));
   }
   if (path === "/audio/sources" && m === "GET") return json(audio.sources());
+
+  // ---- spoken calls for help (§5.7) ----
+  if (path === "/audio/speech" && m === "GET") {
+    const limit = Math.max(0, Math.min(100, Number(url.searchParams.get("limit") ?? 50) || 50));
+    return json({ status: audio.status.connected ? speech.status() : speech.status(), events: speech.events.slice(0, limit) });
+  }
+  if (path === "/audio/speech" && m === "POST") {
+    const b = await body<{ enabled?: unknown }>(req);
+    if (typeof b.enabled !== "boolean") return err(422, "enabled must be true or false");
+    speech.setEnabled(b.enabled);
+    sendStatus();
+    return json(speech.status());
+  }
+  if (path === "/audio/speech/clear" && m === "POST") {
+    speech.clear();
+    return new Response(null, { status: 204 });
+  }
+
+  // ---- room map (handheld 2D mapping) ----
+  if (path === "/room/start" && m === "POST") {
+    const b = await body<{ cell_m?: number }>(req);
+    if (b.cell_m !== undefined && !(Number(b.cell_m) > 0)) return err(422, "cell_m must be > 0");
+    room.start(b.cell_m !== undefined ? Number(b.cell_m) : undefined);
+    sendLog("info", "room mapping started");
+    return json(room.snapshot(true));
+  }
+  if (path === "/room/stop" && m === "POST") {
+    room.stop();
+    return json(room.snapshot(true));
+  }
+  if (path === "/room" && m === "GET") return json(room.snapshot(true));
+  if (path === "/room/grid" && m === "GET") return bin(room.gridFrame());
   if (path === "/audio/calibrate" && m === "POST") {
     const b = await body<{ clicks?: { bearing_deg: number; elevation_deg?: number; event_id?: number; tdoa_us?: Record<string, number> }[]; apply?: boolean }>(req);
     if (!Array.isArray(b.clicks)) return err(422, "clicks required");
