@@ -2,7 +2,11 @@
 
 One Arduino sketch, `servo_tilt/servo_tilt.ino`, for an ESP32 that drives the GS2010MG servo tilting the LiDAR cradle and reads the cradle angle back from an AS5600 magnetic encoder on the tilt axle. The Mac talks to it over USB serial (or TCP over Wi-Fi) with the line protocol in `docs/api.md` section 2 (that file is the contract; this README only covers wiring, building and a hand test).
 
+Pins on the ESP32-S3 follow the hardware team's `pin_connection.md` (ESP32-S3 WROOM-1 N16R8): servo GPIO 17, LiDAR UART RX 13 / TX 14, I2C 11/12, microphones on GPIO 4–7, GPIO 8/9 left unconnected.
+
 On the ESP32-S3 it also relays the RPLIDAR: the LiDAR's 1 Mbaud UART is wired to the S3, and its bytes are passed through unchanged, both ways, to the Mac, either over the board's second USB socket or over Wi-Fi (TCP 8899). Slamtec's SDK in `s2bridge` decodes them on the Mac exactly as if the LiDAR were plugged in directly.
+
+On the ESP32-S3 it also captures four INMP441 microphones simultaneously at 48 kHz and streams them on TCP 8901 (see "Microphones" below).
 
 The encoder is optional: the sketch probes for it at boot and a board without one behaves exactly like the earlier servo-only firmware (`enc=none`, no `meas` values).
 
@@ -10,18 +14,19 @@ Works on either board, pick one and use its FQBN below:
 
 | Board | FQBN |
 |---|---|
-| ESP32-S3 DevKitC-1 (the target board) | `esp32:esp32:esp32s3:CDCOnBoot=cdc` |
+| ESP32-S3 N16R8 (the target board) | `esp32:esp32:esp32s3:PSRAM=opi` |
 | ESP32 DevKit (plain ESP32, CP2102/CH340 USB-UART) | `esp32:esp32:esp32` |
 
 What each build has:
 
 | Feature | ESP32-S3 | plain ESP32 |
 |---|---|---|
-| Tilt protocol over USB | native **USB** socket (`/dev/cu.usbmodem*`) | the one USB socket |
-| LiDAR USB pass-through | **UART** socket (`/dev/cu.usbserial-*`), 1,000,000 baud | not built (one USB socket); boot prints a `NOTE` |
+| Tilt protocol over USB | **UART** socket (`/dev/cu.usbserial-*`, 115200) | the one USB socket |
+| LiDAR USB pass-through | native **USB** socket (`/dev/cu.usbmodem*`) | not built (one USB socket); boot prints a `NOTE` |
 | Wi-Fi, mDNS, TCP 8899 / 8900 | yes | not built; `N` answers `ERR no wifi`, `?` reports `ip=none` |
+| Microphones, TCP 8901 | yes | not built; `A` answers `ERR no audio`, `?` reports `audio=off` |
 
-`CDCOnBoot=cdc` matters on the S3: it puts `Serial` (the tilt protocol) on the native USB socket and frees UART0 (`Serial0`, the CP2102N "UART" socket) for the LiDAR bytes. Built without it, `Serial` and `Serial0` are the same object; the sketch then swaps the sockets (tilt on UART, LiDAR on native USB) so the two still never share a link, but the documented setup is `CDCOnBoot=cdc`.
+`PSRAM=opi` turns on the N16R8's 8 MB octal PSRAM, which holds the 1 MB LiDAR TCP ring and the 2 s microphone ring. The S3 build is made **without** `CDCOnBoot`, so `Serial` (the tilt protocol) is UART0 on the **UART** socket and the LiDAR bytes go out of the native **USB** socket. (With `CDCOnBoot=cdc` the sketch swaps the two; either way the two streams never share a link.)
 
 ## Wiring
 
@@ -33,14 +38,14 @@ A high-torque metal-gear servo draws a few amps when it stalls or starts a move.
 |---|---|
 | red (V+) | **separate 5–6 V supply**, rated 3 A or more (bench PSU, 2S LiPo through a UBEC, or a 6 V wall adapter) |
 | black/brown (GND) | that supply's GND **and** an ESP32 GND pin (the grounds must be shared or the signal has no reference) |
-| yellow/white (signal) | ESP32 **GPIO 13** |
+| yellow/white (signal) | ESP32-S3 **GPIO 17** (plain ESP32: GPIO 13) |
 
 Rules:
 
 - **Never power the servo from the ESP32's 5 V / VIN pin.** The USB port cannot source 3 A; the board browns out and resets mid-move, and the current spike can damage the USB-UART bridge.
 - Connect the grounds first, then the servo supply, then plug in USB.
 - Signal is 3.3 V from the ESP32; the GS2010MG accepts it directly, no level shifter.
-- To use another pin, change `#define SERVO_PIN 13` at the top of the sketch. Avoid strapping pins (0, 2, 5, 12, 15 on the plain ESP32; 0, 3, 45, 46 on the S3).
+- To use another pin, change `SERVO_PIN` (17 on the S3, 13 on the plain ESP32) at the top of the sketch. Avoid strapping pins (0, 2, 5, 12, 15 on the plain ESP32; 0, 3, 45, 46 on the S3).
 - The GS2010MG is a **180°** servo, so the firmware defaults are `C 500 2500 180` and home (`H`) is **90°**. Its real pulse window has not been measured yet: if 0° or 180° hits the mechanical stop early or late, measure the pulses that reach the true end points and set them with `C <us_min> <us_max> 180`. Until then, the soft limits (`L`) are the safe way to keep it off the stops.
 
 ### Encoder (AS5600)
@@ -51,8 +56,8 @@ The AS5600 sits on the tilt axle and reads a small magnet glued to the end of th
 |---|---|
 | VCC | ESP32 **3.3 V** (not 5 V: the ESP32 pins are not 5 V tolerant and the chip runs fine at 3.3 V) |
 | GND | ESP32 GND |
-| SDA | **GPIO 8** on the ESP32-S3, **GPIO 21** on the plain ESP32 |
-| SCL | **GPIO 9** on the ESP32-S3, **GPIO 22** on the plain ESP32 |
+| SDA | **GPIO 11** on the ESP32-S3 (shared with the IMU), **GPIO 21** on the plain ESP32 |
+| SCL | **GPIO 12** on the ESP32-S3 (shared with the IMU), **GPIO 22** on the plain ESP32 |
 | DIR, OUT, PGO | leave unconnected (the sketch handles direction in software) |
 
 Rules:
@@ -61,19 +66,19 @@ Rules:
 - Magnet: a **6 mm diametrically magnetised** disc (poles across the diameter, not through the thickness; the kind sold with AS5600 breakouts). An axially magnetised magnet reads `nomag` no matter the spacing.
 - Mount the magnet **centred on the axle**, its face parallel to the chip, with a **0.5–3 mm air gap** to the chip package. The chip must be on the axle's axis, so fix the breakout to the frame, not to the cradle.
 - Keep steel and other magnets a few cm away. Use `E` to check the spacing (see "Encoder setup" below).
-- The pins follow the board's default I2C bus. To move them, change `AS5600_SDA` / `AS5600_SCL` in the sketch (there is one pair for the S3 and one for the plain ESP32). On the plain ESP32, GPIO 8 and 9 are flash pins: never use them.
+- To move the I2C pins, change `AS5600_SDA` / `AS5600_SCL` in the sketch (there is one pair for the S3 and one for the plain ESP32). Do not use GPIO 8/9 on the S3: the wiring doc keeps them unconnected. On the plain ESP32, GPIO 8 and 9 are flash pins: never use them.
 
 ```
    5–6 V / 3 A supply            ESP32 (S3 pins; plain ESP32 in brackets)
    +---------------+          +----------------+
    |  V+        GND|----+-----|GND             |
    +---|-----------+    |     |                |       AS5600
-       |                |     |  GPIO 13       |----> servo signal (yellow/white)
+       |                |     |  GPIO 17 (13)  |----> servo signal (yellow/white)
        +--> servo red   +---> servo black      |
                               |  3V3           |----> VCC
                               |  GND           |----> GND
-                              |  GPIO 8  (21)  |<---> SDA   (4.7 kΩ to 3V3 if the breakout has none)
-                              |  GPIO 9  (22)  |<---> SCL   (4.7 kΩ to 3V3 if the breakout has none)
+                              |  GPIO 11 (21)  |<---> SDA   (4.7 kΩ to 3V3 if the breakout has none)
+                              |  GPIO 12 (22)  |<---> SCL   (4.7 kΩ to 3V3 if the breakout has none)
                               +----------------+
 ```
 
@@ -83,25 +88,25 @@ The RPLIDAR's UART is 3.3 V logic at 1,000,000 baud and connects straight to the
 
 | RPLIDAR wire | Goes to |
 |---|---|
-| TX (data out of the LiDAR) | ESP32-S3 **GPIO 18** (`LIDAR_RX_PIN`) |
-| RX (data into the LiDAR) | ESP32-S3 **GPIO 17** (`LIDAR_TX_PIN`) |
+| TX (data out of the LiDAR, yellow on this cable) | ESP32-S3 **GPIO 13** (`LIDAR_RX_PIN`) |
+| RX (data into the LiDAR, green on this cable) | ESP32-S3 **GPIO 14** (`LIDAR_TX_PIN`) |
 | GND | ESP32 GND, **and** the LiDAR supply's GND (common ground) |
 | 5 V | **its own 5 V supply** (≥1.5 A), or the power side of the Slamtec USB adapter. **Not** the ESP32's 5 V pin |
 
 Rules:
 
 - The LiDAR pulls about **1.2 A while the motor spins up** (~450 mA running). Through the ESP32's 5 V pin that comes from the USB port and browns the board out, so it needs a separate 5 V source with its ground tied to the ESP32's.
-- TX goes to RX: LiDAR **TX → GPIO 18**, LiDAR **RX ← GPIO 17**. Swapped wires give `lidar_rx=0` in `?` while the motor spins.
-- To use other pins, change `#define LIDAR_RX_PIN 18` / `#define LIDAR_TX_PIN 17` in the sketch (any free GPIO works, UART1 is routed through the GPIO matrix). Avoid the S3 strapping pins (0, 3, 45, 46), the flash/PSRAM pins (26–37 on modules with octal PSRAM), USB D−/D+ (19, 20), UART0 (43, 44), and the AS5600 pins (8, 9).
+- TX goes to RX: LiDAR **TX → GPIO 13**, LiDAR **RX ← GPIO 14**. Swapped wires give `lidar_rx=0` in `?` while the motor spins.
+- To use other pins, change `#define LIDAR_RX_PIN 13` / `#define LIDAR_TX_PIN 14` in the sketch (any free GPIO works, UART1 is routed through the GPIO matrix). Avoid the S3 strapping pins (0, 3, 45, 46), the flash/PSRAM pins (26–37 on modules with octal PSRAM), USB D−/D+ (19, 20), UART0 (43, 44), I2C (11, 12), the microphones (4–7), the servo (17) and the unconnected GPIO 8/9. GPIO 15 is the legacy motor-control assignment in the wiring doc: leave it alone.
 
-### The two USB cables (ESP32-S3 DevKitC-1)
+### The two USB cables (ESP32-S3)
 
 | Socket on the board | macOS port | Carries |
 |---|---|---|
-| **USB** (native, ESP32-S3 USB-Serial/JTAG) | `/dev/cu.usbmodemXXXX` | the tilt protocol (`I`, `?`, `T`, …) at any baud; also used for flashing |
-| **UART** (CP2102N bridge) | `/dev/cu.usbserial-XXXX` (or `/dev/cu.SLAB_USBtoUART`) | the raw LiDAR byte stream, 1,000,000 baud, for `s2bridge --serial` |
+| **UART** (CP2102N bridge) | `/dev/cu.usbserial-XXXX` (or `/dev/cu.SLAB_USBtoUART`) | the tilt protocol (`I`, `?`, `T`, …), 115200 |
+| **USB** (native, ESP32-S3 USB-Serial/JTAG) | `/dev/cu.usbmodemXXXX` | the raw LiDAR byte stream for `s2bridge --serial` (any baud); also used for flashing |
 
-Plug both into the Mac. Over Wi-Fi neither cable needs to carry data (power only).
+Plug both into the Mac. Over Wi-Fi neither cable needs to carry data. The wiring doc's rule applies: no powered laptop USB while the powerbank also feeds the board's 5 V header, unless the carrier's isolation has been checked.
 
 ## Toolchain
 
@@ -114,7 +119,7 @@ arduino-cli core install esp32:esp32          # ~300 MB, takes a few minutes
 arduino-cli lib install ESP32Servo
 ```
 
-The AS5600 driver is a few register reads on `Wire` (part of the ESP32 core); Wi-Fi, mDNS and the TCP servers use the core's `WiFi`, `ESPmDNS` and `Network` libraries. No extra library.
+The AS5600 driver is a few register reads on `Wire` (part of the ESP32 core); Wi-Fi, mDNS and the TCP servers use the core's `WiFi`, `ESPmDNS` and `Network` libraries; the microphones use ESP-IDF's `driver/i2s_std.h` directly (the core ships IDF 5.5). No extra library.
 
 ## Compile and flash
 
@@ -127,14 +132,14 @@ arduino-cli compile --fqbn esp32:esp32:esp32 firmware/servo_tilt
 arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/cu.usbserial-0001 firmware/servo_tilt
 ```
 
-ESP32-S3 DevKitC-1 (the target; always with `CDCOnBoot=cdc`, see the board table above). Flash over either socket; the native **USB** one is shown:
+ESP32-S3 N16R8 (the target; always with `PSRAM=opi`, see the board table above). Flash over either socket; the native **USB** one is shown:
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc firmware/servo_tilt
-arduino-cli upload  --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc -p /dev/cu.usbmodem1101 firmware/servo_tilt
+arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi firmware/servo_tilt
+arduino-cli upload  --fqbn esp32:esp32:esp32s3:PSRAM=opi -p /dev/cu.usbmodem1101 firmware/servo_tilt
 ```
 
-Over the **UART** socket instead: same FQBN, `-p /dev/cu.usbserial-XXXX`. With Wi-Fi in, the S3 image is about 980 KB (74% of the default 1.25 MB app partition).
+Over the **UART** socket instead: same FQBN, `-p /dev/cu.usbserial-XXXX`. With Wi-Fi and audio in, the S3 image is about 1.0 MB (76% of the default 1.25 MB app partition).
 
 If the upload sits at `Connecting........` hold the **BOOT** button, tap **RST**/**EN**, release BOOT, and retry.
 
@@ -153,7 +158,7 @@ Unplug and replug the board and see which entry appears. Typical names:
 - `/dev/cu.usbserial-0001`, `/dev/cu.usbserial-XXXX` (CP2102)
 - `/dev/cu.wchusbserialXXXX` (CH340)
 - `/dev/cu.SLAB_USBtoUART` (older CP210x driver)
-- `/dev/cu.usbmodemXXXX` (ESP32-S3 native USB: the tilt protocol)
+- `/dev/cu.usbmodemXXXX` (ESP32-S3 native USB: the LiDAR bytes)
 
 `arduino-cli board list` shows the same ports with the detected board where it can.
 
@@ -162,23 +167,23 @@ Unplug and replug the board and see which entry appears. Typical names:
 With `screen` (press Enter after each command; `screen` sends `\r`, which the firmware accepts):
 
 ```sh
-screen /dev/cu.usbmodem1101 115200        # ESP32-S3: the native USB socket
+screen /dev/cu.usbserial-XXXX 115200      # ESP32-S3: the UART socket
 screen /dev/cu.usbserial-0001 115200      # plain ESP32
 ```
 
 Or with arduino-cli:
 
 ```sh
-arduino-cli monitor -p /dev/cu.usbmodem1101 -c baudrate=115200
+arduino-cli monitor -p /dev/cu.usbserial-XXXX -c baudrate=115200
 ```
 
-On the plain ESP32, opening the port resets the board (the USB-UART bridge pulls DTR/RTS), so you first see the ROM boot chatter, then the `NOTE` lines and `OBSLAM-TILT v1`, and the servo goes to the middle of its range. The S3's native USB port does not reset on open; press **RST** to see the boot lines. Then type (replies shown for a board with the encoder fitted and zeroed; without one, drop the trailing `meas` token on `OK` lines and expect `meas=nan enc=none settled=0` in `STATUS`):
+Opening the port resets the board (the USB-UART bridge pulls DTR/RTS), so you first see the ROM boot chatter, then the `NOTE` lines and `OBSLAM-TILT v1`, and the servo goes to the middle of its range. Then type (replies shown for a board with the encoder fitted and zeroed; without one, drop the trailing `meas` token on `OK` lines and expect `meas=nan enc=none settled=0` in `STATUS`):
 
 ```
 I
 OBSLAM-TILT v1
 ?
-STATUS angle=90 meas=90.09 min=0 max=180 range=180 us_min=500 us_max=2500 enc=ok settled=1 lidar_rx=0 lidar_tx=0 lidar_drop=0 lidar_ovf=0 ip=192.168.1.42 tcp_rx=0 tcp_tx=0
+STATUS angle=90 meas=90.09 min=0 max=180 range=180 us_min=500 us_max=2500 enc=ok settled=1 lidar_rx=0 lidar_tx=0 lidar_drop=0 lidar_ovf=0 ip=192.168.1.42 tcp_rx=0 tcp_tx=0 buf=0/1048576 audio=on
 T 120
 OK 120 90.09
 W
@@ -205,10 +210,10 @@ Leave `screen` with `Ctrl-A` then `k`, then `y`. Leave the arduino-cli monitor w
 
 ## LiDAR pass-through over USB (ESP32-S3)
 
-With the LiDAR wired and powered and both cables in, run against the **UART** socket's port:
+With the LiDAR wired and powered and both cables in, run against the native **USB** socket's port:
 
 ```sh
-./driver/build/s2bridge --serial /dev/cu.usbserial-XXXX --baud 1000000 --info
+./driver/build/s2bridge --serial /dev/cu.usbmodemXXXX --baud 1000000 --info
 ```
 
 It should print the `{"model":...,"health":"good",...}` line. Then send `?` on the tilt port: `lidar_tx` counts the SDK's command bytes that reached the LiDAR and `lidar_rx` its reply and scan bytes (about 100,000 a second while scanning).
@@ -271,10 +276,84 @@ ping -c1 obslam-tilt.local                                # prints the IP, if yo
 ./driver/build/s2bridge --tcp 192.168.x.y:8899 --info       # numeric IP: the SDK's TCP channel parses an address
 nc 192.168.x.y 8900
 ?
-STATUS angle=90 ... ip=192.168.x.y tcp_rx=... tcp_tx=...
+STATUS angle=90 ... ip=192.168.x.y tcp_rx=... tcp_tx=... buf=.../1048576 audio=on
 ```
 
 (`nc` sends `\n` after each line; quit with `Ctrl-C`.)
+
+## Microphones (ESP32-S3)
+
+Four INMP441 MEMS microphones, captured **simultaneously** at 48 kHz and streamed on TCP **8901** in the `AUD1` frame format of `docs/api.md` §5.2. The array gives direction only; the core turns the stream into bearings.
+
+### Wiring recap (pin_connection.md §3)
+
+| Mic pin | Mic 1 (top) | Mic 2 (left) | Mic 3 (right) | Mic 4 (bottom) |
+|---|---|---|---|---|
+| VDD | 3V3 | 3V3 | 3V3 | 3V3 |
+| GND | GND | GND | GND | GND |
+| SCK / BCLK | GPIO 4 | GPIO 4 | GPIO 4 | GPIO 4 |
+| WS | GPIO 5 | GPIO 5 | GPIO 5 | GPIO 5 |
+| SD | GPIO 7 | GPIO 7 | GPIO 6 | GPIO 6 |
+| L/R | GND (left slot) | 3V3 (right slot) | GND (left slot) | 3V3 (right slot) |
+
+- Never join GPIO 6 and GPIO 7: each pair shares its SD wire through the opposite L/R straps.
+- **Do not fit the GPIO 4→8 / 5→9 jumpers.** GPIO 8 and 9 stay unconnected; the firmware sets them as plain inputs.
+- Mic power comes from the board's 3V3, never 5 V. Keep the mic wires away from the servo and LiDAR motor leads.
+
+### How all four are sampled together
+
+- **I2S0** is the master receiver: it drives BCLK (GPIO 4, 3.072 MHz) and WS (GPIO 5, 48 kHz) for all four mics and reads mics 1/2 on GPIO 7.
+- **I2S1** is a slave receiver for mics 3/4 on GPIO 6. It must see the *same* BCLK/WS, but the wiring doc rules out the jumper wires that would bring them to I2S1's own pins. So the firmware routes the pads internally: after I2S0 has made GPIO 4/5 its outputs, it also turns on their input buffers (`gpio_input_enable`, the output stays routed) and connects them to I2S1's slave clock inputs through the GPIO matrix:
+
+  ```c
+  esp_rom_gpio_connect_in_signal(4, I2S1I_BCK_IN_IDX, false);   // signal 31
+  esp_rom_gpio_connect_in_signal(5, I2S1I_WS_IN_IDX,  false);   // signal 32
+  ```
+
+  I2S1 itself is created with no clock pins (`I2S_GPIO_UNUSED`). If a driver version refuses that, it is created on the unconnected GPIO 8/9 instead (they stay inputs) and the matrix routing above replaces them as I2S1's clock source.
+- I2S1 is **enabled before** I2S0, so the slave is already waiting when the master's first WS edge arrives and both units start on the same frame. Both then run off the same physical clock, so they cannot drift. If a read ever times out, both units are stopped and restarted together, which re-aligns them.
+- The fallback, if the routing ever turns out not to work on the hardware: build with `-DAUDIO_CLOCK_JUMPERS=1` (or edit the `#define`), which clocks I2S1 from GPIO 8/9. That needs the 4→8 / 5→9 jumpers, so it is only for a bench test after the hardware team agrees. The boot `NOTE audio:` line says which mode is running.
+
+What has **not** been verified yet (no hardware on the bench when this was written): that I2S1 really starts on the same frame as I2S0. A fixed one-sample offset between the pairs (mics 1/2 vs 3/4) is the plausible failure mode; check it once with a single sharp tap equidistant from two mics of different pairs (their cross-correlation peak should be at 0 samples).
+
+### Data path
+
+- A capture task on **core 0** (with Wi-Fi; `loop()` keeps core 1 to itself) reads 10 ms blocks (480 frames of 32-bit slots) from both units, converts to `int16` with the right shift (default 14, saturating), interleaves mic1..mic4, stamps the frame and puts it in a 2 s ring (200 frames, ~774 KB) in PSRAM. The DMA holds 60 ms per unit, so short Wi-Fi bursts on core 0 lose nothing.
+- `t_us` is `esp_timer_get_time()` at the frame's first sample. It comes from a sample-counted timeline (10 000 µs per frame) anchored to `esp_timer` by the minimum over each second of (read time − elapsed audio), so it is jitter-free and follows any slow rate offset.
+- `loop()` copies the ring to the client with non-blocking `send()`, at most two frames per pass, exactly like the LiDAR path; servo, encoder and LiDAR work never wait on audio.
+- Frames only go into the ring while a client is connected. A new client starts on fresh audio (anything queued is skipped). If the client falls 2 s behind, new frames are dropped (`dropped` in `A` grows by 480 per frame), `seq` still advances, and the next frame sent has flag bit 1 set.
+- **Bandwidth:** 384 KB/s. lwIP's send buffer here is 5.7 KB, so the link needs a round trip under ~15 ms to keep up. That is normal on the board's own `SLAM-Test` AP or a quiet router; on a busy network, watch `dropped`.
+
+### Commands (USB or TCP 8900)
+
+```
+A
+AUDIO rate=48000 shift=14 clients=0 frames=1234 dropped=0 i2s_timeouts=0
+A shift 12
+OK
+```
+
+- `frames`: frames captured since boot (100 per second, whether or not a client is connected).
+- `dropped`: samples per channel lost because the client fell behind (480 per lost frame).
+- `i2s_timeouts`: reads that timed out (should stay 0; non-zero means a unit lost its clock).
+- `A shift <8..16>` sets the gain and is saved in NVS (`aud_shift`). The INMP441's 24-bit sample sits at the top of the 32-bit slot, so `shift 16` keeps exactly its top 16 bits (0 dBFS = the mic's full scale); each step lower doubles the level (+6 dB) and clips that much sooner. The default 14 is +12 dB, which suits a quiet room. The value applies from the next frame and is reported in every frame header.
+- `?` ends with `audio=on` when both units and the capture task are running, `audio=off` otherwise.
+
+### Checking the stream from the Mac
+
+`firmware/tools/audio_check.py` (Python 3, standard library only) connects to port 8901, validates every frame (magic, header fields, payload size, `seq` gaps, flags), and prints each channel's RMS and peak level in dBFS once a second:
+
+```sh
+python3 firmware/tools/audio_check.py 192.168.4.1                    # on the SLAM-Test AP
+python3 firmware/tools/audio_check.py 192.168.1.42 --wav mics.wav    # also save 4-channel 16-bit WAV
+python3 firmware/tools/audio_check.py 192.168.4.1:8901 --seconds 10
+```
+
+```
+ 100 fr  shift=14  m1  -52.3/ -38.0  m2  -51.8/ -37.1  m3  -52.9/ -39.4  m4  -52.0/ -36.6
+```
+
+Ctrl-C prints totals (frames, lost frames and gaps, flag counts, resyncs, clipped samples per mic, received rate). Exit status is 0 only if frames arrived and no header was malformed. A tap near one mic should raise that channel most; a channel stuck at `-inf` is a dead mic or a wrong L/R strap (two mics on one slot).
 
 ## Encoder setup
 
