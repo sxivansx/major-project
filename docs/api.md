@@ -313,3 +313,20 @@ Text: `{"type":"audio_event", ...AudioEvent}` on every detection.
 - Events also carry `reasons[]`, `coherence[6]`, `residual_us`, `calibrated`, `map_age_s`; candidates carry `off_axis_deg`. Candidate window is at least ±3°, a wide region straddling the bearing counts, and events with confidence < 0.1 get none.
 - Status `audio` also carries `link`, `note`, `array_yaw_deg`, `map_age_s` and CPU stats.
 - The array is assumed fixed to the base, not the tilting cradle. With this left–right symmetric layout a ch2/ch3 swap gives a perfectly fitting but mirrored bearing; only the clap calibration catches it.
+
+### 5.6 Sound sources (what the operator sees)
+
+Raw events are noisy (echoes, one clap detected twice, a noisy mic). The operator-facing unit is a **source**: events that keep coming from the same direction, grouped over time. Repeated tapping from one direction is the signal that matters.
+
+Tracking (core): events with `confidence ≥ 0.1` and a bearing join the active source whose bearing is within `max(15°, 3 × spread)` and whose last event is < 60 s old; otherwise they start a new source. Events below 0.1 are kept but marked `"noise": true` and never form sources. A source expires 120 s after its last event (kept in history). Bearing = confidence/σ²-weighted circular mean; `spread_deg` = weighted circular standard deviation. `kind` = `"tapping"` when ≥ 3 events arrive 0.3–6 s apart, else `"sound"`. `confidence` grows with the number of consistent events and drops with spread: `1 − Π(1 − cᵢ)` × `exp(−spread/20°)`, capped at 0.99.
+
+`GET /audio/sources` → `{"active":[Source], "history":[Source]}`; WS text `{"type":"audio_sources","active":[…]}` on every change; `status.audio.sources_active` = count.
+```json
+{"id": 4, "kind": "tapping", "bearing_deg": 112.0, "spread_deg": 6.1, "sigma_deg": 3.0,
+ "n_events": 6, "first_t": 1761250000.1, "last_t": 1761250040.3, "rate_per_min": 9.0,
+ "confidence": 0.86, "peak_dbfs": -9.0, "event_ids": [42, 45, 52],
+ "candidates": [{"kind":"void","id":"V2","distance_m":1.8,"bearing_deg":110,"off_axis_deg":2}],
+ "active": true}
+```
+
+Channel health: a mic whose noise floor is > 12 dB above the median of the others is **excluded** from direction finding (its pairs dropped; 3 mics still give a 2-D bearing). `status.audio.excluded_mics` lists them with a reason; events carry `mics_used`.
