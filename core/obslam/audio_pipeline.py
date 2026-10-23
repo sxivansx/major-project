@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 PREVIEW_POINTS = 100  # per channel: 100 ms at 1 kHz
 PREVIEW_PERIOD_S = 0.05  # ≤ 20 Hz
 CLIP_LEVEL = 32767
+DC_ALPHA = 0.02  # per 10 ms frame: DC estimate settles in ~0.5 s
 CLIP_HOLD_S = 2.0
 LOSS_WINDOW_S = 10.0
 LOSS_ALARM_FRAMES = 5  # in LOSS_WINDOW_S; one lost 10 ms frame inside a spike window spoils its bearing
@@ -168,14 +169,22 @@ class AudioPipeline:
                 self.rate, self.channels = f.rate, f.channels
                 self.detector = Detector(f.rate, f.channels, cfg.trigger_db, cfg.min_gap_ms)
                 self._preview = np.zeros((0, f.channels), np.int16)
+                self._dc = None
             self.shift = f.shift
             if f.lost_before:
                 # the samples on either side of a gap are not contiguous: no window may span it
                 self.detector.reset_stream()
-            x = f.samples
-            peak = np.max(np.abs(x.astype(np.int32)), axis=0)
+            raw = f.samples
+            peak = np.max(np.abs(raw.astype(np.int32)), axis=0)
             for c in np.nonzero(peak >= CLIP_LEVEL)[0][:4]:
-                self._clip_t[int(c)] = f.t
+                self._clip_t[int(c)] = f.t  # clipping is judged on the raw stream
+            # INMP441 boards can sit on a large constant offset (one real mic read -17 dBFS of pure
+            # DC); remove it before levels, preview and detection, or the offset reads as loudness
+            # and raises the noise floor the trigger is measured against. ~0.5 s time constant.
+            m = raw.mean(axis=0, dtype=np.float64)
+            dc = getattr(self, "_dc", None)
+            self._dc = m if dc is None else dc + DC_ALPHA * (m - dc)
+            x = np.clip(np.rint(raw - self._dc), -32768, 32767).astype(np.int16)
             span = max(1, f.rate // 10)
             self._preview = np.concatenate([self._preview, x])[-span:]
             dets = self.detector.feed(x, f.t_us, f.t)
