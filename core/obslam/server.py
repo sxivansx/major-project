@@ -128,6 +128,10 @@ class AudioCalibrate(BaseModel):
     refine_positions: bool = False  # ≥ 6 claps: also fit the mic positions (applied too when apply=true)
 
 
+class SpeechToggle(BaseModel):
+    enabled: bool
+
+
 class AIRequest(BaseModel):
     cell: float | None = None
 
@@ -145,6 +149,7 @@ def create_app(
     autostart_sim: bool = False,
     sim_hz: float = 10.0,
     ai_client=None,
+    speech_key: str | None = None,
 ) -> FastAPI:
     from .ai import AIClient
 
@@ -152,6 +157,9 @@ def create_app(
     config = load_config(config_path)
     rig = Rig(config, SessionStore(sessions_dir), bc.publish, bridge_path=bridge, sim_hz=sim_hz)
     ai = ai_client or AIClient()
+    from .speech import SpeechListener
+
+    rig.audio.speech = SpeechListener(ai, rig.audio._send, rig.log, rig.audio.locate_window, key=speech_key)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -174,6 +182,7 @@ def create_app(
             yield
         finally:
             task.cancel()
+            rig.audio.speech.close()
             await asyncio.to_thread(rig.shutdown)
 
     app = FastAPI(title="major-project", lifespan=lifespan)
@@ -285,6 +294,22 @@ def create_app(
     @app.post(f"{api}/audio/clear", status_code=204)
     def audio_clear():
         rig.audio.clear()
+        return Response(status_code=204)
+
+    # ---- spoken calls for help (§5.7) --------------------------------------------------------------
+    @app.get(f"{api}/audio/speech")
+    def speech_events(limit: int = Query(50, ge=0, le=100)):
+        return {"status": rig.audio.speech.status(), "events": rig.audio.speech.events(limit)}
+
+    @app.post(f"{api}/audio/speech")
+    def speech_toggle(body: SpeechToggle):
+        rig.audio.speech.set_enabled(body.enabled)
+        rig.publish_status()
+        return rig.audio.speech.status()
+
+    @app.post(f"{api}/audio/speech/clear", status_code=204)
+    def speech_clear():
+        rig.audio.speech.clear()
         return Response(status_code=204)
 
     @app.post(f"{api}/audio/sim/emit")

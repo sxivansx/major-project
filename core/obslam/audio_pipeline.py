@@ -105,6 +105,8 @@ class AudioPipeline:
         self._map_lock = threading.Lock()
         self._map_stop = threading.Event()
 
+        self.speech = None  # SpeechListener, attached by the server (it owns the AI client)
+
     # ---- connection ----------------------------------------------------------------------------
     def connect(self, source: str, port: str | None = None) -> None:
         cfg = self.config.audio
@@ -206,7 +208,8 @@ class AudioPipeline:
             # the samples on either side of a gap are not contiguous: no window may span it. A
             # frame with an I2S read timeout may itself be partly padding, so it is not analysed.
             i2s_timeout = bool(f.flags & FLAG_I2S_TIMEOUT)
-            if f.lost_before or f.flags & FLAG_DROPPED or i2s_timeout:
+            gap = bool(f.lost_before or f.flags & FLAG_DROPPED)
+            if gap or i2s_timeout:
                 self.detector.reset_stream(f.lost_before * f.n)
                 self.gaps += 1
             raw = f.samples
@@ -227,6 +230,7 @@ class AudioPipeline:
                 dets = []
             else:
                 dets = self.detector.feed(x, f.t_us, f.t)
+            use = [m for m in range(f.channels) if m not in self._excluded]
             if f.t - self._health_t >= HEALTH_PERIOD_S:
                 self._health_t = f.t
                 self._check_channels()
@@ -236,6 +240,12 @@ class AudioPipeline:
                 preview = self._encode_preview(f.t)
         if preview is not None:
             self._publish(preview)
+        sp = self.speech
+        if sp is not None:
+            if gap or i2s_timeout:
+                sp.reset()
+            else:
+                sp.feed(x, f.t, f.rate, use)
         for d in dets:
             self._handle(d)
         with self._lock:
@@ -281,6 +291,17 @@ class AudioPipeline:
         self._levels = [round(float(v), 1) for v in levels]
         self._preview_seq += 1
         return encode_preview(self._preview_seq, t, levels, mins, maxs)
+
+    def locate_window(self, window: np.ndarray, rate: int) -> dict:
+        """The event DOA with the current geometry and excluded mics, for other listeners (speech)."""
+        cfg = self.config.audio
+        with self._lock:
+            use = [m for m in range(window.shape[1]) if m not in self._excluded]
+        loc = acoustic.locate(
+            window, rate, cfg.mics_mm, cfg.speed_of_sound, cfg.array_yaw_deg, cfg.calibrated, None,
+            offsets_us=cfg.channel_offsets_us, use_mics=use,
+        )
+        return {**loc, "calibrated": bool(cfg.calibrated)}
 
     def _handle(self, d: Detection) -> None:
         t0 = time.perf_counter()
@@ -506,6 +527,7 @@ class AudioPipeline:
                 "map_cost_ms": None if self._map_cost_s is None else round(self._map_cost_s * 1000, 1),
                 "cpu_us_per_frame": round(c["frame_s"] / c["frames"] * 1e6, 1) if c["frames"] else None,
                 "cpu_ms_per_event": round(c["event_s"] / c["events"] * 1e3, 2) if c["events"] else None,
+                "speech": None if self.speech is None else self.speech.status(),
             }
 
     def alarms(self) -> dict[str, str]:
@@ -538,5 +560,7 @@ class AudioPipeline:
             if clipped:
                 hint = f" (A shift {self.shift + 1})" if self.shift is not None and self.shift < 16 else ""
                 out["audio_clip"] = f"audio clipping on mic {', '.join(map(str, clipped))}: lower the gain{hint}"
+        if self.speech is not None and (a := self.speech.alarm()):
+            out["speech_help"] = a
         return out
 
