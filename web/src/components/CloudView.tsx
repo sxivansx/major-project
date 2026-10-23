@@ -6,6 +6,8 @@ import type { GridFrame } from "../api/types";
 import { cloud } from "../store/cloud";
 import { useStore } from "../store/store";
 import { RAMP_GLSL } from "../lib/colormap";
+import { useRoom } from "../store/room";
+import { RoomLayer, roomBounds } from "./RoomLayer";
 
 // Our data is z-up (base frame). three.js is y-up. Everything in the base
 // frame lives inside <group rotation={[-PI/2, 0, 0]}>, which maps data
@@ -220,16 +222,26 @@ const CAMERA_HOME: [number, number, number] = [3.5, 9, 4.5];
 
 // Puts the camera back to the default view whenever `nonce` changes (the Fit
 // button). OrbitControls registers itself as the default controls.
+// With an empty cloud but a room map, Fit frames the room instead: same
+// viewing direction, centred on the room, far enough to see all of it.
 function CameraHome({ nonce, targetY }: { nonce: number; targetY: number }) {
   const camera = useThree((s) => s.camera);
   const controls = useThree((s) => s.controls) as { target: THREE.Vector3; update: () => void } | null;
   useEffect(() => {
     if (nonce === 0) return;
-    camera.position.set(...CAMERA_HOME);
+    const showRoom = useStore.getState().showRoom;
+    const rb = showRoom && cloud.count === 0 ? roomBounds(useRoom.getState().grid) : null;
+    let target = new THREE.Vector3(0, targetY, 0);
+    if (rb) {
+      // data (x, y, z) -> three (x, z, -y)
+      target = new THREE.Vector3(rb.cx, 0, -rb.cy);
+      const dir = new THREE.Vector3(...CAMERA_HOME).normalize();
+      camera.position.copy(target.clone().add(dir.multiplyScalar(Math.max(4, rb.extent * 1.25))));
+    } else camera.position.set(...CAMERA_HOME);
     if (controls) {
-      controls.target.set(0, targetY, 0);
+      controls.target.copy(target);
       controls.update();
-    } else camera.lookAt(0, targetY, 0);
+    } else camera.lookAt(target);
   }, [nonce, camera, controls, targetY]);
   return null;
 }
@@ -239,6 +251,7 @@ export function CloudView({ resetNonce = 0 }: { resetNonce?: number }) {
   const showHelpers = useStore((s) => s.showHelpers);
   const pointSize = useStore((s) => s.pointSize);
   const colorZ = useStore((s) => s.colorZ);
+  const showRoom = useStore((s) => s.showRoom);
   const mount = useStore((s) => s.config?.mount);
   const phiDeg = useStore((s) => s.status?.servo.phi_deg ?? 0);
   const axisZ = (mount?.axis_z_mm ?? 80) / 1000;
@@ -260,7 +273,11 @@ export function CloudView({ resetNonce = 0 }: { resetNonce?: number }) {
         <Rig axisZ={axisZ} h={h} phiDeg={phiDeg} />
         <PointCloud size={pointSize} zRange={colorZ} />
         {showSurface && <HeightSurface zRange={colorZ} />}
+        {showRoom && <RoomLayer />}
       </group>
+      {/* lights only shade the room walls; points and surface use their own shaders */}
+      <ambientLight intensity={0.6} />
+      <directionalLight position={[3, 8, 5]} intensity={0.9} />
     </Canvas>
   );
 }

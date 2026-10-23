@@ -36,6 +36,9 @@ export interface UiState {
   gridForm: { cell: string; layer: GridLayer; zMin: string; zMax: string }; // height map query (strings: form inputs)
   fitColours: boolean; // height map colour range from the data instead of z min/max
   cloudResetNonce: number; // bump to put the 3D camera back to the default view
+  showRoom: boolean; // the handheld room map as a 3D layer in the cloud view
+  roomWallH: number; // assumed wall height for the room layer, m
+  roomScannerH: number | null; // scanner height above the floor for the room layer, m; null = from the findings, else 1 m
 }
 
 export interface State extends UiState {
@@ -134,6 +137,9 @@ export const useStore = create<State>((set) => ({
   gridForm: { cell: "0.05", layer: "max", zMin: "-0.5", zMax: "2.5" },
   fitColours: false,
   cloudResetNonce: 0,
+  showRoom: true,
+  roomWallH: 2.4,
+  roomScannerH: null,
 
   setWs: (p) => set(p),
   setStatus: (status) => set({ status }),

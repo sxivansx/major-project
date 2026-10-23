@@ -79,6 +79,44 @@ export class RoomSim {
   private match = { rms_mm: null as number | null, inliers: null as number | null, ok: false };
   private timer: ReturnType<typeof setInterval> | null = null;
   private tick = 0;
+  private next: RoomState["next"] = null;
+
+  // where to carry the scanner next: a clear spot near the nearest open edge (§3.5, simplified)
+  private findNext(): RoomState["next"] {
+    const W = this.w;
+    const c = this.cell;
+    let edges = 0;
+    let best: { x: number; y: number; d: number } | null = null;
+    for (let i = 0; i < this.cells.length; i++) {
+      if (this.cells[i] !== 3) continue;
+      edges++;
+      const iy = Math.floor(i / W);
+      const ix = i - iy * W;
+      const x = this.x0 + (ix + 0.5) * c;
+      const y = this.y0 + (iy + 0.5) * c;
+      const d = Math.hypot(x - this.pose.x, y - this.pose.y);
+      if (d >= 0.4 && (!best || d < best.d)) best = { x, y, d };
+    }
+    if (!best) return { station: null, open_edges: 0, complete: this.keyframes > 1 };
+    // step back 0.3 m toward the scanner so the station is on clear floor
+    const k = Math.max(0, (best.d - 0.3) / best.d);
+    const sx = this.pose.x + (best.x - this.pose.x) * k;
+    const sy = this.pose.y + (best.y - this.pose.y) * k;
+    const ang = (Math.atan2(sy - this.pose.y, sx - this.pose.x) * 180) / Math.PI;
+    // LiDAR convention: clockwise from the cable mark as it points now
+    const bearing = ((this.pose.theta_deg - ang) % 360 + 360) % 360;
+    return {
+      station: {
+        x: +sx.toFixed(2),
+        y: +sy.toFixed(2),
+        distance_m: +Math.hypot(sx - this.pose.x, sy - this.pose.y).toFixed(2),
+        bearing_deg: +bearing.toFixed(0),
+        edge: { x: +best.x.toFixed(2), y: +best.y.toFixed(2), width_m: 0.6 },
+      },
+      open_edges: Math.max(1, Math.round(edges / 12)),
+      complete: false,
+    };
+  }
 
   constructor(
     private sendState: (r: RoomState) => void,
@@ -98,6 +136,7 @@ export class RoomSim {
       match: this.w ? { ...this.match } : null,
       lost: false,
       note: this.state === "mapping" && this.scans < 5 ? "hold still for a moment while the first scans settle" : null,
+      next: this.w ? this.next : null,
     };
     if (withGrid) r.grid = { w: this.w, h: this.h, cell: this.cell, x0: this.x0, y0: this.y0 };
     return r;
@@ -220,5 +259,20 @@ export class RoomSim {
       }
     }
     for (let i = 0; i < this.cells.length; i++) this.cells[i] = this.hits[i] > 0 ? 2 : this.hits[i] < 0 ? 1 : 0;
+    // open edge (3): free next to unknown
+    const W = this.w;
+    for (let i = 0; i < this.cells.length; i++) {
+      if (this.cells[i] !== 1) continue;
+      const iy = Math.floor(i / W);
+      const ix = i - iy * W;
+      if (
+        (ix > 0 && this.cells[i - 1] === 0) ||
+        (ix < W - 1 && this.cells[i + 1] === 0) ||
+        (iy > 0 && this.cells[i - W] === 0) ||
+        (iy < this.h - 1 && this.cells[i + W] === 0)
+      )
+        this.cells[i] = 3;
+    }
+    this.next = this.findNext();
   }
 }

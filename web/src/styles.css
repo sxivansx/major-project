@@ -1362,3 +1362,24 @@ button.linklike:hover:not(:disabled) {
   border: 0;
   background: var(--accent);
 }
+
+/* room layer in the 3D view */
+.room-3d-hint {
+  padding: 4px 8px;
+  margin: 0;
+  border-top: 1px solid var(--border);
+  flex: none;
+}
+
+.action-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.action-field input {
+  width: 64px;
+  padding: 3px 5px;
+}

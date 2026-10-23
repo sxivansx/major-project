@@ -9,6 +9,8 @@ import { HeightMapControls, HeightMapPanel, downloadHeightMapPng } from "./Heigh
 import { JobPanel } from "./JobPanel";
 import { MountPanel } from "./MountPanel";
 import { Shell, useAdvancedFlag, type BigNumber } from "./Shell";
+import { useRoom } from "../store/room";
+import { useRoomFloorZ } from "./RoomLayer";
 
 // Point cloud and height map: the 3D view left, the 2.5D map right, the
 // numbers from /api/metrics on top.
@@ -68,8 +70,36 @@ function CloudControls() {
           <input type="checkbox" checked={showHelpers} onChange={(e) => setUi({ showHelpers: e.target.checked })} />
           grid and axes
         </label>
+        <RoomHeightField />
       </div>
     </section>
+  );
+}
+
+// Scanner height above the floor for the room layer (blank = automatic).
+function RoomHeightField() {
+  const manual = useStore((s) => s.roomScannerH);
+  const setUi = useStore((s) => s.setUi);
+  const { source } = useRoomFloorZ();
+  return (
+    <div className="field" style={{ marginTop: 6 }} title="Where the room map's floor is drawn: blank uses the fitted floor or the findings, else 1 m">
+      <label>Scanner above floor m</label>
+      <input
+        type="number"
+        min={0.1}
+        step={0.05}
+        placeholder="auto"
+        value={manual ?? ""}
+        onChange={(e) => {
+          const v = e.target.value === "" ? null : Number(e.target.value);
+          setUi({ roomScannerH: v !== null && v > 0 ? v : null });
+        }}
+      />
+      <span />
+      <span className="hint" style={{ marginTop: 0 }}>
+        room floor from: {source}
+      </span>
+    </div>
   );
 }
 
@@ -82,6 +112,11 @@ export function CloudTab() {
   const grid = useStore((s) => s.grid);
   const showSurface = useStore((s) => s.showSurface);
   const cloudResetNonce = useStore((s) => s.cloudResetNonce);
+  const showRoom = useStore((s) => s.showRoom);
+  const wallH = useStore((s) => s.roomWallH);
+  const roomGrid = useRoom((s) => s.grid);
+  const haveRoom = !!roomGrid && roomGrid.w > 0 && roomGrid.h > 0;
+  const [wallText, setWallText] = useState(String(wallH));
   const setUi = useStore((s) => s.setUi);
   const [scanErr, setScanErr] = useState<string | null>(null);
   const [scanBusy, setScanBusy] = useState(false);
@@ -149,6 +184,9 @@ export function CloudTab() {
             <CloudView resetNonce={cloudResetNonce} />
             <div className="scene-overlay">drag: orbit · right-drag: pan · wheel: zoom · x red, y green, z blue · blue dot: tilt axis</div>
           </div>
+          {showRoom && haveRoom && (
+            <div className="hint room-3d-hint">Walls are the room map raised to an assumed height. Real heights need a tilt sweep: the servo must move.</div>
+          )}
         </section>
       }
       side={<HeightMapPanel />}
@@ -163,12 +201,41 @@ export function CloudTab() {
             </span>
           )}
           {scanErr && <span className="err mono">{scanErr}</span>}
-          <button onClick={() => setUi({ cloudResetNonce: cloudResetNonce + 1 })} title="Camera back to the default view">
+          <button
+            onClick={() => setUi({ cloudResetNonce: cloudResetNonce + 1 })}
+            title={cloudCount === 0 && showRoom && haveRoom ? "Frame the room map" : "Camera back to the default view"}
+          >
             Fit
           </button>
           <button className={showSurface ? "toggled" : ""} onClick={() => setUi({ showSurface: !showSurface })}>
             Surface {showSurface ? "on" : "off"}
           </button>
+          <button
+            className={showRoom && haveRoom ? "toggled" : ""}
+            disabled={!haveRoom}
+            title={haveRoom ? "The handheld room map (Room map tab) in 3D" : "No room map yet: map one on the Room map tab"}
+            onClick={() => setUi({ showRoom: !showRoom })}
+          >
+            Room {showRoom && haveRoom ? "on" : "off"}
+          </button>
+          {showRoom && haveRoom && (
+            <label className="action-field" title="The room map has no heights: walls are drawn this tall">
+              Wall height (assumed)
+              <input
+                type="number"
+                min={0.2}
+                max={10}
+                step={0.1}
+                value={wallText}
+                onChange={(e) => {
+                  setWallText(e.target.value);
+                  const v = Number(e.target.value);
+                  if (v > 0 && v <= 10) setUi({ roomWallH: v });
+                }}
+              />
+              <span className="dim">m</span>
+            </label>
+          )}
           <button disabled={!grid} onClick={() => downloadHeightMapPng()} title="Download the height map as a PNG">
             PNG
           </button>
