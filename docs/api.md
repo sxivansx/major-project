@@ -253,7 +253,7 @@ Config (`/api/config`, new `audio` block):
 "audio": {
   "port": "tcp://192.168.1.49:8901",
   "mics_mm": [[0,0,0],[0,0,0],[0,0,0],[0,0,0]],   // sound-port positions in the array frame, mm
-  "array_yaw_deg": 0,          // array x-axis relative to the base frame x (lidar 0° mark), deg CCW
+  "array_yaw_deg": 0,          // bearing of the array's +x axis, clockwise from base +x (same convention as every bearing)
   "calibrated": false,
   "trigger_db": 12,            // spike = short-term energy this many dB above the running noise floor
   "min_gap_ms": 300,           // dead time between events
@@ -284,13 +284,16 @@ AudioEvent:
  "candidates": [ {"kind":"void","id":"V2","distance_m":1.8,"bearing_deg":43}, {"kind":"shadow","id":"S1", ...} ],
  "label": "impulse"}
 ```
-`candidates` = findings (voids first, then shadows / unknown regions, then obstacles' far sides) whose centroid lies inside bearing ± 2σ, nearest first. Never "person": these are places a source could be.
+`candidates` = findings whose centroid lies inside bearing ± 2σ (wrap-safe), grouped by `kind` in this order: `void`, `shadow`, `unknown`, `obstacle` (depressions are not candidates), nearest first within each group. Never "person": these are places a source could be.
+
+Conventions: `tdoa_us["ij"]` = t_i − t_j (positive when mic i hears the sound later). `bearing_deg`, `bearing_sigma_deg` and `elevation_deg` are all null when the direction is unresolved (with `"reason"`). `status.audio` is `{"connected": false}` when nothing is connected. `calibrated` lives in config; status mirrors it. `/audio/sim/emit` returns the detected AudioEvent (or `{"detected": false, "reason": …}` if the knock stayed under the trigger) and is 409 unless the source is `sim`. Event ages use the core clock (`t`); `t_us` is the ESP32 clock, kept for the raw record only.
 
 ### 5.4 WebSocket additions
 
 Binary, kind 5 **audio preview** (≤ 20 Hz while audio is connected): per channel min/max envelopes of the last 100 ms at 1 kHz, for the waveform view:
 ```
 u8 kind=5, u8 channels=4, u16 n (points per channel, 100), u32 seq, f64 t_unix,
-4 × f32 level_dbfs (RMS of the block), then channels × n × (i16 min, i16 max)
+channels × f32 level_dbfs (RMS of the block), then channels × n × (i16 min, i16 max)
 ```
+Channel-major (all of mic1's n points, then mic2's …). `t_unix` is the time of the **last** point; frames may overlap (each covers the last 100 ms), so clients de-duplicate by time. min/max are the stream's i16 values after `shift`, ±32767 = full scale (0 dBFS).
 Text: `{"type":"audio_event", ...AudioEvent}` on every detection.
