@@ -195,6 +195,7 @@ class Rig:
         # replay buffered rotations in bursts, hence the longer grace period.
         alarms: dict[str, str] = {}
         now = time.time()
+        self.audio.tick(now)  # outside the rig lock: it may publish
         with self._lock:
             if self.scan is not None and now - self._scan_connected_at > 8.0:
                 last_t = self.latest.t if self.latest else self._scan_connected_at

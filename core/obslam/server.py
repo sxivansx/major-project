@@ -104,7 +104,7 @@ class RouteRequest(BaseModel):
 
 
 class AudioConnect(BaseModel):
-    source: Literal["tcp", "sim"] = "tcp"
+    source: Literal["udp", "tcp", "sim"] = "udp"
     port: str | None = None
 
 
@@ -277,6 +277,10 @@ def create_app(
     @app.get(f"{api}/audio/events")
     def audio_events(limit: int = Query(50, ge=0, le=200)):
         return rig.audio.events(limit)
+
+    @app.get(f"{api}/audio/sources")
+    def audio_sources():
+        return rig.audio.sources()
 
     @app.post(f"{api}/audio/clear", status_code=204)
     def audio_clear():

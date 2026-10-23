@@ -148,3 +148,144 @@ def decode_preview(buf: bytes) -> dict:
     lv = np.frombuffer(buf, "<f4", ch, o)
     env = np.frombuffer(buf, "<i2", ch * n * 2, o + 4 * ch).reshape(ch, n, 2)
     return {"seq": seq, "t": t, "levels_dbfs": lv, "min": env[:, :, 0], "max": env[:, :, 1]}
+
+
+# ---- UDP 8902: 'AUD2' datagrams (docs/api.md §5.2) ---------------------------------------------------
+MAGIC2 = 0x32445541  # 'AUD2'
+_HDR2 = struct.Struct("<IIQIHHHHBBHH")  # magic seq t_us rate channels n shift flags part parts first count → 34 B
+HEADER2_SIZE = _HDR2.size
+MAX_PART_SAMPLES = 175  # 1,400 B of samples per datagram at 4 channels
+
+
+def encode_aud2(seq: int, t_us: int, rate: int, samples, shift: int = 14, flags: int = 0, max_count: int = MAX_PART_SAMPLES) -> list[bytes]:
+    """One frame as datagrams, split evenly like the firmware (480 → 3 × 160, 240 → 2 × 120)."""
+    s = np.ascontiguousarray(samples, dtype="<i2")
+    n, ch = s.shape
+    parts = max(1, -(-n // max_count))
+    bounds = [round(k * n / parts) for k in range(parts + 1)]
+    out = []
+    for k in range(parts):
+        a, b = bounds[k], bounds[k + 1]
+        hdr = _HDR2.pack(MAGIC2, seq & 0xFFFFFFFF, t_us, rate, ch, n, shift, flags, k, parts, a, b - a)
+        out.append(hdr + s[a:b].tobytes())
+    return out
+
+
+@dataclass
+class _Partial:
+    t_us: int
+    rate: int
+    shift: int
+    n: int
+    channels: int
+    parts: int
+    flags: int
+    samples: np.ndarray
+    got: set
+    arrived: float
+
+
+class Aud2Reassembler:
+    """Datagrams → whole frames, in seq order.
+
+    Parts are placed at their `first` sample; a frame is complete when all `parts` arrived.
+    Frames are released in seq order; a frame still incomplete once the stream is `reorder`
+    frames past it (or `max_wait_s` after a later frame completed) is lost, and the next
+    released frame carries the gap in `lost_before`. Garbage, duplicates and parts that
+    disagree with their frame are counted and ignored, never raised."""
+
+    def __init__(self, reorder: int = 5, max_wait_s: float = 0.05):
+        self.reorder = reorder
+        self.max_wait_s = max_wait_s
+        self.tracker = SeqTracker()
+        self.reset()
+        self.garbage = 0
+        self.late = 0
+        self.duplicates = 0
+        self.partial_lost = 0  # frames dropped because a part never came
+
+    def reset(self) -> None:
+        self._next: int | None = None
+        self._newest: int | None = None
+        self._partial: dict[int, _Partial] = {}
+        self._done: dict[int, tuple[AudioFrame, float]] = {}
+        self.tracker.reset()
+
+    @staticmethod
+    def _diff(a: int, b: int) -> int:
+        """a − b on the 32-bit wrapping counter, as a signed number."""
+        d = (a - b) & 0xFFFFFFFF
+        return d - (1 << 32) if d >= 1 << 31 else d
+
+    def feed(self, data: bytes, now: float = 0.0) -> list[AudioFrame]:
+        if len(data) < HEADER2_SIZE:
+            self.garbage += 1
+            return self.poll(now)
+        magic, seq, t_us, rate, ch, n, shift, flags, part, parts, first, count = _HDR2.unpack_from(data)
+        ok = (
+            magic == MAGIC2 and 1 <= ch <= MAX_CHANNELS and 1 <= n <= MAX_SAMPLES and 1 <= parts <= 64
+            and part < parts and count >= 1 and first + count <= n and len(data) == HEADER2_SIZE + count * ch * 2
+        )
+        if not ok:
+            self.garbage += 1
+            return self.poll(now)
+        if self._next is not None:
+            d = self._diff(seq, self._next)
+            if d < -1000 or d > 100_000:  # the firmware restarted (or a stale stream): start over
+                self.reset()
+            elif d < 0:
+                self.late += 1
+                return self.poll(now)
+        if self._next is None:
+            self._next = seq
+        if self._newest is None or self._diff(seq, self._newest) > 0:
+            self._newest = seq
+        if seq in self._done:
+            self.duplicates += 1
+            return self.poll(now)
+        p = self._partial.get(seq)
+        if p is None:
+            p = _Partial(t_us, rate, shift, n, ch, parts, 0, np.zeros((n, ch), np.int16), set(), now)
+            self._partial[seq] = p
+        elif (p.n, p.channels, p.parts, p.rate) != (n, ch, parts, rate):
+            self.garbage += 1
+            return self.poll(now)
+        if part in p.got:
+            self.duplicates += 1
+            return self.poll(now)
+        p.got.add(part)
+        p.flags |= flags
+        p.samples[first : first + count] = np.frombuffer(data, "<i2", count * ch, HEADER2_SIZE).reshape(count, ch)
+        if len(p.got) == p.parts:
+            del self._partial[seq]
+            self._done[seq] = (AudioFrame(seq, p.t_us, p.rate, p.shift, p.flags, p.samples, now), now)
+        return self.poll(now)
+
+    def poll(self, now: float = 0.0, flush: bool = False) -> list[AudioFrame]:
+        """Release what can be released. `flush` gives up on every gap (the stream stopped)."""
+        out: list[AudioFrame] = []
+        while self._next is not None:
+            if self._next in self._done:
+                f, _ = self._done.pop(self._next)
+                f.lost_before = self.tracker.update(f.seq)
+                out.append(f)
+                self._next = (self._next + 1) & 0xFFFFFFFF
+                continue
+            if not self._done and not self._partial:
+                break
+            behind = self._newest is not None and self._diff(self._newest, self._next) >= self.reorder
+            waited = bool(self._done) and now - min(t for _, t in self._done.values()) > self.max_wait_s
+            if not (flush or behind or waited):
+                break
+            # give up on this seq: it never completed in time
+            if self._partial.pop(self._next, None) is not None:
+                self.partial_lost += 1
+            if not self._done and not self._partial:
+                self._next = (self._next + 1) & 0xFFFFFFFF
+                break
+            self._next = (self._next + 1) & 0xFFFFFFFF
+        # partials that fell behind the release point are lost for good
+        for s in [s for s in self._partial if self._next is not None and self._diff(s, self._next) < 0]:
+            del self._partial[s]
+            self.partial_lost += 1
+        return out

@@ -54,7 +54,7 @@ MEASURED_MICS_MM = [[-35.0, 0.0, 0.0], [-70.0, -19.5, 0.0], [0.0, -19.5, 0.0], [
 
 
 class AudioConfig(BaseModel):
-    port: str = "tcp://192.168.1.49:8901"
+    port: str = "udp://192.168.1.49:8902"  # udp://ip:8902 (AUD2, recommended) or tcp://ip:8901 (AUD1)
     mics_mm: list[list[float]] = Field(default_factory=lambda: [list(m) for m in MEASURED_MICS_MM])  # sound ports, array frame
     array_yaw_deg: float = 0.0  # bearing of the array +x axis, clockwise from base +x (lidar 0° mark); 0 is an assumption until calibrated
     calibrated: bool = False

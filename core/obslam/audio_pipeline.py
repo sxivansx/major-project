@@ -1,5 +1,6 @@
 """The acoustic layer as the server sees it: one audio source, the spike detector, direction
-finding, the event ring and the kind-5 waveform preview (docs/api.md §5.3, §5.4).
+finding, the event ring, sound sources (events grouped by direction), channel health and the
+kind-5 waveform preview (docs/api.md §5.3, §5.4, §5.6).
 
 Thread model: frames arrive on the source's thread and are processed there (≈0.1 ms per 10 ms
 frame, a few ms per spike), so the rig's lock is never taken on that path. Findings for the
@@ -20,9 +21,9 @@ from typing import Callable
 import numpy as np
 
 from . import acoustic
-from .acoustic import Detection, Detector, dbfs
-from .audio_source import AudioSource, SimAudioSource, TcpAudioSource, parse_tcp
-from .audio_wire import AudioFrame, encode_preview
+from .acoustic import Detection, Detector, SourceTracker, dbfs
+from .audio_source import AudioSource, SimAudioSource, TcpAudioSource, UdpAudioSource, parse_hostport
+from .audio_wire import FLAG_DROPPED, FLAG_I2S_TIMEOUT, AudioFrame, encode_preview
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -36,6 +37,10 @@ LOSS_WINDOW_S = 10.0
 LOSS_ALARM_FRAMES = 5  # in LOSS_WINDOW_S; one lost 10 ms frame inside a spike window spoils its bearing
 MIN_CONFIDENCE_FOR_CANDIDATES = 0.1
 MAP_MIN_INTERVAL_S = 2.0  # during a sweep the cloud changes every step; re-analyse at most this often
+EXCLUDE_DB = 12.0  # a mic whose floor is this far above the median of the others is left out of DOA
+INCLUDE_DB = 9.0  # …and taken back below this (hysteresis: a floor hovering at 12 dB must not flap)
+HEALTH_PERIOD_S = 1.0
+PRE_CUT_CONFIDENCE = 0.7  # onset right after a gap: the direct sound may be missing from the window
 
 
 class AudioError(Exception):
@@ -80,6 +85,11 @@ class AudioPipeline:
         self._clip_t = [0.0] * 4
         self._loss_hist: deque[tuple[float, int, int]] = deque()
 
+        self.tracker = SourceTracker()
+        self._excluded: dict[int, str] = {}  # 0-based mic → why it is left out of direction finding
+        self._health_t = 0.0
+        self.gaps = 0
+
         self._events: deque[dict] = deque(maxlen=200)
         self._event_id = 0
         self._event_cv = threading.Condition(self._lock)
@@ -104,15 +114,9 @@ class AudioPipeline:
             if source == "sim":
                 src: AudioSource = SimAudioSource(cfg.mics_mm, cfg.array_yaw_deg, c=cfg.speed_of_sound)
                 port = "sim"
-            elif source == "tcp":
-                port = port or cfg.port
-                try:
-                    host, p = parse_tcp(port)
-                except ValueError:
-                    raise AudioError(f"bad audio port {port!r}: expected tcp://host:8901") from None
-                if not host or not 0 < p < 65536:
-                    raise AudioError(f"bad audio port {port!r}: expected tcp://host:8901")
-                src = TcpAudioSource(port)
+            elif source in ("tcp", "udp"):
+                port = self._port_for(source, port, cfg.port)
+                src = TcpAudioSource(port) if source == "tcp" else UdpAudioSource(port)
             else:
                 raise AudioError(f"unknown audio source {source!r}")
             self.source, self.source_kind, self.port, self.error = src, source, port, None
@@ -123,11 +127,39 @@ class AudioPipeline:
             self._levels = None
             self._clip_t = [0.0] * 4
             self._loss_hist.clear()
+            self._excluded = {}
+            self.gaps = 0
             self.cpu = {"frames": 0, "frame_s": 0.0, "events": 0, "event_s": 0.0}
             src.start(self._on_frame, self._on_exit)
         self._map_stop.clear()
         self._kick_map()
         self._log("info", f"audio connected: {source} {port}")
+
+    @staticmethod
+    def _port_for(source: str, port: str | None, configured: str) -> str:
+        """The explicit port, else the configured one; a configured address of the other
+        transport lends its host (config says udp://ip:8902, the operator picks tcp → ip:8901)."""
+        default = 8901 if source == "tcp" else 8902
+        want = f"{source}://"
+        if not port:
+            if configured.startswith(want):
+                port = configured
+            else:
+                other = "udp" if source == "tcp" else "tcp"
+                try:
+                    host, _ = parse_hostport(configured, other, 0)
+                except ValueError:
+                    host = ""
+                port = f"{want}{host}:{default}"
+        elif "://" in port and not port.startswith(want):
+            raise AudioError(f"source {source!r} needs a {want}host:{default} port, got {port!r}")
+        try:
+            host, p = parse_hostport(port, source, default)
+        except ValueError:
+            raise AudioError(f"bad audio port {port!r}: expected {want}host:{default}") from None
+        if not host or not 0 < p < 65536:
+            raise AudioError(f"bad audio port {port!r}: expected {want}host:{default}")
+        return port if port.startswith(want) else f"{want}{host}:{p}"
 
     def disconnect(self) -> None:
         with self._lock:
@@ -171,9 +203,12 @@ class AudioPipeline:
                 self._preview = np.zeros((0, f.channels), np.int16)
                 self._dc = None
             self.shift = f.shift
-            if f.lost_before:
-                # the samples on either side of a gap are not contiguous: no window may span it
-                self.detector.reset_stream()
+            # the samples on either side of a gap are not contiguous: no window may span it. A
+            # frame with an I2S read timeout may itself be partly padding, so it is not analysed.
+            i2s_timeout = bool(f.flags & FLAG_I2S_TIMEOUT)
+            if f.lost_before or f.flags & FLAG_DROPPED or i2s_timeout:
+                self.detector.reset_stream(f.lost_before * f.n)
+                self.gaps += 1
             raw = f.samples
             peak = np.max(np.abs(raw.astype(np.int32)), axis=0)
             for c in np.nonzero(peak >= CLIP_LEVEL)[0][:4]:
@@ -187,7 +222,14 @@ class AudioPipeline:
             x = np.clip(np.rint(raw - self._dc), -32768, 32767).astype(np.int16)
             span = max(1, f.rate // 10)
             self._preview = np.concatenate([self._preview, x])[-span:]
-            dets = self.detector.feed(x, f.t_us, f.t)
+            if i2s_timeout:
+                self.detector.reset_stream(f.n)
+                dets = []
+            else:
+                dets = self.detector.feed(x, f.t_us, f.t)
+            if f.t - self._health_t >= HEALTH_PERIOD_S:
+                self._health_t = f.t
+                self._check_channels()
             now = time.monotonic()
             if self._preview.shape[0] >= span and now - self._last_preview >= PREVIEW_PERIOD_S:
                 self._last_preview = now
@@ -199,6 +241,33 @@ class AudioPipeline:
         with self._lock:
             self.cpu["frames"] += 1
             self.cpu["frame_s"] += time.perf_counter() - t0
+
+    def _check_channels(self) -> None:
+        """Noisy-mic exclusion (docs/api.md §5.6). Called under `_lock`, about once a second."""
+        det = self.detector
+        if det is None or not det.warmed_up or det.channels != 4:
+            return
+        fl = np.asarray(dbfs(np.sqrt(det.floor)), float)
+        new: dict[int, str] = {}
+        excess = {}
+        for i in range(4):
+            others = float(np.median(np.delete(fl, i)))
+            excess[i] = (fl[i] - others, others)
+        # exclude the worst offender only: three mics are the minimum for a 2-D bearing
+        worst = max(range(4), key=lambda i: excess[i][0])
+        e, others = excess[worst]
+        limit = INCLUDE_DB if worst in self._excluded else EXCLUDE_DB
+        if e > limit:
+            new[worst] = f"noise floor {fl[worst]:.1f} dBFS, {e:.1f} dB above the others' median ({others:.1f})"
+        if set(new) != set(self._excluded):
+            for i in set(new) - set(self._excluded):
+                self._log("warn", f"audio: mic {i + 1} excluded from direction finding: {new[i]}")
+            for i in set(self._excluded) - set(new):
+                self._log("info", f"audio: mic {i + 1} back in direction finding")
+            mask = np.ones(4, bool)
+            mask[list(new)] = False
+            det.set_sum_mask(mask)
+        self._excluded = new
 
     def _encode_preview(self, t: float) -> bytes:
         p = self._preview
@@ -216,11 +285,18 @@ class AudioPipeline:
     def _handle(self, d: Detection) -> None:
         t0 = time.perf_counter()
         cfg = self.config.audio
+        with self._lock:
+            use = [m for m in range(d.window.shape[1]) if m not in self._excluded]
         loc = acoustic.locate(
             d.window, d.rate, cfg.mics_mm, cfg.speed_of_sound, cfg.array_yaw_deg, cfg.calibrated, d.snr_db,
-            offsets_us=cfg.channel_offsets_us,
+            offsets_us=cfg.channel_offsets_us, use_mics=use,
         )
         reasons = list(loc["reasons"])
+        if d.cut_ms > 0:
+            reasons.append(f"window cut short by a frame gap ({d.cut_ms:.0f} ms missing)")
+        if d.pre_cut and loc["bearing_deg"] is not None:
+            loc["confidence"] = round(loc["confidence"] * PRE_CUT_CONFIDENCE, 3)
+            reasons.append("onset right after a frame gap: the start of the sound may be missing")
         findings, map_t = self._cached_map()
         cands: list[dict] = []
         if loc["bearing_deg"] is not None:
@@ -251,19 +327,43 @@ class AudioPipeline:
                 "coherence": loc.get("coherence"),
                 "residual_us": loc.get("residual_us"),
                 "map_age_s": None if map_t is None else round(time.time() - map_t, 1),
+                "mics_used": loc.get("mics_used"),
             }
+            src = self.tracker.add(ev)
+            ev["noise"] = src is None
+            ev["source_id"] = None if src is None else src.id
             self._events.append(ev)
             self._last_event_mono = time.monotonic()
             self.cpu["events"] += 1
             self.cpu["event_s"] += time.perf_counter() - t0
             self._event_cv.notify_all()
-        msg = {"type": "audio_event", **ev}
+        self._send({"type": "audio_event", **ev})
+        if not ev["noise"]:
+            self._publish_sources()
+
+    def _send(self, msg: dict) -> None:
         if self._publish_json:
             self._publish_json(msg)
         else:
             import json
 
             self._publish(json.dumps(msg))
+
+    # ---- sources -------------------------------------------------------------------------------
+    def sources(self) -> dict:
+        findings, _ = self._cached_map()
+        with self._lock:
+            return self.tracker.snapshot(findings)
+
+    def _publish_sources(self) -> None:
+        self._send({"type": "audio_sources", "active": self.sources()["active"]})
+
+    def tick(self, now: float | None = None) -> None:
+        """About once a second (the rig's alarm ticker): retire quiet sources."""
+        with self._lock:
+            changed = self.tracker.expire(time.time() if now is None else now)
+        if changed:
+            self._publish_sources()
 
     # ---- events ----------------------------------------------------------------------------------
     def events(self, limit: int = 50) -> list[dict]:
@@ -273,6 +373,8 @@ class AudioPipeline:
     def clear(self) -> None:
         with self._lock:
             self._events.clear()
+            self.tracker.clear()
+        self._publish_sources()
 
     def emit_sim(self, bearing_deg: float, elevation_deg: float = 0.0, snr_db: float = 20.0, kind: str = "knock", timeout: float = 2.0) -> dict:
         """Inject a source into the simulator and wait for the detector's verdict: the AudioEvent
@@ -388,7 +490,17 @@ class AudioPipeline:
                 "calibrated": bool(cfg.calibrated),
                 "array_yaw_deg": cfg.array_yaw_deg,
                 "note": None if cfg.calibrated else "uncalibrated: channel order, array yaw to the LiDAR 0° mark and capture offsets not yet verified by a click test",
+                # TCP is capped by the ESP32's 5,744 B send window per round trip; UDP is not
+                "transport_note": "TCP over Wi-Fi is window-limited and drops frames on a slow link: udp://<scanner>:8902 is recommended" if self.source_kind == "tcp" else None,
                 "events": len(self._events),
+                "sources_active": len(self.tracker.active),
+                "excluded_mics": [{"mic": i + 1, "reason": r} for i, r in sorted(self._excluded.items())],
+                "gaps": self.gaps,
+                "suppressed": None if self.detector is None else {
+                    "echoes": self.detector.suppressed_echoes,
+                    "duplicates": self.detector.duplicates,
+                    "cut_by_gap": self.detector.dropped_by_gap,
+                },
                 "error": src.error,
                 "map_age_s": None if self._map_t is None else round(now - self._map_t, 1),
                 "map_cost_ms": None if self._map_cost_s is None else round(self._map_cost_s * 1000, 1),

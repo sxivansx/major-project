@@ -1,6 +1,7 @@
 """AudioSource: anything that produces 4-channel audio frames on a background thread.
 
-TcpAudioSource talks to the ESP32-S3 on port 8901 (docs/api.md §5.2); SimAudioSource renders the
+UdpAudioSource subscribes to the ESP32-S3's 'AUD2' datagrams on UDP 8902 (preferred over Wi-Fi),
+TcpAudioSource reads 'AUD1' frames on TCP 8901 (docs/api.md §5.2); SimAudioSource renders the
 same frames from a model of the array, with sources injected on demand.
 """
 
@@ -17,7 +18,7 @@ from typing import Callable
 import numpy as np
 
 from .acoustic import PAIRS, PAIR_KEYS, bearing_to_array
-from .audio_wire import FLAG_DROPPED, FLAG_I2S_TIMEOUT, AudioFrame, FrameReader, SeqTracker
+from .audio_wire import FLAG_DROPPED, FLAG_I2S_TIMEOUT, Aud2Reassembler, AudioFrame, FrameReader, SeqTracker
 
 log = logging.getLogger(__name__)
 
@@ -86,12 +87,22 @@ class AudioSource(ABC):
                 self._on_exit(self.error)
 
 
-def parse_tcp(port: str, default_port: int = 8901) -> tuple[str, int]:
-    hp = port[len("tcp://") :] if port.startswith("tcp://") else port
+def parse_hostport(port: str, scheme: str, default_port: int) -> tuple[str, int]:
+    """`scheme://host[:port]` (or bare `host[:port]`) → (host, port). ValueError on a bad port."""
+    prefix = f"{scheme}://"
+    hp = port[len(prefix) :] if port.startswith(prefix) else port
     host, _, p = hp.rpartition(":")
     if not host:
         return hp, default_port
     return host, int(p)
+
+
+def parse_tcp(port: str, default_port: int = 8901) -> tuple[str, int]:
+    return parse_hostport(port, "tcp", default_port)
+
+
+def parse_udp(port: str, default_port: int = 8902) -> tuple[str, int]:
+    return parse_hostport(port, "udp", default_port)
 
 
 class TcpAudioSource(AudioSource):
@@ -175,6 +186,126 @@ class TcpAudioSource(AudioSource):
             backoff = min(backoff * 2, self.max_backoff_s)
 
 
+class UdpAudioSource(AudioSource):
+    """Subscriber for the ESP32's 'AUD2' datagrams (docs/api.md §5.2, UDP 8902).
+
+    Binds an ephemeral local port and sends `AUDS <port>` to the scanner every `resubscribe_s`
+    (the scanner forgets a subscriber ~5 s after its last AUDS, and only the newest one gets
+    audio). Datagrams arrive from an ephemeral source port, so only the sender's IP is checked.
+    Parts are reassembled per seq with a few frames of reordering; an incomplete frame is a seq
+    gap, counted as lost exactly like TCP. After `stall_s` of silence the link is reported down,
+    the reassembler is flushed, and subscribing simply continues: there is no connection to
+    re-establish. `AUDX` on stop releases the scanner at once instead of after its 5 s timeout."""
+
+    name = "udp"
+
+    def __init__(self, port: str, resubscribe_s: float = 1.0, stall_s: float = 2.0, reorder: int = 5):
+        super().__init__()
+        self.host, self.port = parse_udp(port)
+        self.resubscribe_s = resubscribe_s
+        self.stall_s = stall_s
+        self.reasm = Aud2Reassembler(reorder=reorder)
+        self.subscriptions = 0
+        self.foreign = 0  # datagrams from anyone but the scanner
+        self.local_port: int | None = None
+        self._sock: socket.socket | None = None
+        self._addr: tuple[str, int] | None = None
+
+    def _close(self) -> None:
+        s, self._sock = self._sock, None
+        if s is not None:
+            if self._addr is not None:
+                try:
+                    s.sendto(b"AUDX", self._addr)
+                except OSError:
+                    pass
+            s.close()
+        self.link_up = False
+
+    def _resolve(self) -> tuple[str, int] | None:
+        try:
+            info = socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_DGRAM)
+            return info[0][4][0], self.port
+        except OSError as e:
+            self.error = f"cannot resolve {self.host}: {e}"
+            return None
+
+    def _deliver_all(self, frames: list[AudioFrame]) -> None:
+        for f in frames:
+            self._deliver(f)
+
+    def _run(self) -> None:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)  # ~2.5 s of 48 kHz audio
+            s.bind(("0.0.0.0", 0))
+            s.settimeout(0.05)
+            self._sock = s
+            self.local_port = s.getsockname()[1]
+            sub = f"AUDS {self.local_port}".encode()
+            last_sub = -1e9
+            last_data: float | None = None
+            while not self._stop.is_set():
+                now = time.monotonic()
+                if self._addr is None:
+                    self._addr = self._resolve()
+                if self._addr is not None and now - last_sub >= self.resubscribe_s:
+                    last_sub = now
+                    try:
+                        s.sendto(sub, self._addr)
+                        self.subscriptions += 1
+                    except OSError as e:  # no route yet (Wi-Fi down): keep trying
+                        self.error = f"subscribe to {self.host}:{self.port} failed: {e}"
+                try:
+                    data, addr = s.recvfrom(2048)
+                except socket.timeout:
+                    data = None
+                except OSError as e:
+                    if self._stop.is_set():
+                        return
+                    self.error = str(e)
+                    data = None
+                now = time.monotonic()
+                if data is not None:
+                    if self._addr is None or addr[0] != self._addr[0]:
+                        self.foreign += 1
+                    else:
+                        if not self.link_up:
+                            self.link_up, self.error = True, None
+                            self.connects += 1
+                            log.info("audio datagrams from %s (local port %d)", self.host, self.local_port)
+                        last_data = now
+                        frames = self.reasm.feed(data, now)
+                        t = time.time()
+                        for f in frames:
+                            f.t = t
+                        self._deliver_all(frames)
+                else:
+                    frames = self.reasm.poll(now)
+                    t = time.time()
+                    for f in frames:
+                        f.t = t
+                    self._deliver_all(frames)
+                if self.link_up and last_data is not None and now - last_data > self.stall_s:
+                    # deliver what was complete, then start clean: frames after the silence are a
+                    # new stretch, and the jump in seq across it is downtime, not loss
+                    t = time.time()
+                    tail = self.reasm.poll(now, flush=True)
+                    for f in tail:
+                        f.t = t
+                    self._deliver_all(tail)
+                    self.reasm.reset()
+                    self.link_up = False
+                    self.error = f"no audio datagrams for {self.stall_s:.0f} s (still subscribing to {self.host}:{self.port})"
+                    log.warning("audio: %s", self.error)
+        except Exception as e:  # noqa: BLE001
+            if not self._stop.is_set():
+                self.error = f"{type(e).__name__}: {e}"
+                log.exception("udp audio source crashed")
+        finally:
+            self._close()
+
+
 # ---- simulator --------------------------------------------------------------------------------
 def _knock(rate: int, rng: np.random.Generator) -> np.ndarray:
     """A knock on rubble: a short broadband click exciting a few damped resonances."""
@@ -235,6 +366,9 @@ def synth_event(
     rng: np.random.Generator | None = None,
     gain_mismatch_db: float = 0.5,
     channel_delays_us=None,
+    rt60_s: float = 0.24,
+    tail_gain: float = 0.35,
+    late_echo: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, dict]:
     """The source's contribution at each mic (float, LSB; no background noise), and the truth.
 
@@ -242,7 +376,9 @@ def synth_event(
     delayed per mic by the exact far-field geometry. With `reverb`, six early reflections arrive
     from other directions 1.5–15 ms later, each with its own exact per-mic delays, followed by a
     diffuse tail that is independent at every mic, so GCC sees competing coherent peaks and a
-    decorrelated floor rather than one clean delay. `channel_delays_us` adds a fixed capture
+    decorrelated floor rather than one clean delay. `rt60_s` / `tail_gain` set how long and how
+    loud that tail rings (a concrete room: 0.6–1 s, gain ~1); `late_echo` = (delay_s, gain) adds
+    one more discrete reflection from another direction. `channel_delays_us` adds a fixed capture
     delay per channel (an I2S slot skew), which the truth's tdoas do *not* include. SNR is the loudest 2.5 ms block of the
     direct path over the noise power, the definition the Detector reports."""
     rng = rng or np.random.default_rng()
@@ -257,7 +393,9 @@ def synth_event(
     d = plane_wave_delays(mics_m, az, elevation_deg, c)
     cap = np.zeros(4) if channel_delays_us is None else np.asarray(channel_delays_us, float) * 1e-6
     lead = 0.001  # every mic's delay is positive, and the onset is not at sample 0
-    tail_s = 0.25 if reverb else 0.0
+    tail_s = min(1.5, max(0.25, 1.2 * rt60_s)) if reverb else 0.0
+    if late_echo:
+        tail_s = max(tail_s, late_echo[0] + 0.1)
     nfft = 1 << int(math.ceil(math.log2(src.shape[0] + int((lead + 0.02 + tail_s) * rate))))
     f = np.fft.rfftfreq(nfft, 1.0 / rate)
     S = np.fft.rfft(src, nfft)
@@ -277,11 +415,15 @@ def synth_event(
                 out[:, m] += g * _delayed(S * lp, f, lead + extra + dr[m] - d.min() + cap[m], nfft)
         nt = int(tail_s * rate)
         tt = np.arange(nt) / rate
-        env = np.exp(-tt / 0.035) * (tt > 0.003)
+        env = np.exp(-tt * 6.91 / rt60_s) * (tt > 0.003)  # amplitude falls 60 dB in rt60
         for m in range(4):
             h = rng.normal(0, 1, nt) * env
-            h *= 0.35 / (np.linalg.norm(h) or 1.0)
+            h *= tail_gain / (np.linalg.norm(h) or 1.0)
             out[:, m] += _delayed(S * lp * np.fft.rfft(h, nfft), f, cap[m], nfft)
+    if late_echo:
+        de = plane_wave_delays(mics_m, rng.uniform(0, 360), rng.uniform(-20, 40), c)
+        for m in range(4):
+            out[:, m] += late_echo[1] * _delayed(S, f, lead + late_echo[0] + de[m] - d.min() + cap[m], nfft)
     out *= gains[None, :]
     end = src.shape[0] + int((lead + 0.002 + tail_s + cap.max()) * rate)
     t_rel = d - d.min()
@@ -315,13 +457,20 @@ class SimAudioSource(AudioSource):
         seed: int | None = None,
         shift: int = 14,
         channel_delays_us=None,
+        channel_noise_dbfs=None,
+        channel_dc=None,
     ):
         super().__init__()
         self.mics_mm = np.asarray(true_mics_mm if true_mics_mm is not None else mics_mm, float)
         self.array_yaw_deg = array_yaw_deg
         self.rate = rate
         self.frame_n = frame_n
-        self.noise_rms = 32768.0 * 10 ** (noise_dbfs / 20)
+        # per-channel self-noise (the real ch3 hisses ~15 dB above the others) and DC offset;
+        # SNR is stated against the typical (median) mic
+        nd = np.full(4, noise_dbfs, float) if channel_noise_dbfs is None else np.asarray(channel_noise_dbfs, float)
+        self.channel_noise_rms = 32767.0 * 10 ** (nd / 20)
+        self.noise_rms = float(np.median(self.channel_noise_rms))
+        self.channel_dc = np.zeros(4) if channel_dc is None else np.asarray(channel_dc, float)
         self.c = c
         self.reverb = reverb
         self.shift = shift
@@ -335,13 +484,13 @@ class SimAudioSource(AudioSource):
         self._t0_us = 1_000_000
         self.link_up = True
 
-    def emit(self, bearing_deg: float, elevation_deg: float = 0.0, snr_db: float = 20.0, kind: str = "knock", reverb: bool | None = None, delay_ms: float = 20.0) -> dict:
+    def emit(self, bearing_deg: float, elevation_deg: float = 0.0, snr_db: float = 20.0, kind: str = "knock", reverb: bool | None = None, delay_ms: float = 20.0, **room) -> dict:
         if kind not in ("knock", "voice"):
             raise ValueError("kind must be knock or voice")
         sig, truth = synth_event(
             self.mics_mm, bearing_deg, elevation_deg, snr_db, kind, self.rate, self.noise_rms,
             self.array_yaw_deg, self.c, self.reverb if reverb is None else reverb, self.rng,
-            channel_delays_us=self.channel_delays_us,
+            channel_delays_us=self.channel_delays_us, **room,
         )
         with self._plock:
             # land at a random point inside a frame, so onsets are never frame-aligned
@@ -354,7 +503,7 @@ class SimAudioSource(AudioSource):
     def next_block(self) -> AudioFrame:
         """The next frame, without pacing: tests pull these synchronously."""
         n = self.frame_n
-        x = self.rng.normal(0.0, self.noise_rms, (n, 4))
+        x = self.rng.normal(0.0, 1.0, (n, 4)) * self.channel_noise_rms[None, :] + self.channel_dc[None, :]
         with self._plock:
             keep = []
             for at, sig in self._pending:
