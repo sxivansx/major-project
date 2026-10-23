@@ -15,6 +15,8 @@ import {
   coreNowSec,
   sourceBearingText,
   sourceKindWord,
+  speechAlarm,
+  speechBearingText,
   strongestSource,
   useAudio,
   useCoreNow,
@@ -68,6 +70,20 @@ export function OpsTab() {
   const soundNow = useCoreNow(!!latestSound && coreNowSec() - latestSound.t < RECENT_MAP_S + 2);
   const soundFresh = rawOnly ? !!latestSound && soundNow - latestSound.t < RECENT_MAP_S : sources.length > 0;
   const strongest = rawOnly ? null : strongestSource(sources);
+  // a spoken call for help: the core keeps alarm "speech_help" up for 30 s
+  const speech = useAudio((s) => s.speech);
+  const helpAlarm = speechAlarm(status);
+  const lastHelp = speech.find((e) => e.flagged) ?? null;
+  const helpNow = useCoreNow(!!lastHelp, 1000);
+  const helpRecent = !!lastHelp && helpNow - lastHelp.t < 30;
+  const banner =
+    helpAlarm || helpRecent ? (
+      <div className="danger-banner" role="alert">
+        {lastHelp && (helpRecent || helpAlarm)
+          ? `Call for help: "${lastHelp.transcript}" from ${speechBearingText(lastHelp)}${!lastHelp.calibrated && lastHelp.bearing_deg !== null ? " (uncalibrated)" : ""}`
+          : helpAlarm}
+      </div>
+    ) : null;
   const mapRef = useRef<OpsMapHandle>(null);
   const [scanErr, setScanErr] = useState<string | null>(null);
   const [scanBusy, setScanBusy] = useState(false);
@@ -77,7 +93,7 @@ export function OpsTab() {
     return startOpsAutoRefresh();
   }, []);
 
-  const alarms = status?.alarms ?? [];
+  const alarms = (status?.alarms ?? []).filter((a) => !a.toLowerCase().startsWith("call for help"));
   const connected = !!status?.lidar.connected && !!status?.servo.connected;
   const haveSession = !!status?.session_loaded;
   const scan = scanState(findings, status);
@@ -163,6 +179,7 @@ export function OpsTab() {
 
   return (
     <Shell
+      banner={banner}
       numbers={numbers}
       numbersDim={scan.scanning}
       main={

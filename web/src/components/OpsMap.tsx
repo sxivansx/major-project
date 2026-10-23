@@ -300,11 +300,13 @@ export const OpsMap = forwardRef<OpsMapHandle, Props>(function OpsMap({ scanning
   const setRouteMode = useOps((s) => s.setRouteMode);
   const simple = !advanced;
   const soundEvents = useAudio((s) => s.events);
+  const speech = useAudio((s) => s.speech);
   const sources = useAudio((s) => s.sources);
   const sourcesSupported = useAudio((s) => s.sourcesSupported);
   const highlightSourceId = useAudio((s) => s.highlightSourceId);
   const useRaw = sourcesSupported === false;
-  const soundActive = useRaw ? soundEvents.some((e) => e.bearing_deg !== null && coreNowSec() - e.t < RECENT_MAP_S) : sources.length > 0;
+  const helpActive = speech.some((e) => e.flagged && e.bearing_deg !== null && coreNowSec() - e.t < RECENT_MAP_S);
+  const soundActive = helpActive || (useRaw ? soundEvents.some((e) => e.bearing_deg !== null && coreNowSec() - e.t < RECENT_MAP_S) : sources.length > 0);
   const now = useCoreNow(soundActive, useRaw ? 1000 : 5000);
   const wedges: Wedge[] = useMemo(() => {
     if (!useRaw)
@@ -335,6 +337,11 @@ export const OpsMap = forwardRef<OpsMapHandle, Props>(function OpsMap({ scanning
         highlight: false,
       }));
   }, [useRaw, sources, soundEvents, now, highlightSourceId]);
+  // spoken calls for help of the last minute, drawn in the danger colour
+  const helpCalls = useMemo(
+    () => speech.filter((e) => e.flagged && e.bearing_deg !== null && now - e.t < RECENT_MAP_S && now - e.t > -5),
+    [speech, now],
+  );
 
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -547,6 +554,49 @@ export const OpsMap = forwardRef<OpsMapHandle, Props>(function OpsMap({ scanning
         }
       }
 
+      // calls for help: a wedge in the danger colour (± 2σ), newest labelled
+      if (helpCalls.length) {
+        const x0 = sx(0);
+        const y0 = sy(0);
+        const bb = boundsOf(layers, findings);
+        const rad = Math.max(3, Math.hypot(bb[0], bb[1]), Math.hypot(bb[0], bb[3]), Math.hypot(bb[2], bb[1]), Math.hypot(bb[2], bb[3])) * scale;
+        for (let i = helpCalls.length - 1; i >= 0; i--) {
+          const e = helpCalls[i];
+          const fade = Math.max(0.3, Math.min(1, 1 - (now - e.t) / RECENT_MAP_S));
+          const a = e.bearing_deg! * DEG;
+          const half = Math.min(180, Math.max(4, 2 * (e.bearing_sigma_deg ?? 10))) * DEG;
+          ctx.beginPath();
+          ctx.moveTo(x0, y0);
+          ctx.arc(x0, y0, rad, a - half, a + half);
+          ctx.closePath();
+          ctx.fillStyle = `rgba(224,96,96,${0.22 * fade})`;
+          ctx.fill();
+          ctx.strokeStyle = `rgba(224,96,96,${fade})`;
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.moveTo(x0, y0);
+          ctx.lineTo(x0 + Math.cos(a) * rad, y0 + Math.sin(a) * rad);
+          ctx.stroke();
+          ctx.lineWidth = 1;
+          // red dot where the wedge leaves the view (or at its end): a direction, not a position
+          {
+            const cosA = Math.cos(a);
+            const sinA = Math.sin(a);
+            const tx = cosA > 1e-6 ? (W - 10 - x0) / cosA : cosA < -1e-6 ? (10 - x0) / cosA : Infinity;
+            const ty = sinA > 1e-6 ? (H - 10 - y0) / sinA : sinA < -1e-6 ? (10 - y0) / sinA : Infinity;
+            const td = Math.max(12, Math.min(rad, tx, ty));
+            ctx.fillStyle = `rgba(224,96,96,${fade})`;
+            ctx.beginPath();
+            ctx.arc(x0 + cosA * td, y0 + sinA * td, i === 0 ? 6 : 4, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          if (i === 0) {
+            const lr = Math.min(rad * 0.45, Math.max(60, Math.min(W, H) * 0.25));
+            label(ctx, `call for help ${Math.round(e.bearing_deg!)}°${e.calibrated ? "" : " (uncalibrated)"}`, x0 + Math.cos(a) * lr + 6, y0 + Math.sin(a) * lr + 14, C.err);
+          }
+        }
+      }
+
       // findings outlines: voids always, the rest only in Advanced
       if (findings && (simple || toggles.findings)) {
         const kinds: FindingKind[] = simple ? ["voids"] : FINDING_KINDS;
@@ -667,7 +717,7 @@ export const OpsMap = forwardRef<OpsMapHandle, Props>(function OpsMap({ scanning
     const ro = new ResizeObserver(paint);
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [view, layers, findings, route, routeEnds, routeStart, selected, hover, toggles, simple, terrainImg, travImg, notSeenImg, shadowImg, blindImg, scanningText, wedges]);
+  }, [view, layers, findings, route, routeEnds, routeStart, selected, hover, toggles, simple, terrainImg, travImg, notSeenImg, shadowImg, blindImg, scanningText, wedges, helpCalls]);
 
   // ---- mouse ----
 

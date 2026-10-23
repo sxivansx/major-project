@@ -36,15 +36,18 @@ interface Props {
   main: ReactNode;
   side: ReactNode;
   actions: ReactNode;
+  actionsNote?: ReactNode; // one short line under the buttons
+  banner?: ReactNode; // a plain full-width line above the numbers (urgent things)
   advanced?: ReactNode; // omit for tabs without a drawer
   advancedOpen?: boolean;
   onAdvanced?: (open: boolean) => void;
 }
 
-export function Shell({ numbers, numbersDim, main, side, actions, advanced, advancedOpen, onAdvanced }: Props) {
+export function Shell({ numbers, numbersDim, main, side, actions, actionsNote, banner, advanced, advancedOpen, onAdvanced }: Props) {
   const hasDrawer = advanced !== undefined && onAdvanced !== undefined;
   return (
     <div className="ops-simple">
+      {banner}
       {numbers && numbers.length > 0 && (
         <div
           className={"bignums ops-top" + (numbersDim ? " scanning" : "")}
@@ -70,6 +73,7 @@ export function Shell({ numbers, numbersDim, main, side, actions, advanced, adva
             Advanced {advancedOpen ? "▾" : "▸"}
           </button>
         )}
+        {actionsNote && <div className="ops-actions-note">{actionsNote}</div>}
       </div>
       {hasDrawer && advancedOpen && <div className="ops-advanced">{advanced}</div>}
     </div>
