@@ -207,6 +207,19 @@ A void is a cell whose returns have a vertical gap ≥ 0.4 m starting within 0.1
 
 All three consume the findings JSON, never points. Two keys in `core/.env` (see `core/.env.example`) or the environment: `TYPESAFE_API_KEY` sends Jev questions straight to `https://api.typesafe.ai/v1/systemone` (model `jev-latest`, cost computed from input tokens at $0.042/M); `OPENROUTER_API_KEY` is used for Gemini (`google/gemini-3.5-flash`) and, if there is no TypeSafe key, for Jev via OpenRouter's Decisions API (`typesafe/jev-1.14`). `/ai/status` reports each half (`decisions`, `prose`) separately; `available` means decisions work. Without decisions, `/ai/triage` and `/ai/ask` return 503; without prose, `/ai/sitrep` and the `answer` in `/ai/ask` are deterministic templates (`"model": "template"`). Upstream errors surface as 502 with the provider's message. Override models with `OBSLAM_DECISIONS_MODEL` / `OBSLAM_PROSE_MODEL`. Measured costs (22 Oct 2026): a full Jev triage ≈ $0.00016, an intent decision ≈ $0.00013, a Gemini answer or SITREP ≈ $0.001 with `reasoning.effort: minimal` (the model's reasoning cannot be disabled; "low" costs 5× more and can truncate). Guardrails: every ranking `why` is a template over the finding's own numbers (Jev cannot write text); prose that mentions a survivor, victim or body is discarded for the template; the UI labels all of it as assistant output.
 
+### 3.5 Handheld room map (`core/obslam/slam2d.py`, `room.py`)
+
+Works with the tilt level (φ 0°) and the scanner carried by hand: each rotation is matched to the map built so far and the floor plan fills in. Map frame: origin where mapping started, +x = LiDAR 0° mark at the start, +y to its left, metres; `theta_deg` CCW from map +x.
+
+- Matching: 0.5° sectors (median range, 0.15–12 m) scored against a chamfer distance field (distance to the nearest wall cell, clipped 0.3 m fine / 0.6 m coarse at 2× cells). Brute force ±0.2 m / ±8° on the coarse field around a constant-velocity guess, then Gauss-Newton (Huber) on the fine one. ~20 ms per rotation on an M-series Mac.
+- Map: log-odds occupancy (hit +0.9, free −0.4 along the beam, clamp ±4), 5 cm cells, 24 m square around the start. Updated from keyframes only (moved ≥ 10 cm or turned ≥ 4°).
+- Lost: fewer than 35 % of points within 10 cm of a wall → the scan is not used, `lost: true`, and the next scans search ±0.6 m / ±30° around the last good pose.
+
+REST: `POST /api/room/start {"cell_m": 0.05}` (resets; 400 without a LiDAR), `POST /api/room/stop` (keeps the map), `GET /api/room` → room JSON + `grid {w,h,cell,x0,y0}`, `GET /api/room/grid` → the kind-6 frame.
+
+WS binary kind 6 (≤ 2 Hz while mapping): `<BBHIIfff` kind=6, pad, pad, w, h, cell, x0, y0 (24 bytes), then u8 × w·h row-major, row = y: 0 unknown, 1 free, 2 occupied (cropped to what has been seen + 0.5 m).
+WS JSON (≤ 5 Hz): `{"type": "room", state: "idle"|"mapping", pose {x, y, theta_deg}, path [[x, y]] (≤ 500), keyframes, scans, area_m2, match {rms_mm, inliers, ok}, lost, note}`.
+
 ## 4. Session on disk
 
 `sessions/<id>/meta.json` (SessionMeta) + `sessions/<id>/sweeps.npz` with equal-length arrays:
