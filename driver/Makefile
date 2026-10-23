@@ -1,4 +1,4 @@
-# major-project LiDAR bridge. See README.md.
+# On-board SLAM LiDAR bridge. See README.md.
 #
 #   make          build build/s2bridge (builds the vendored SDK first if needed)
 #   make sdk      build only the Slamtec SDK static library

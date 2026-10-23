@@ -1,6 +1,6 @@
-# major-project (OBSLAM payload tool)
+# major-project: On-board SLAM for GPS-Denied Indoor Search
 
-Bench tool for the OBSLAM search-and-rescue payload: an RPLIDAR S3 on a servo-tilted cradle and a 4-mic array on an ESP32-S3, streamed over Wi-Fi to a laptop that maps the room, finds sound directions, flags spoken calls for help and shows it all on a dashboard.
+Bench tool for On-board SLAM, a search-and-rescue payload: an RPLIDAR S3 on a servo-tilted cradle and a 4-mic array on an ESP32-S3, streamed over Wi-Fi to a laptop that maps the room, finds sound directions, flags spoken calls for help and shows it all on a dashboard.
 
 ```
 driver/    C++ bridge over Slamtec rplidar_sdk (S-series scan format, 1 Mbaud, serial or TCP)

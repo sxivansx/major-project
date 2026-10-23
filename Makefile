@@ -1,4 +1,4 @@
-# major-project: one entry point for the whole tool.
+# On-board SLAM: one entry point for the whole tool.
 #
 #   make setup    first time: SDK + bridge, python venv, web deps
 #   make dev      server (:8000) + vite dev (:5173) side by side; Ctrl-C stops both
