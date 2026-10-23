@@ -212,3 +212,85 @@ All three consume the findings JSON, never points. Two keys in `core/.env` (see 
 `sessions/<id>/meta.json` (SessionMeta) + `sessions/<id>/sweeps.npz` with equal-length arrays:
 `step u16, phi f32 (commanded tilt, deg), phi_meas f32 (encoder tilt, deg, NaN without an encoder), theta f32 (deg, native clockwise), range f32 (m), quality u8, t f64`.
 Points are derived on load from the mount config in `meta.json`, using `phi_meas` where finite and `phi` otherwise, so re-calibrating `h` or a centre never needs a re-scan.
+
+## 5. Acoustic layer (four INMP441 microphones)
+
+Goal: detect impulsive sounds (knocks, shouts, tapping) and estimate their **direction** from the scanner, with a confidence, then intersect that bearing with the LiDAR findings to list where a person could be. The array is 2–4 cm across, so it gives **direction only, never distance**; a position needs bearings from two scanner stations.
+
+### 5.1 Hardware (pin_connection.md §3)
+
+| Signal | GPIO | Notes |
+|---|---|---|
+| BCLK (all mics) | 4 | driven by I2S0 (master) |
+| WS (all mics) | 5 | driven by I2S0 (master) |
+| SD mics 1 + 2 | 7 | I2S0 RX data. Mic 1 L/R=GND → left slot, mic 2 L/R=3V3 → right slot |
+| SD mics 3 + 4 | 6 | I2S1 RX data (slave, clocked from the same BCLK/WS). Mic 3 left, mic 4 right |
+
+Both I2S units sample on the same BCLK/WS edges, so all four channels are simultaneous; I2S1 is started before I2S0 so both begin on the same WS frame.
+
+### 5.2 Firmware → core: TCP 8901 audio stream
+
+One client at a time (a new one replaces the old). Streaming runs only while a client is connected. Little-endian frames:
+
+```
+u32  magic        0x31445541  ('AUD1')
+u32  seq          increments per frame; a gap = frames lost
+u64  t_us         esp_timer_get_time() at the first sample of this frame
+u32  sample_rate  48000
+u16  channels     4   (order: mic1, mic2, mic3, mic4)
+u16  n            samples per channel in this frame (480 = 10 ms)
+u16  shift        right shift applied to the 32-bit I2S word (default 14)
+u16  flags        bit0 = I2S read timeout in this frame, bit1 = samples dropped before this frame
+n × 4 × i16       interleaved: s0m1 s0m2 s0m3 s0m4 s1m1 ...
+```
+
+384 KB/s at 48 kHz. Tilt protocol additions (port 8900 / USB): `A` → `AUDIO rate=48000 shift=14 clients=<0|1> frames=<n> dropped=<n> i2s_timeouts=<n>`; `A shift <8..16>` → `OK` (gain; lower shift = louder, clips sooner).
+
+### 5.3 Core
+
+Config (`/api/config`, new `audio` block):
+```json
+"audio": {
+  "port": "tcp://192.168.1.49:8901",
+  "mics_mm": [[0,0,0],[0,0,0],[0,0,0],[0,0,0]],   // sound-port positions in the array frame, mm
+  "array_yaw_deg": 0,          // array x-axis relative to the base frame x (lidar 0° mark), deg CCW
+  "calibrated": false,
+  "trigger_db": 12,            // spike = short-term energy this many dB above the running noise floor
+  "min_gap_ms": 300,           // dead time between events
+  "speed_of_sound": 343.0
+}
+```
+Endpoints:
+
+| Method | Path | Returns |
+|---|---|---|
+| POST | `/audio/connect` | `{"source":"tcp"\|"sim","port":"tcp://…:8901"}` → Status |
+| POST | `/audio/disconnect` | Status |
+| GET | `/audio/events?limit=50` | `[AudioEvent]`, newest first |
+| POST | `/audio/clear` | 204 |
+| POST | `/audio/sim/emit` | `{"bearing_deg":40,"elevation_deg":0,"snr_db":20}` (sim source only): inject a test knock |
+
+Status gains `"audio": {"connected", "source", "port", "rate", "frames", "lost_frames", "levels_dbfs":[4], "noise_dbfs":[4], "clipping":[4 bool], "calibrated"}`.
+
+AudioEvent:
+```json
+{"id": 12, "t": 1761250000.123, "t_us": 123456789,
+ "peak_dbfs": -18.2, "snr_db": 24.5,
+ "bearing_deg": 41.0,            // clockwise from base +x, like every bearing in findings; null if unresolved
+ "bearing_sigma_deg": 6.5,       // 1σ uncertainty
+ "elevation_deg": 12.0,          // |elevation|; a planar array cannot tell above from below
+ "confidence": 0.82,             // 0..1: GCC peak sharpness × pair consistency × SNR
+ "tdoa_us": {"12": -41.2, "13": 18.0, "14": -22.9, "23": 59.1, "24": 18.3, "34": -40.8},
+ "candidates": [ {"kind":"void","id":"V2","distance_m":1.8,"bearing_deg":43}, {"kind":"shadow","id":"S1", ...} ],
+ "label": "impulse"}
+```
+`candidates` = findings (voids first, then shadows / unknown regions, then obstacles' far sides) whose centroid lies inside bearing ± 2σ, nearest first. Never "person": these are places a source could be.
+
+### 5.4 WebSocket additions
+
+Binary, kind 5 **audio preview** (≤ 20 Hz while audio is connected): per channel min/max envelopes of the last 100 ms at 1 kHz, for the waveform view:
+```
+u8 kind=5, u8 channels=4, u16 n (points per channel, 100), u32 seq, f64 t_unix,
+4 × f32 level_dbfs (RMS of the block), then channels × n × (i16 min, i16 max)
+```
+Text: `{"type":"audio_event", ...AudioEvent}` on every detection.
