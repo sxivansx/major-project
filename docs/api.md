@@ -362,3 +362,13 @@ Tracking (core): events with `confidence ≥ 0.1` and a bearing join the active 
 ```
 
 Channel health: a mic whose noise floor is > 12 dB above the median of the others is **excluded** from direction finding (its pairs dropped; 3 mics still give a 2-D bearing). `status.audio.excluded_mics` lists them with a reason; events carry `mics_used`.
+
+### 5.7 Spoken calls for help (`core/obslam/speech.py`)
+
+Speech is cut out of the same 4-channel stream by an energy gate (pre-emphasised mean of the used mics, floor = 20th percentile of 10 ms block energy over 3 s; opens 9 dB above it for 40 ms, closes after 450 ms below +5 dB; ≥ 180 ms of voice, ≤ 6 s), so knocks and claps are never sent. Each segment:
+
+1. **Direction:** the loudest 1 s goes through the event DOA (`locate`, same geometry, offsets and excluded mics).
+2. **Transcript:** Sarvam `POST https://api.sarvam.ai/speech-to-text`, `saaras:v4`, `language_code=unknown`, keyterms biased toward the help words. Key `SARVAM_API_KEY` in `core/.env`. At most 12 calls a minute.
+3. **Flag:** exact words (`save me/us`, `help`, `bachao`/बचाओ, `madad`/मदद, `kaapadi`/ಕಾಪಾಡಿ, `sahaya`/ಸಹಾಯ), sound-alikes of them (rough phonetic key + edit distance, first sound must agree: "safe me", "shave me", "bachaav", "hep me"), or Jev's `distress` probability ≥ 0.6.
+
+Out: WS `{"type": "speech_event", id, t, duration_s, transcript, language, matched[], sounds_like[{word, heard}], distress_p, flagged, bearing_deg, bearing_sigma_deg, confidence, calibrated, reasons[], stt_ms, jev_ms, jev_error, cost_usd}`; a flagged event also raises alarm `speech_help` for 30 s and a `warn` log line. `GET /api/audio/speech?limit=` → `{status, events}`; `POST /api/audio/speech {"enabled": bool}`; `POST /api/audio/speech/clear`. `status.audio.speech` carries the counters. On by default when the key is set: speech leaves the rig for Sarvam's API only while enabled.
