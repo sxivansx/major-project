@@ -134,7 +134,8 @@ class _TcpLine:
             except socket.timeout:
                 return b""
             if not chunk:
-                return b""
+                # end of stream: the ESP32 closed the socket (reboot, or another client took it)
+                raise ConnectionResetError("tilt link closed by the ESP32")
             self._buf += chunk
         line, _, self._buf = self._buf.partition(b"\n")
         return line + b"\n"
@@ -218,16 +219,39 @@ class SerialTilt(TiltSource):
         assert self._ser
         return self._ser.readline().decode(errors="replace").strip()
 
+    def _exchange(self, line: str) -> str:
+        self._ser.reset_input_buffer()
+        self._ser.write((line.strip() + "\n").encode())
+        reply = self._readline()
+        # The firmware prints its banner once at boot (and on every new TCP
+        # client); skip it, and the NOTE / NET lines, if they arrive first.
+        while reply.startswith(("OBSLAM-TILT", "NOTE ", "NET ip=")) and line.strip() != "I":
+            reply = self._readline()
+        return reply
+
     def raw(self, line: str) -> str:
         if not self._ser:
             raise TiltError("servo not connected")
         with self._lock:
-            self._ser.reset_input_buffer()
-            self._ser.write((line.strip() + "\n").encode())
-            reply = self._readline()
-            # The firmware prints its banner once at boot; skip it if it arrives late.
-            while reply.startswith("OBSLAM-TILT") and line.strip() != "I":
-                reply = self._readline()
+            try:
+                reply = self._exchange(line)
+            except (OSError, serial.SerialException) as e:
+                # Over Wi-Fi the ESP32 closes our socket when it reboots or when another
+                # client takes its single tilt connection. Reopen once and repeat the
+                # command; it is the same command the operator just asked for.
+                if not self.port.startswith("tcp://"):
+                    raise TiltError(f"servo link lost: {e}") from e
+                log.warning("tilt link to %s lost (%s), reconnecting", self.port, e)
+                try:
+                    self._ser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ser = open_link(self.port, self.baud)
+                try:
+                    self._ser.readline()  # banner
+                    reply = self._exchange(line)
+                except OSError as e2:
+                    raise TiltError(f"servo link lost: {e2}") from e2
         if not reply:
             raise TiltError(f"no reply to {line.strip()!r}")
         return reply

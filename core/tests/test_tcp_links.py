@@ -22,9 +22,30 @@ class FakeTiltServer(threading.Thread):
         self.lines: list[str] = []
 
     def run(self):
-        conn, _ = self.srv.accept()
+        while True:  # like the ESP32: one client at a time, accepts the next after a drop
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return
+            self.conn = conn
+            self.serve(conn)
+
+    def drop(self):
+        """The ESP32 rebooting, or another client taking the tilt link."""
+        import socket as _s
+
+        self.conn.shutdown(_s.SHUT_RDWR)
+        self.conn.close()
+
+    def serve(self, conn):
         conn.sendall(b"OBSLAM-TILT v1\n")  # boot banner, like the serial firmware
         f = conn.makefile("rwb", buffering=0)
+        try:
+            lines = list(self._lines(f))
+        except (OSError, ValueError):
+            return
+
+    def _lines(self, f):
         for raw in f:
             line = raw.decode().strip()
             self.lines.append(line)
@@ -39,6 +60,7 @@ class FakeTiltServer(threading.Thread):
                 f.write(f"OK {self.angle + 0.3:.1f} settled=1\n".encode())
             else:
                 f.write(b"ERR unknown cmd\n")
+            yield line
 
 
 def test_tilt_over_tcp():
@@ -52,6 +74,19 @@ def test_tilt_over_tcp():
     assert t.raw("?").startswith("STATUS")
     t.disconnect()
     assert "T 120.00" in srv.lines
+
+
+def test_tilt_tcp_reconnects_after_the_esp_drops_the_socket():
+    srv = FakeTiltServer()
+    srv.start()
+    t = SerialTilt(f"tcp://127.0.0.1:{srv.port}")
+    t.connect()
+    srv.drop()
+    import time
+
+    time.sleep(0.1)
+    assert t.move(95.0) == 95.0  # transparently reconnected and repeated
+    assert srv.lines.count("T 95.00") == 1
 
 
 def test_tilt_tcp_unreachable_is_a_tilt_error():
