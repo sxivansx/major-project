@@ -67,7 +67,13 @@
 
 // ---------------------------------------------------------------- settings --
 
-#define SERVO_PIN        13        // GS2010MG signal (yellow/white)
+// Pin map follows the hardware team's pin_connection.md (24 Oct 2026) on the
+// ESP32-S3 N16R8 board: servo 17, LiDAR UART 13/14, I2C 11/12, mics on 4-7.
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define SERVO_PIN        17        // servo signal (pin_connection.md §6)
+#else
+#define SERVO_PIN        13        // plain ESP32 bench board
+#endif
 #define SERVO_HZ         50
 
 // ESP32Servo defaults to a 10-bit timer (19.5 us per tick, ~1.8 deg on a 180
@@ -104,8 +110,8 @@
 // default bus: GPIO 8/9 on the ESP32-S3 DevKitC-1, GPIO 21/22 on the plain
 // ESP32 DevKit (8/9 are flash pins there).
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-#define AS5600_SDA       8
-#define AS5600_SCL       9
+#define AS5600_SDA       11        // shared with the IMU (0x68); AS5600 is 0x36
+#define AS5600_SCL       12
 #else
 #define AS5600_SDA       21
 #define AS5600_SCL       22
@@ -140,8 +146,8 @@
 // USB socket, so there the pass-through is not built.
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 #define LIDAR_PASSTHROUGH   1
-#define LIDAR_RX_PIN        18      // LiDAR TX -> this pin
-#define LIDAR_TX_PIN        17      // LiDAR RX <- this pin
+#define LIDAR_RX_PIN        13      // LiDAR TX (yellow) -> this pin
+#define LIDAR_TX_PIN        14      // LiDAR RX (green) <- this pin
 #define LIDAR_BAUD          1000000
 #define LIDAR_RX_BUF        16384   // UART1 RX ring, ~160 ms of scan data
 #define LIDAR_TX_BUF        1024    // UART1 TX ring; SDK commands are a few bytes
@@ -579,14 +585,20 @@ static void fmtIp(char *buf, size_t n) {
 
 // Start (first call) or re-point (after `N`) the station. Non-blocking apart
 // from the driver's own disconnect of a live link (<= 1 s, only on `N`).
+// The board always runs its own access point (the hardware team's SLAM-Test,
+// 192.168.4.1) so a laptop can reach it in the field with no router; a network
+// stored with `N` is joined as well.
+#define AP_SSID   "SLAM-Test"
+#define AP_PASS   "SLAMtest24"
+
 static void netStart() {
-  if (!net_ssid[0]) return;
   if (!net_started) {
     WiFi.persistent(false);  // credentials live in our NVS namespace only
     WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) { net_got_ip = true; },
                  ARDUINO_EVENT_WIFI_STA_GOT_IP);
     WiFi.setHostname(NET_HOSTNAME);
-    WiFi.mode(WIFI_STA);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, AP_PASS);
     WiFi.setSleep(false);    // modem sleep adds 100+ ms latency spikes to the stream
     WiFi.setAutoReconnect(true);
     lidar_server.setNoDelay(true);
@@ -595,6 +607,7 @@ static void netStart() {
     tilt_server.begin();
     net_started = true;
   }
+  if (!net_ssid[0]) return;  // access point only
   WiFi.begin(net_ssid, net_pass[0] ? net_pass : nullptr);
   net_down_since = millis();
 }
@@ -648,7 +661,7 @@ static void netLoop() {
 
   // The driver's auto-reconnect covers ordinary drops; this covers the rest
   // (AP gone for a long time, auth failure that stopped retrying).
-  if (WiFi.status() == WL_CONNECTED) {
+  if (!net_ssid[0] || WiFi.status() == WL_CONNECTED) {
     net_down_since = millis();
   } else if (millis() - net_down_since > NET_RETRY_MS) {
     WiFi.reconnect();
@@ -817,8 +830,10 @@ static void loadCal() {
   cal.us_min  = prefs.getInt("us_min", DEF_US_MIN);
   cal.us_max  = prefs.getInt("us_max", DEF_US_MAX);
   cal.range   = prefs.getInt("range", DEF_RANGE);
-  cal.lim_min = prefs.getFloat("lim_min", 0.0f);
-  cal.lim_max = prefs.getFloat("lim_max", (float)cal.range);
+  // Until the installed 13 kg servo is identified, the hardware team allows only
+  // 1400-1600 us. With 500-2500 us over 180 deg that is 81-99 deg; `L` widens it.
+  cal.lim_min = prefs.getFloat("lim_min", 81.0f);
+  cal.lim_max = prefs.getFloat("lim_max", 99.0f);
   enc.zero    = prefs.getFloat("enc_zero", 0.0f);
   enc.dir     = prefs.getInt("enc_dir", 1);
   prefs.end();
@@ -1110,7 +1125,7 @@ void setup() {
 #endif
 #ifdef NET_ENABLED
   loadNet();
-  netStart();  // no-op until `N` has stored a network
+  netStart();  // always starts the SLAM-Test access point; joins a stored network too
 #endif
 
   delay(50);
@@ -1122,6 +1137,7 @@ void setup() {
   Serial.println("NOTE lidar pass-through not built: needs the ESP32-S3");
 #endif
 #ifdef NET_ENABLED
+  Serial.printf("NOTE wifi: access point %s at 192.168.4.1\n", AP_SSID);
   if (net_ssid[0]) Serial.printf("NOTE wifi: joining %s as %s.local\n", net_ssid, NET_HOSTNAME);
   else             Serial.println("NOTE wifi: no network stored, set one with N <ssid> <password>");
 #endif
