@@ -1127,6 +1127,10 @@ button.toggled {
   fill: var(--accent);
 }
 
+.compass-label.err {
+  fill: var(--err);
+}
+
 .audio-events td.cands {
   max-width: 120px;
   overflow: hidden;
@@ -1274,4 +1278,87 @@ button.linklike:hover:not(:disabled) {
 
 .wizard .btn-row > button {
   flex: none;
+}
+
+/* spoken calls for help (§5.7) */
+.danger-banner {
+  background: var(--err);
+  color: #1c1c1c;
+  font-weight: 600;
+  padding: 8px 12px;
+  border: 1px solid var(--err);
+  flex: none;
+}
+
+.speech-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.speech-row {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.speech-row.flagged {
+  border-color: var(--err);
+}
+
+.speech-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.speech-head .spacer {
+  flex: 1;
+}
+
+.speech-quote {
+  font-size: 13px;
+}
+
+.speech-help {
+  color: var(--err);
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+.speech-meta {
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* room map */
+.ops-actions-note {
+  flex-basis: 100%;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.ops-legend .sw-room-free {
+  background: var(--bg-hover);
+}
+
+.ops-legend .sw-room-occ {
+  background: var(--text);
+}
+
+.ops-legend .sw-room-edge {
+  background: var(--warn);
+}
+
+.room-next {
+  color: var(--warn);
+}
+
+.ops-legend .sw-room-path {
+  height: 2px;
+  border: 0;
+  background: var(--accent);
 }

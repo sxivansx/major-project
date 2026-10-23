@@ -6,7 +6,9 @@ import { clientLog, useStore, type Tab } from "./store/store";
 import { OpsTab } from "./components/OpsTab";
 import { LiveTab } from "./components/LiveTab";
 import { SoundTab } from "./components/SoundTab";
-import { loadAudioEvents, loadAudioSources } from "./store/audio";
+import { loadAudioEvents, loadAudioSources, loadSpeech } from "./store/audio";
+import { loadRoom } from "./store/room";
+import { RoomTab } from "./components/RoomTab";
 import { CloudTab } from "./components/CloudTab";
 import { SessionsPanel } from "./components/SessionsPanel";
 import { LogPanel } from "./components/LogPanel";
@@ -21,6 +23,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "live", label: "Live scan" },
   { id: "sound", label: "Sound" },
   { id: "cloud", label: "Point cloud and height map" },
+  { id: "room", label: "Room map" },
   { id: "sessions", label: "Sessions" },
   { id: "log", label: "Log" },
 ];
@@ -47,7 +50,9 @@ async function bootstrap() {
   if (status.status === "fulfilled" && status.value.audio) {
     void loadAudioEvents();
     void loadAudioSources();
+    if (status.value.audio.speech) void loadSpeech();
   }
+  void loadRoom();
 }
 
 export default function App() {
@@ -79,6 +84,7 @@ export default function App() {
           {tab === "live" && <LiveTab />}
           {tab === "sound" && <SoundTab />}
           {tab === "cloud" && <CloudTab />}
+          {tab === "room" && <RoomTab />}
           {tab === "sessions" && <SessionsPanel />}
           {tab === "log" && <LogPanel />}
         </div>
