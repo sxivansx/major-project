@@ -6,7 +6,7 @@ Pins on the ESP32-S3 follow the hardware team's `pin_connection.md` (ESP32-S3 WR
 
 On the ESP32-S3 it also relays the RPLIDAR: the LiDAR's 1 Mbaud UART is wired to the S3, and its bytes are passed through unchanged, both ways, to the Mac, either over the board's second USB socket or over Wi-Fi (TCP 8899). Slamtec's SDK in `s2bridge` decodes them on the Mac exactly as if the LiDAR were plugged in directly.
 
-On the ESP32-S3 it also captures four INMP441 microphones simultaneously at 48 kHz and streams them on TCP 8901 (see "Microphones" below).
+On the ESP32-S3 it also captures four INMP441 microphones simultaneously (24 kHz by default) and streams them on TCP 8901 (see "Microphones" below).
 
 The encoder is optional: the sketch probes for it at boot and a board without one behaves exactly like the earlier servo-only firmware (`enc=none`, no `meas` values).
 
@@ -283,7 +283,7 @@ STATUS angle=90 ... ip=192.168.x.y tcp_rx=... tcp_tx=... buf=.../1048576 audio=o
 
 ## Microphones (ESP32-S3)
 
-Four INMP441 MEMS microphones, captured **simultaneously** at 48 kHz and streamed on TCP **8901** in the `AUD1` frame format of `docs/api.md` §5.2. The array gives direction only; the core turns the stream into bearings.
+Four INMP441 MEMS microphones, captured **simultaneously** at 24 kHz (default; 16 or 48 kHz with `A rate`) and streamed on TCP **8901** in the `AUD1` frame format of `docs/api.md` §5.2. The array gives direction only; the core turns the stream into bearings.
 
 ### Wiring recap (pin_connection.md §3)
 
@@ -298,11 +298,12 @@ Four INMP441 MEMS microphones, captured **simultaneously** at 48 kHz and streame
 
 - Never join GPIO 6 and GPIO 7: each pair shares its SD wire through the opposite L/R straps.
 - **Do not fit the GPIO 4→8 / 5→9 jumpers.** GPIO 8 and 9 stay unconnected; the firmware sets them as plain inputs.
+- The firmware turns on the internal pull-down on both SD inputs (GPIO 6, 7), as the INMP441 datasheet asks for on SD. A mic that is not driving its slot then reads exactly 0 instead of floating.
 - Mic power comes from the board's 3V3, never 5 V. Keep the mic wires away from the servo and LiDAR motor leads.
 
 ### How all four are sampled together
 
-- **I2S0** is the master receiver: it drives BCLK (GPIO 4, 3.072 MHz) and WS (GPIO 5, 48 kHz) for all four mics and reads mics 1/2 on GPIO 7.
+- **I2S0** is the master receiver: it drives BCLK (GPIO 4, 64 × the sample rate: 1.536 MHz at 24 kHz) and WS (GPIO 5, the sample rate) for all four mics and reads mics 1/2 on GPIO 7.
 - **I2S1** is a slave receiver for mics 3/4 on GPIO 6. It must see the *same* BCLK/WS, but the wiring doc rules out the jumper wires that would bring them to I2S1's own pins. So the firmware routes the pads internally: after I2S0 has made GPIO 4/5 its outputs, it also turns on their input buffers (`gpio_input_enable`, the output stays routed) and connects them to I2S1's slave clock inputs through the GPIO matrix:
 
   ```c
@@ -318,26 +319,48 @@ What has **not** been verified yet (no hardware on the bench when this was writt
 
 ### Data path
 
-- A capture task on **core 0** (with Wi-Fi; `loop()` keeps core 1 to itself) reads 10 ms blocks (480 frames of 32-bit slots) from both units, converts to `int16` with the right shift (default 14, saturating), interleaves mic1..mic4, stamps the frame and puts it in a 2 s ring (200 frames, ~774 KB) in PSRAM. The DMA holds 60 ms per unit, so short Wi-Fi bursts on core 0 lose nothing.
+- A capture task on **core 0** (with Wi-Fi; `loop()` keeps core 1 to itself) reads 10 ms blocks (n = rate/100 frames of 32-bit slots: 240 at 24 kHz) from both units, converts to `int16` with the right shift (default 14, saturating), interleaves mic1..mic4, stamps the frame and puts it in a 200-frame ring (~774 KB) in PSRAM. The DMA holds 60 ms per unit, so short Wi-Fi bursts on core 0 lose nothing.
 - `t_us` is `esp_timer_get_time()` at the frame's first sample. It comes from a sample-counted timeline (10 000 µs per frame) anchored to `esp_timer` by the minimum over each second of (read time − elapsed audio), so it is jitter-free and follows any slow rate offset.
 - `loop()` copies the ring to the client with non-blocking `send()`, at most two frames per pass, exactly like the LiDAR path; servo, encoder and LiDAR work never wait on audio.
-- Frames only go into the ring while a client is connected. A new client starts on fresh audio (anything queued is skipped). If the client falls 2 s behind, new frames are dropped (`dropped` in `A` grows by 480 per frame), `seq` still advances, and the next frame sent has flag bit 1 set.
-- **Bandwidth:** 384 KB/s. lwIP's send buffer here is 5.7 KB, so the link needs a round trip under ~15 ms to keep up. That is normal on the board's own `SLAM-Test` AP or a quiet router; on a busy network, watch `dropped`.
+- Frames only go into the ring while a client is connected. A new client starts on fresh audio (anything queued is skipped).
+- **Latency cap.** If the link is slower than the stream, the backlog can never drain, and sending it oldest-first only hides the loss behind a growing delay (that is what the first hardware test showed: 39 % of real time received with no gaps, because the drops were all queued behind the 6 s capture window). So when more than 30 frames (300 ms) are waiting, the sender skips to the newest 5. The skipped samples are added to `dropped` in `A`, `seq` jumps, and the next frame sent has flag bit 1 set. The checker's `lag=` column shows how far behind real time the stream is; it should stay under ~300 ms.
+- **Bandwidth.** Each frame is 28 + n × 8 bytes: **128 KB/s at 16 kHz, 193 KB/s at 24 kHz, 384 KB/s at 48 kHz**. TCP on the ESP32 can only have lwIP's 5,744-byte send buffer in flight, so the ceiling is about 5,744 B ÷ round-trip time: ~570 KB/s at 10 ms, ~190 KB/s at 30 ms, ~150 KB/s at 38 ms (what the first test on a home router implies). So 24 kHz needs a round trip under ~30 ms. The board's own `SLAM-Test` AP is usually fine; on a slow router use `A rate 16000`. The buffer size is compiled into the Arduino core's prebuilt lwIP and cannot be raised from the sketch.
+- **Not built yet: a UDP path.** It would remove that window ceiling: the same `AUD1` frames, split into 5 ms datagrams under the 1,472-byte MTU payload, sent with non-blocking `sendto()` to an address the Mac subscribes with (`A udp <port>` on 8900, renewed every few seconds or it stops). No acknowledgements means no RTT limit (only Wi-Fi airtime, several MB/s); a lost datagram is just a `seq` gap, which the core already handles.
 
 ### Commands (USB or TCP 8900)
 
 ```
 A
-AUDIO rate=48000 shift=14 clients=0 frames=1234 dropped=0 i2s_timeouts=0
+AUDIO rate=24000 shift=14 clients=0 frames=1234 dropped=0 i2s_timeouts=0
 A shift 12
 OK
+A rate 16000
+OK
+A raw
+RAW rate=16000 n=160 fmt=philips data_bits=32 slot_bits=32 mask=both ws_width=32 ... | i2s0.L(mic1) first=... min=... max=... nz=... ones=... toggle=... | ...
 ```
 
-- `frames`: frames captured since boot (100 per second, whether or not a client is connected).
-- `dropped`: samples per channel lost because the client fell behind (480 per lost frame).
+- `frames`: frames captured since boot (100 per second at any rate, whether or not a client is connected).
+- `dropped`: samples per channel not delivered because the client fell behind (n per skipped frame).
+- `A rate <16000|24000|48000>` sets the sample rate and saves it in NVS (`aud_rate`). The capture task switches both units within ~20 ms; the new rate and n appear in the next frames' headers. All three keep the INMP441 inside its 0.5–3.2 MHz SCK range.
 - `i2s_timeouts`: reads that timed out (should stay 0; non-zero means a unit lost its clock).
 - `A shift <8..16>` sets the gain and is saved in NVS (`aud_shift`). The INMP441's 24-bit sample sits at the top of the 32-bit slot, so `shift 16` keeps exactly its top 16 bits (0 dBFS = the mic's full scale); each step lower doubles the level (+6 dB) and clips that much sooner. The default 14 is +12 dB, which suits a quiet room. The value applies from the next frame and is reported in every frame header.
 - `?` ends with `audio=on` when both units and the capture task are running, `audio=off` otherwise.
+
+### `A raw`: what the lines are really doing
+
+`A raw` grabs the next raw block (before the shift) and replies with one long line: the slot/clock configuration actually passed to the driver, a pad probe, and per unit and slot the first 8 raw 32-bit words in hex, `min`/`max`, `nz` (non-zero words), `ones` (words equal to 0xFFFFFFFF) and `toggle` (every bit that ever differed from the first word).
+
+| What you see | Meaning |
+|---|---|
+| `toggle=00000000`, `ones=n` | the data line sat high the whole block: nothing is driving it (before the pull-down fix this gave −1 after the shift = the −90.3 dBFS seen in the first test) |
+| `toggle=00000000`, `nz=0` | line held low: with the pull-down on, the mic is not driving its slot |
+| top bits toggling, low byte `00` | a working INMP441 (24 bits left-justified, low 8 bits zero) |
+| only one slot of a pair alive | wrong or floating L/R strap, or one dead mic |
+| `pads_hi` for bclk4/ws5 far from half the samples | the clock pad is not toggling at all (wiring, pin, or I2S0 not started) |
+| `pads_hi` for din7/din6 at 0 or 4000 | the data pad never changes during the probe |
+
+Expected configuration for the INMP441: `fmt=philips data_bits=32 slot_bits=32 mask=both ws_width=32 ws_pol=0 bit_shift=1 big_endian=0 lsb_first=0` (64 BCLK per frame, MSB one BCLK after the WS edge, left slot while WS is low).
 
 ### Checking the stream from the Mac
 
@@ -350,10 +373,10 @@ python3 firmware/tools/audio_check.py 192.168.4.1:8901 --seconds 10
 ```
 
 ```
- 100 fr  shift=14  m1  -52.3/ -38.0  m2  -51.8/ -37.1  m3  -52.9/ -39.4  m4  -52.0/ -36.6
+ 100 fr  24k  shift=14  lag=   41ms  m1  -52.3/ -38.0  m2  -51.8/ -37.1  m3  -52.9/ -39.4  m4  -52.0/ -36.6
 ```
 
-Ctrl-C prints totals (frames, lost frames and gaps, flag counts, resyncs, clipped samples per mic, received rate). Exit status is 0 only if frames arrived and no header was malformed. A tap near one mic should raise that channel most; a channel stuck at `-inf` is a dead mic or a wrong L/R strap (two mics on one slot).
+Ctrl-C prints totals (frames, lost frames and gaps, flag counts, resyncs, clipped samples per mic, received rate). Exit status is 0 only if frames arrived and no header was malformed. A tap near one mic should raise that channel most; a channel stuck at `-inf` is a mic that is not driving its slot (dead, unpowered, or a wrong L/R strap putting two mics on one slot). Each line also shows the rate and `lag=` (how far behind real time the stream is).
 
 ## Encoder setup
 

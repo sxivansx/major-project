@@ -28,7 +28,9 @@
 //                                             Serial each time the link gets an address.
 //
 //                                         ... buf=<used>/<cap> audio=<on|off>
-//   A                           -> AUDIO rate=48000 shift=<8..16> clients=<0|1> frames=<n> dropped=<n> i2s_timeouts=<n>
+//   A                           -> AUDIO rate=<16000|24000|48000> shift=<8..16> clients=<0|1> frames=<n> dropped=<n> i2s_timeouts=<n>
+//   A rate <16000|24000|48000>  -> OK         sample rate (default 24000), persisted
+//   A raw                       -> RAW ...    one-line dump of one raw block per unit/slot + applied config
 //   A shift <8..16>             -> OK         mic gain (right shift of the 32-bit slot), persisted
 //                                             (plain ESP32: ERR no audio)
 //
@@ -222,13 +224,15 @@
 #define AUD_DIN1_PIN        6       // I2S1: mic3 (left) + mic4 (right)
 #define AUD_SPARE0_PIN      8       // unconnected; kept a plain input (jumper target if JUMPERS=1)
 #define AUD_SPARE1_PIN      9
-#define AUD_RATE            48000
-#define AUD_N               480     // samples per channel per frame = 10 ms
+#define AUD_RATE_DEF        24000   // `A rate` picks 16000 / 24000 / 48000, persisted
+#define AUD_N_MAX           480     // samples per channel per frame at 48 kHz; n = rate/100 = 10 ms
 #define AUD_CH              4
 #define AUD_PORT            8901
 #define AUD_MAGIC           0x31445541u  // 'AUD1'
 #define AUD_HDR_BYTES       28
-#define AUD_FRAME_BYTES     (AUD_HDR_BYTES + AUD_N * AUD_CH * 2)  // 3868
+#define AUD_FRAME_BYTES     (AUD_HDR_BYTES + AUD_N_MAX * AUD_CH * 2)  // ring slot size, 3868
+#define AUD_HDR_OFF_FLAGS   26      // byte offset of `flags` in the header
+#define AUD_HDR_OFF_N       22      // byte offset of `n`
 #define AUD_RING_FRAMES     200     // 2 s in PSRAM (~774 KB)
 #define AUD_RING_FRAMES_SRAM 16     // 160 ms if there is no PSRAM
 #define AUD_SHIFT_DEF       14
@@ -240,6 +244,9 @@
 #define AUD_TASK_CORE       0       // with Wi-Fi; the loop() stays alone on core 1
 #define AUD_TASK_PRIO       10      // above idle work, below lwIP (18) and Wi-Fi (23)
 #define AUD_SEND_FRAMES     2       // frames pushed per service() call at most
+#define AUD_LAG_MAX_FRAMES  30      // backlog above this (300 ms) is skipped, counted and flagged
+#define AUD_LAG_KEEP_FRAMES 5       // ... down to the newest 50 ms
+#define AUD_RAW_WAIT_MS     500     // `A raw` waits this long for the capture task
 #endif
 
 // ------------------------------------------------------------------- state --
@@ -360,7 +367,17 @@ static volatile bool     aud_streaming = false;  // a client is connected: produ
 
 static volatile uint8_t  aud_shift        = AUD_SHIFT_DEF;
 static volatile uint32_t aud_frames       = 0;   // frames captured since boot
-static volatile uint32_t aud_dropped      = 0;   // samples per channel dropped (ring full)
+static volatile uint32_t aud_dropped      = 0;   // samples per channel dropped (backlog skipped / ring full); atomic adds
+static volatile uint32_t aud_rate         = AUD_RATE_DEF;  // running rate (capture task owns)
+static volatile uint32_t aud_rate_req     = AUD_RATE_DEF;  // requested by `A rate`
+
+// `A raw`: the capture task copies one raw block here on request.
+static int32_t           aud_raw_snap0[AUD_N_MAX * 2];
+static int32_t           aud_raw_snap1[AUD_N_MAX * 2];
+static volatile uint32_t aud_raw_n     = 0;
+static volatile bool     aud_raw_req   = false;
+static volatile bool     aud_raw_ready = false;
+static i2s_std_config_t  aud_cfg0, aud_cfg1;      // the configs actually passed to the driver
 static volatile uint32_t aud_timeouts     = 0;   // I2S reads that timed out
 
 static NetworkServer aud_server(AUD_PORT);
@@ -814,15 +831,19 @@ static void netLoop() {
 
 #ifdef AUDIO_ENABLED
 
-// Read exactly one 10 ms block (480 stereo frames of 32-bit slots) from a unit.
+static void service();  // defined below; `A raw` keeps everything running while it waits
+
+static inline uint32_t audN() { return aud_rate / 100; }  // samples per channel per 10 ms frame
+
+// Read exactly one 10 ms block (n stereo frames of 32-bit slots) from a unit.
 // False on timeout; the unread rest is zeroed so the frame stays well-formed.
-static bool audRead(i2s_chan_handle_t ch, int32_t *buf) {
-  const size_t want = AUD_N * 2 * sizeof(int32_t);
+static bool audRead(i2s_chan_handle_t ch, int32_t *buf, uint32_t n) {
+  const size_t want = (size_t)n * 2 * sizeof(int32_t);
   size_t got = 0;
   while (got < want) {
-    size_t n = 0;
-    esp_err_t e = i2s_channel_read(ch, (uint8_t *)buf + got, want - got, &n, AUD_READ_TIMEOUT_MS);
-    got += n;
+    size_t r = 0;
+    esp_err_t e = i2s_channel_read(ch, (uint8_t *)buf + got, want - got, &r, AUD_READ_TIMEOUT_MS);
+    got += r;
     if (e != ESP_OK) {
       memset((uint8_t *)buf + got, 0, want - got);
       return false;
@@ -838,11 +859,21 @@ static void audStart() {
   i2s_channel_enable(aud_rx0);
 }
 
-// After a timeout one unit may hold a partial block and the two would stay
-// offset; a restart puts them back on a common first frame.
-static void audRestart() {
+static void audStop() {
   i2s_channel_disable(aud_rx0);
   i2s_channel_disable(aud_rx1);
+}
+
+// Capture-task only: switch both units to aud_rate_req. Clocks can only be
+// changed while a channel is disabled; the restart re-aligns the two units.
+static void audApplyRate() {
+  uint32_t r = aud_rate_req;
+  audStop();
+  aud_cfg0.clk_cfg.sample_rate_hz = r;
+  aud_cfg1.clk_cfg.sample_rate_hz = r;
+  i2s_channel_reconfig_std_clock(aud_rx0, &aud_cfg0.clk_cfg);
+  i2s_channel_reconfig_std_clock(aud_rx1, &aud_cfg1.clk_cfg);
+  aud_rate = r;
   audStart();
 }
 
@@ -856,8 +887,8 @@ static inline int16_t audSat(int32_t v, uint8_t shift) {
 // Capture task (core 0). Blocks only in i2s_channel_read, which sleeps on the
 // DMA queue, so it costs the core almost nothing and never touches loop().
 static void audTask(void *) {
-  static int32_t raw0[AUD_N * 2];  // mic1, mic2 interleaved
-  static int32_t raw1[AUD_N * 2];  // mic3, mic4 interleaved
+  static int32_t raw0[AUD_N_MAX * 2];  // mic1, mic2 interleaved (L, R)
+  static int32_t raw1[AUD_N_MAX * 2];  // mic3, mic4 interleaved (L, R)
   uint32_t seq          = 0;
   bool     drop_pending = false;
   // Timestamps: a sample-counted timeline (10 000 us per frame) anchored to
@@ -869,13 +900,28 @@ static void audTask(void *) {
   uint32_t k = 0, win = 0;
 
   for (;;) {
+    if (aud_rate_req != aud_rate) {
+      audApplyRate();
+      anchor = win_min = INT64_MAX;  // new clock, new common start: new timeline
+      k = win = 0;
+    }
+    const uint32_t n = audN();
+
     uint16_t flags = 0;
-    bool ok0 = audRead(aud_rx0, raw0);
-    bool ok1 = audRead(aud_rx1, raw1);
+    bool ok0 = audRead(aud_rx0, raw0, n);
+    bool ok1 = audRead(aud_rx1, raw1, n);
     int64_t now = esp_timer_get_time();
     if (!ok0 || !ok1) {
       flags |= 1;
       aud_timeouts = aud_timeouts + 1;
+    }
+
+    if (aud_raw_req) {  // `A raw`: hand one untouched block to loop()
+      memcpy(aud_raw_snap0, raw0, (size_t)n * 2 * sizeof(int32_t));
+      memcpy(aud_raw_snap1, raw1, (size_t)n * 2 * sizeof(int32_t));
+      aud_raw_n   = n;
+      aud_raw_req = false;
+      __atomic_store_n(&aud_raw_ready, true, __ATOMIC_RELEASE);
     }
 
     int64_t est = now - (int64_t)(k + 1) * 10000;
@@ -893,7 +939,7 @@ static void audTask(void *) {
       uint32_t w = aud_w;
       uint32_t r = __atomic_load_n(&aud_r, __ATOMIC_ACQUIRE);
       if (w - r >= aud_ring_frames) {
-        aud_dropped  = aud_dropped + AUD_N;  // client too slow: this frame is lost
+        __atomic_fetch_add(&aud_dropped, n, __ATOMIC_RELAXED);  // consumer stalled outright
         drop_pending = true;
       } else {
         uint8_t *slot = aud_ring + (size_t)(w % aud_ring_frames) * AUD_FRAME_BYTES;
@@ -902,18 +948,18 @@ static void audTask(void *) {
         h.magic       = AUD_MAGIC;
         h.seq         = seq;
         h.t_us        = t_us;
-        h.sample_rate = AUD_RATE;
+        h.sample_rate = aud_rate;
         h.channels    = AUD_CH;
-        h.n           = AUD_N;
+        h.n           = (uint16_t)n;
         h.shift       = sh;
         h.flags       = (uint16_t)(flags | (drop_pending ? 2 : 0));
         memcpy(slot, &h, sizeof(h));
         int16_t *pcm = (int16_t *)(slot + AUD_HDR_BYTES);
-        for (int i = 0; i < AUD_N; i++) {
-          pcm[4 * i + 0] = audSat(raw0[2 * i + 0], sh);  // mic1
-          pcm[4 * i + 1] = audSat(raw0[2 * i + 1], sh);  // mic2
-          pcm[4 * i + 2] = audSat(raw1[2 * i + 0], sh);  // mic3
-          pcm[4 * i + 3] = audSat(raw1[2 * i + 1], sh);  // mic4
+        for (uint32_t i = 0; i < n; i++) {
+          pcm[4 * i + 0] = audSat(raw0[2 * i + 0], sh);  // mic1 (I2S0 left)
+          pcm[4 * i + 1] = audSat(raw0[2 * i + 1], sh);  // mic2 (I2S0 right)
+          pcm[4 * i + 2] = audSat(raw1[2 * i + 0], sh);  // mic3 (I2S1 left)
+          pcm[4 * i + 3] = audSat(raw1[2 * i + 1], sh);  // mic4 (I2S1 right)
         }
         drop_pending = false;
         __atomic_store_n(&aud_w, w + 1, __ATOMIC_RELEASE);
@@ -925,8 +971,10 @@ static void audTask(void *) {
     aud_frames = aud_frames + 1;
 
     if (flags & 1) {
-      audRestart();
-      anchor = win_min = INT64_MAX;  // new common start: new timeline
+      // One unit may hold a partial block; restart both on a common frame.
+      audStop();
+      audStart();
+      anchor = win_min = INT64_MAX;
       k = win = 0;
     }
   }
@@ -944,9 +992,13 @@ static esp_err_t audNewUnits() {
   return e;
 }
 
+// INMP441: 64 BCLK per frame (two 32-bit slots), 24-bit two's complement data
+// MSB first, starting one BCLK after the WS edge (= Philips), left slot while
+// WS is low, L/R pin picks the slot. That is exactly the IDF Philips default
+// with 32-bit data: ws_width 32, ws_pol low-first, bit_shift 1, both slots.
 static i2s_std_config_t audStdConfig(int bclk, int ws, int din) {
   i2s_std_config_t cfg = {};
-  cfg.clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUD_RATE);
+  cfg.clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(aud_rate);
   cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
   cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
   cfg.gpio_cfg.bclk = (gpio_num_t)bclk;
@@ -956,13 +1008,28 @@ static i2s_std_config_t audStdConfig(int bclk, int ws, int din) {
   return cfg;
 }
 
+// The INMP441 tri-states SD outside its own slot and whenever it is not
+// running; the datasheet asks for a pull-down on SD. With the pads' default
+// state a dead/undriven line can read as all ones (every word 0xFFFFFFFF,
+// i.e. -1 after the shift). Pulled down, an undriven line reads exactly 0.
+static void audDinPulls() {
+  gpio_pullup_dis((gpio_num_t)AUD_DIN0_PIN);
+  gpio_pulldown_en((gpio_num_t)AUD_DIN0_PIN);
+  gpio_pullup_dis((gpio_num_t)AUD_DIN1_PIN);
+  gpio_pulldown_en((gpio_num_t)AUD_DIN1_PIN);
+}
+
 // Bring up both units and the capture task. False (audio=off) on any failure;
 // the rest of the firmware is unaffected.
 static bool audInit() {
   prefs.begin(NVS_NAMESPACE, true);
-  uint8_t sh = prefs.getUChar("aud_shift", AUD_SHIFT_DEF);
+  uint8_t  sh   = prefs.getUChar("aud_shift", AUD_SHIFT_DEF);
+  uint32_t rate = prefs.getUInt("aud_rate", AUD_RATE_DEF);
   prefs.end();
   aud_shift = (sh >= AUD_SHIFT_MIN && sh <= AUD_SHIFT_MAX) ? sh : AUD_SHIFT_DEF;
+  if (rate != 16000 && rate != 24000 && rate != 48000) rate = AUD_RATE_DEF;
+  aud_rate     = rate;
+  aud_rate_req = rate;
 
   if (psramFound()) {
     aud_ring = (uint8_t *)ps_malloc((size_t)AUD_RING_FRAMES * AUD_FRAME_BYTES);
@@ -978,23 +1045,23 @@ static bool audInit() {
 
   // I2S1 (slave) first: its init must not touch pads 4/5, which I2S0 owns.
 #if AUDIO_CLOCK_JUMPERS
-  i2s_std_config_t s1 = audStdConfig(AUD_SPARE0_PIN, AUD_SPARE1_PIN, AUD_DIN1_PIN);
-  if (i2s_channel_init_std_mode(aud_rx1, &s1) != ESP_OK) return false;
+  aud_cfg1 = audStdConfig(AUD_SPARE0_PIN, AUD_SPARE1_PIN, AUD_DIN1_PIN);
+  if (i2s_channel_init_std_mode(aud_rx1, &aud_cfg1) != ESP_OK) return false;
   aud_clock_desc = "jumpers GPIO4->8, GPIO5->9";
 #else
-  i2s_std_config_t s1 = audStdConfig(I2S_GPIO_UNUSED, I2S_GPIO_UNUSED, AUD_DIN1_PIN);
-  if (i2s_channel_init_std_mode(aud_rx1, &s1) != ESP_OK) {
+  aud_cfg1 = audStdConfig(I2S_GPIO_UNUSED, I2S_GPIO_UNUSED, AUD_DIN1_PIN);
+  if (i2s_channel_init_std_mode(aud_rx1, &aud_cfg1) != ESP_OK) {
     // A driver that insists on clock pins gets the unconnected GPIO8/9: as
     // slave clocks they are only inputs, and the matrix routing below
     // replaces them as I2S1's clock source anyway.
-    s1 = audStdConfig(AUD_SPARE0_PIN, AUD_SPARE1_PIN, AUD_DIN1_PIN);
-    if (i2s_channel_init_std_mode(aud_rx1, &s1) != ESP_OK) return false;
+    aud_cfg1 = audStdConfig(AUD_SPARE0_PIN, AUD_SPARE1_PIN, AUD_DIN1_PIN);
+    if (i2s_channel_init_std_mode(aud_rx1, &aud_cfg1) != ESP_OK) return false;
   }
   aud_clock_desc = "GPIO matrix from pads 4/5";
 #endif
 
-  i2s_std_config_t s0 = audStdConfig(AUD_BCLK_PIN, AUD_WS_PIN, AUD_DIN0_PIN);
-  if (i2s_channel_init_std_mode(aud_rx0, &s0) != ESP_OK) return false;
+  aud_cfg0 = audStdConfig(AUD_BCLK_PIN, AUD_WS_PIN, AUD_DIN0_PIN);
+  if (i2s_channel_init_std_mode(aud_rx0, &aud_cfg0) != ESP_OK) return false;
 
 #if !AUDIO_CLOCK_JUMPERS
   // I2S0 has made pads 4/5 outputs (I2S0I_BCK_OUT / I2S0I_WS_OUT). Turn their
@@ -1006,6 +1073,7 @@ static bool audInit() {
   esp_rom_gpio_connect_in_signal(AUD_BCLK_PIN, I2S1I_BCK_IN_IDX, false);
   esp_rom_gpio_connect_in_signal(AUD_WS_PIN, I2S1I_WS_IN_IDX, false);
 #endif
+  audDinPulls();
 
   audStart();
   if (xTaskCreatePinnedToCore(audTask, "audio", 4096, nullptr, AUD_TASK_PRIO, nullptr,
@@ -1015,11 +1083,107 @@ static bool audInit() {
   return true;
 }
 
+// ---- `A raw` diagnostics
+
+// Sample the four I2S pads' input levels in a tight loop: a clock pad should be
+// high about half the time, a data pad that never leaves 0 or n is not driven.
+static void audPadProbe(uint32_t *hi_bclk, uint32_t *hi_ws, uint32_t *hi_d0, uint32_t *hi_d1, uint32_t n) {
+  *hi_bclk = *hi_ws = *hi_d0 = *hi_d1 = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    *hi_bclk += (uint32_t)gpio_get_level((gpio_num_t)AUD_BCLK_PIN);
+    *hi_ws   += (uint32_t)gpio_get_level((gpio_num_t)AUD_WS_PIN);
+    *hi_d0   += (uint32_t)gpio_get_level((gpio_num_t)AUD_DIN0_PIN);
+    *hi_d1   += (uint32_t)gpio_get_level((gpio_num_t)AUD_DIN1_PIN);
+  }
+}
+
+// One slot (0 = left, 1 = right) of a stereo block: first 8 words, then
+// min/max, how many are non-zero, how many are all-ones (-1), and which bits
+// ever differ from the first word (0 = the line never changed).
+static void audPrintSlot(const char *name, const int32_t *buf, uint32_t n, int slot) {
+  int32_t  mn = INT32_MAX, mx = INT32_MIN;
+  uint32_t nz = 0, ones = 0, tog = 0;
+  uint32_t w0 = (uint32_t)buf[slot];
+  for (uint32_t i = 0; i < n; i++) {
+    int32_t v = buf[2 * i + slot];
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    if (v != 0) nz++;
+    if (v == -1) ones++;
+    tog |= (uint32_t)v ^ w0;
+  }
+  out->printf(" | %s first=", name);
+  for (uint32_t i = 0; i < 8 && i < n; i++) {
+    out->printf(i ? ",%08lx" : "%08lx", (unsigned long)(uint32_t)buf[2 * i + slot]);
+  }
+  out->printf(" min=%ld max=%ld nz=%lu ones=%lu toggle=%08lx", (long)mn, (long)mx,
+              (unsigned long)nz, (unsigned long)ones, (unsigned long)tog);
+}
+
+static const char *audSlotMaskStr(i2s_std_slot_mask_t m) {
+  return m == I2S_STD_SLOT_BOTH ? "both" : m == I2S_STD_SLOT_LEFT ? "left" : "right";
+}
+
+// `A raw`: one reply line. Waits (servicing everything else) for the capture
+// task to hand over the next block.
+static void audReplyRaw() {
+  if (!aud_on) {
+    out->println("ERR audio off");
+    return;
+  }
+  aud_raw_ready = false;
+  aud_raw_req   = true;
+  unsigned long t0 = millis();
+  while (!__atomic_load_n(&aud_raw_ready, __ATOMIC_ACQUIRE)) {
+    if (millis() - t0 > AUD_RAW_WAIT_MS) {
+      aud_raw_req = false;
+      out->println("ERR raw timeout (capture task not reading)");
+      return;
+    }
+    service();
+    delay(1);
+  }
+  const uint32_t n = aud_raw_n;
+
+  uint32_t pb, pw, p0, p1;
+  const uint32_t probes = 4000;
+  audPadProbe(&pb, &pw, &p0, &p1, probes);
+
+  const i2s_std_slot_config_t &sc = aud_cfg0.slot_cfg;
+  out->printf("RAW rate=%lu n=%lu fmt=%s data_bits=%d slot_bits=%d mask=%s ws_width=%lu ws_pol=%d"
+              " bit_shift=%d left_align=%d big_endian=%d lsb_first=%d mclk_x=%d slave_bclk_div=%lu",
+              (unsigned long)aud_rate, (unsigned long)n,
+              sc.bit_shift ? "philips" : "msb", (int)sc.data_bit_width,
+              sc.slot_bit_width ? (int)sc.slot_bit_width : (int)sc.data_bit_width,
+              audSlotMaskStr(sc.slot_mask), (unsigned long)sc.ws_width, sc.ws_pol ? 1 : 0,
+              sc.bit_shift ? 1 : 0, sc.left_align ? 1 : 0, sc.big_endian ? 1 : 0,
+              sc.bit_order_lsb ? 1 : 0, (int)aud_cfg0.clk_cfg.mclk_multiple,
+              (unsigned long)aud_cfg1.clk_cfg.bclk_div);
+  out->printf(" pins=i2s0(bclk%d,ws%d,din%d) i2s1(din%d,clk=%s) shift=%u",
+              AUD_BCLK_PIN, AUD_WS_PIN, AUD_DIN0_PIN, AUD_DIN1_PIN, aud_clock_desc, (unsigned)aud_shift);
+  out->printf(" pads_hi/%lu=bclk%d:%lu,ws%d:%lu,din%d:%lu,din%d:%lu", (unsigned long)probes,
+              AUD_BCLK_PIN, (unsigned long)pb, AUD_WS_PIN, (unsigned long)pw,
+              AUD_DIN0_PIN, (unsigned long)p0, AUD_DIN1_PIN, (unsigned long)p1);
+  audPrintSlot("i2s0.L(mic1)", aud_raw_snap0, n, 0);
+  audPrintSlot("i2s0.R(mic2)", aud_raw_snap0, n, 1);
+  audPrintSlot("i2s1.L(mic3)", aud_raw_snap1, n, 0);
+  audPrintSlot("i2s1.R(mic4)", aud_raw_snap1, n, 1);
+  out->println();
+}
+
+// ---- TCP 8901
+
 static void audClientDrop() {
   __atomic_store_n(&aud_streaming, false, __ATOMIC_RELEASE);
   aud_client.stop();
   aud_client_on = false;
   aud_send_off  = 0;
+}
+
+static inline uint32_t audSlotLen(const uint8_t *slot) {
+  uint16_t n;
+  memcpy(&n, slot + AUD_HDR_OFF_N, sizeof(n));
+  return AUD_HDR_BYTES + (uint32_t)n * AUD_CH * 2;
 }
 
 // Accepts, connection checks and the ring -> socket copy. Runs from service(),
@@ -1049,12 +1213,31 @@ static void audService() {
 
   for (int i = 0; i < AUD_SEND_FRAMES; i++) {
     uint32_t r = aud_r;
-    if (r == __atomic_load_n(&aud_w, __ATOMIC_ACQUIRE)) return;  // nothing queued
+    uint32_t w = __atomic_load_n(&aud_w, __ATOMIC_ACQUIRE);
+    if (r == w) return;  // nothing queued
+
+    // Latency cap. If the link is slower than the stream the backlog can never
+    // drain, and sending it oldest-first would hide the loss behind a growing
+    // delay. Between frames, skip to the newest few, count the skipped samples
+    // and flag the first frame sent after the hole (bit1); seq shows the gap.
+    if (aud_send_off == 0 && w - r > AUD_LAG_MAX_FRAMES) {
+      uint32_t skip = (w - r) - AUD_LAG_KEEP_FRAMES;
+      __atomic_fetch_add(&aud_dropped, skip * audN(), __ATOMIC_RELAXED);
+      r += skip;
+      __atomic_store_n(&aud_r, r, __ATOMIC_RELEASE);
+      uint8_t *s = aud_ring + (size_t)(r % aud_ring_frames) * AUD_FRAME_BYTES;
+      uint16_t fl;
+      memcpy(&fl, s + AUD_HDR_OFF_FLAGS, sizeof(fl));
+      fl |= 2;
+      memcpy(s + AUD_HDR_OFF_FLAGS, &fl, sizeof(fl));
+    }
+
     const uint8_t *slot = aud_ring + (size_t)(r % aud_ring_frames) * AUD_FRAME_BYTES;
-    int s = send(aud_client.fd(), slot + aud_send_off, AUD_FRAME_BYTES - aud_send_off, MSG_DONTWAIT);
+    const uint32_t len  = audSlotLen(slot);
+    int s = send(aud_client.fd(), slot + aud_send_off, len - aud_send_off, MSG_DONTWAIT);
     if (s > 0) {
       aud_send_off += (size_t)s;
-      if (aud_send_off < AUD_FRAME_BYTES) return;  // socket full mid-frame: resume next call
+      if (aud_send_off < len) return;  // socket full mid-frame: resume next call
       aud_send_off = 0;
       __atomic_store_n(&aud_r, r + 1, __ATOMIC_RELEASE);
     } else {
@@ -1454,10 +1637,27 @@ static void handleLine(char *s) {
     case 'A': {
 #ifdef AUDIO_ENABLED
       if (nargs == 0) {
-        out->printf("AUDIO rate=%d shift=%u clients=%d frames=%lu dropped=%lu i2s_timeouts=%lu\n",
-                    AUD_RATE, (unsigned)aud_shift, aud_client_on ? 1 : 0,
+        out->printf("AUDIO rate=%lu shift=%u clients=%d frames=%lu dropped=%lu i2s_timeouts=%lu\n",
+                    (unsigned long)aud_rate, (unsigned)aud_shift, aud_client_on ? 1 : 0,
                     (unsigned long)aud_frames, (unsigned long)aud_dropped,
                     (unsigned long)aud_timeouts);
+        return;
+      }
+      if (nargs == 1 && strcasecmp(argv[1], "raw") == 0) {
+        audReplyRaw();
+        return;
+      }
+      if (nargs == 2 && strcasecmp(argv[1], "rate") == 0) {
+        // A rate <16000|24000|48000>: applied by the capture task within ~20 ms.
+        if (!parseF(argv[2], &a) || (a != 16000.0f && a != 24000.0f && a != 48000.0f)) {
+          replyBadArgs();
+          return;
+        }
+        aud_rate_req = (uint32_t)a;
+        prefs.begin(NVS_NAMESPACE, false);
+        prefs.putUInt("aud_rate", aud_rate_req);
+        prefs.end();
+        out->println("OK");
         return;
       }
       // A shift <8..16>: whole numbers only. Lower = louder, clips sooner.
@@ -1571,8 +1771,8 @@ void setup() {
   else             Serial.println("NOTE wifi: no network stored, set one with N <ssid> <password>");
 #endif
 #ifdef AUDIO_ENABLED
-  if (aud_on) Serial.printf("NOTE audio: 4 mics at %d Hz on TCP %d, I2S1 clock via %s, ring %lu frames\n",
-                            AUD_RATE, AUD_PORT, aud_clock_desc, (unsigned long)aud_ring_frames);
+  if (aud_on) Serial.printf("NOTE audio: 4 mics at %lu Hz on TCP %d, I2S1 clock via %s, ring %lu frames\n",
+                            (unsigned long)aud_rate, AUD_PORT, aud_clock_desc, (unsigned long)aud_ring_frames);
   else        Serial.println("NOTE audio: init failed, audio=off");
 #else
   Serial.println("NOTE audio not built: needs the ESP32-S3");

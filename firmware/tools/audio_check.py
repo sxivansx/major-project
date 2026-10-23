@@ -94,8 +94,10 @@ def main():
 
     wav = None
     tot = dict(frames=0, samples=0, lost=0, gaps=0, resyncs=0, skipped=0, bad=0,
-               timeout_flags=0, drop_flags=0, clipped=[0, 0, 0, 0])
+               timeout_flags=0, drop_flags=0, rate_changes=0, clipped=[0, 0, 0, 0])
     first_t_us = last_t_us = None
+    first_frame_wall = None
+    lag_ms = 0.0
     first_wall = time.monotonic()
     last_seq = None
     rate = None
@@ -130,7 +132,7 @@ def main():
             if rate is None:
                 rate = srate
             elif srate != rate:
-                tot["bad"] += 1
+                tot["rate_changes"] += 1  # `A rate` while streaming: legal, but the WAV keeps the first rate
                 print(f"sample rate changed {rate} -> {srate} at seq {seq}", file=sys.stderr)
                 rate = srate
 
@@ -148,7 +150,11 @@ def main():
             acc_flags |= flags
             if first_t_us is None:
                 first_t_us = t_us
+                first_frame_wall = time.monotonic()
             last_t_us = t_us
+            # How far this frame is behind real time, relative to the first one:
+            # grows without bound if the scanner sends slower than it captures.
+            lag_ms = ((time.monotonic() - first_frame_wall) - (t_us - first_t_us) / 1e6) * 1000
 
             pcm = array.array("h")
             pcm.frombytes(payload)
@@ -186,7 +192,8 @@ def main():
                     extra.append("I2S-TIMEOUT")
                 if acc_flags & 2:
                     extra.append("DROPPED")
-                print(f"{acc_frames:4d} fr  shift={shift}  {cols}  {' '.join(extra)}", flush=True)
+                print(f"{acc_frames:4d} fr  {rate // 1000}k  shift={shift}  lag={lag_ms:5.0f}ms  {cols}  {' '.join(extra)}",
+                      flush=True)
                 acc_sq = [0.0] * 4
                 acc_pk = [0] * 4
                 acc_n = acc_frames = acc_lost = acc_flags = 0
@@ -208,7 +215,8 @@ def main():
     print(f"frames            {tot['frames']}  ({tot['samples']} samples per channel)")
     print(f"lost frames       {tot['lost']} in {tot['gaps']} seq gaps")
     print(f"flags             i2s-timeout {tot['timeout_flags']}, dropped-before {tot['drop_flags']}")
-    print(f"bad headers       {tot['bad']}, magic resyncs {tot['resyncs']} ({tot['skipped']} bytes skipped)")
+    print(f"bad headers       {tot['bad']}, magic resyncs {tot['resyncs']} ({tot['skipped']} bytes skipped)"
+          f", rate changes {tot['rate_changes']}")
     print(f"clipped samples   " + "  ".join(f"m{c + 1} {tot['clipped'][c]}" for c in range(4)))
     if rate and wall > 0:
         print(f"wall time         {wall:.1f} s, received {tot['samples'] / wall:.0f} samples/s/ch "
