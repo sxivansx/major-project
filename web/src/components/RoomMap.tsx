@@ -246,6 +246,32 @@ export const RoomMap = forwardRef<RoomMapHandle, { grid: RoomFrame | null; room:
         ctx.fillText(`next scan here · ${st.distance_m.toFixed(1)} m`, sx(st.x) + 14, sy(st.y) + 4);
       }
 
+      // stations (station mode): numbered circles with a heading tick along theta
+      for (const st of room?.stations ?? []) {
+        const x0 = sx(st.x);
+        const y0 = sy(st.y);
+        const a = (-st.theta_deg * Math.PI) / 180;
+        ctx.strokeStyle = accent;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x0 + Math.cos(a) * 10, y0 + Math.sin(a) * 10);
+        ctx.lineTo(x0 + Math.cos(a) * 20, y0 + Math.sin(a) * 20);
+        ctx.stroke();
+        ctx.fillStyle = bg;
+        ctx.beginPath();
+        ctx.arc(x0, y0, 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.lineWidth = 1;
+        ctx.fillStyle = accent;
+        ctx.font = "bold 11px ui-monospace, Menlo, monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(String(st.n), x0, y0 + 0.5);
+        ctx.textBaseline = "alphabetic";
+      }
+
       // pose: a triangle pointing along theta (CCW from +x, +y drawn up)
       const p = room?.pose;
       if (p) {

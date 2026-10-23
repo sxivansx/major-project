@@ -5,7 +5,9 @@
 // +y to its left), so here the map frame is the room frame shifted to the start.
 
 import { encodeRoom } from "../src/api/frames";
-import type { RoomState } from "../src/api/types";
+import type { RoomState, RoomStation, RoomStationResult } from "../src/api/types";
+
+export class RoomConflict extends Error {}
 import { BOXES, ROOM } from "./world";
 
 const TICK_MS = 200; // "room" messages at 5 Hz
@@ -80,6 +82,12 @@ export class RoomSim {
   private timer: ReturnType<typeof setInterval> | null = null;
   private tick = 0;
   private next: RoomState["next"] = null;
+  private mode: "walk" | "stations" = "walk";
+  private planned = 6;
+  private stations: RoomStation[] = [];
+  private placed = false; // station mode: no pose until the first station
+  private stationBusy = false;
+  private stationCalls = 0;
 
   // where to carry the scanner next: a clear spot near the nearest open edge (§3.5, simplified)
   private findNext(): RoomState["next"] {
@@ -128,15 +136,25 @@ export class RoomSim {
     for (let i = 0; i < this.cells.length; i++) if (this.cells[i] === 1) free++;
     const r: RoomState = {
       state: this.state,
-      pose: this.w ? { x: +this.pose.x.toFixed(3), y: +this.pose.y.toFixed(3), theta_deg: +this.pose.theta_deg.toFixed(1) } : null,
+      mode: this.mode,
+      planned: this.planned,
+      stations: this.stations.map((x) => ({ ...x })),
+      pose: this.w && (this.mode === "walk" || this.placed) ? { x: +this.pose.x.toFixed(3), y: +this.pose.y.toFixed(3), theta_deg: +this.pose.theta_deg.toFixed(1) } : null,
       path: this.path.slice(-500),
       keyframes: this.keyframes,
       scans: this.scans,
       area_m2: +(free * this.cell * this.cell).toFixed(2),
       match: this.w ? { ...this.match } : null,
       lost: false,
-      note: this.state === "mapping" && this.scans < 5 ? "hold still for a moment while the first scans settle" : null,
-      next: this.w ? this.next : null,
+      note:
+        this.mode === "stations"
+          ? this.state === "mapping" && !this.placed
+            ? "station mode: nothing is mapped until the first station is added"
+            : null
+          : this.state === "mapping" && this.scans < 5
+            ? "hold still for a moment while the first scans settle"
+            : null,
+      next: this.w && (this.mode === "walk" || this.placed) ? this.next : null,
     };
     if (withGrid) r.grid = { w: this.w, h: this.h, cell: this.cell, x0: this.x0, y0: this.y0 };
     return r;
@@ -146,8 +164,13 @@ export class RoomSim {
     return encodeRoom({ w: this.w, h: this.h, cell_m: this.cell, x0_m: this.x0, y0_m: this.y0, cells: this.cells });
   }
 
-  start(cell?: number): void {
+  start(cell?: number, mode: "walk" | "stations" = "walk", planned = 6): void {
     this.stopTimer();
+    this.mode = mode;
+    this.planned = Math.max(1, Math.min(50, Math.round(planned) || 6));
+    this.stations = [];
+    this.placed = false;
+    this.stationCalls = 0;
     this.cell = cell && cell >= 0.02 && cell <= 0.5 ? cell : 0.05;
     // grid covering the room in map coordinates (room shifted to the start), with a margin
     this.x0 = Math.floor((ROOM.min[0] - START[0] - 0.3) / this.cell) * this.cell;
@@ -165,10 +188,93 @@ export class RoomSim {
     this.lastKey = { x: 0, y: 0, th: 0 };
     this.state = "mapping";
     this.tick = 0;
+    this.next = null;
+    if (mode === "stations") {
+      // nothing updates the map until a station is added
+      this.path = [];
+      this.keyframes = 0;
+      this.match = { rms_mm: null, inliers: null, ok: false };
+      this.sendState(this.snapshot());
+      this.sendGrid(this.gridFrame());
+      return;
+    }
     this.scan();
     this.sendState(this.snapshot());
     this.sendGrid(this.gridFrame());
     this.timer = setInterval(() => this.step(), TICK_MS);
+  }
+
+  // POST /api/room/station: the next spot along the mock walk, set down at
+  // some heading; a still scan is integrated. Every 4th call fails to match.
+  async addStation(): Promise<RoomStationResult> {
+    if (this.state !== "mapping" || this.mode !== "stations") throw new RoomConflict("start mapping in station mode first");
+    if (this.stationBusy) throw new RoomConflict("a station is already being added");
+    this.stationBusy = true;
+    const t0 = Date.now();
+    try {
+      await new Promise((r) => setTimeout(r, 500 + Math.random() * 900)); // 5 rotations + search
+      this.stationCalls++;
+      const n = this.stations.length + 1;
+      if (this.stationCalls % 4 === 0) {
+        const inl = +(0.18 + Math.random() * 0.15).toFixed(3);
+        return {
+          ok: false,
+          inliers: inl,
+          conflict: +(0.08 + Math.random() * 0.1).toFixed(3),
+          reason: `only ${Math.round(inl * 100)}% of this view matches the map: put the scanner where it can see some walls already mapped, within 3 m of the last station`,
+          search_ms: Date.now() - t0,
+        };
+      }
+      if (n > 1) this.advance(1.1 + Math.random() * 0.5);
+      const a = WAYPOINTS[this.seg % (WAYPOINTS.length - 1)];
+      const b = WAYPOINTS[(this.seg % (WAYPOINTS.length - 1)) + 1];
+      const travel = (Math.atan2(b[1] - a[1], b[0] - a[0]) * 180) / Math.PI;
+      const theta = n === 1 ? 0 : ((((travel + (Math.random() * 80 - 40)) + 180) % 360) + 360) % 360 - 180;
+      this.pose = { ...this.pose, theta_deg: theta };
+      this.placed = true;
+      for (let k = 0; k < 3; k++) this.scan();
+      this.keyframes++;
+      this.path.push([+this.pose.x.toFixed(3), +this.pose.y.toFixed(3)]);
+      const st: RoomStation = {
+        n,
+        x: n === 1 ? 0 : +this.pose.x.toFixed(3),
+        y: n === 1 ? 0 : +this.pose.y.toFixed(3),
+        theta_deg: +theta.toFixed(1),
+        inliers: n === 1 ? 1 : +(0.72 + Math.random() * 0.22).toFixed(3),
+        rms_mm: n === 1 ? null : +(14 + Math.random() * 14).toFixed(1),
+      };
+      this.stations.push(st);
+      this.match = { rms_mm: st.rms_mm, inliers: st.inliers, ok: true };
+      this.sendState(this.snapshot());
+      this.sendGrid(this.gridFrame());
+      return { ok: true, ...st, search_ms: Date.now() - t0 };
+    } finally {
+      this.stationBusy = false;
+    }
+  }
+
+  // move `dist` metres along the mock walk (world pose → map pose)
+  private advance(dist: number) {
+    let d = dist;
+    while (d > 0) {
+      const a = WAYPOINTS[this.seg % (WAYPOINTS.length - 1)];
+      const b = WAYPOINTS[(this.seg % (WAYPOINTS.length - 1)) + 1];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const left = len - this.along;
+      if (d < left) {
+        this.along += d;
+        d = 0;
+      } else {
+        d -= left;
+        this.along = 0;
+        this.seg++;
+      }
+    }
+    const a = WAYPOINTS[this.seg % (WAYPOINTS.length - 1)];
+    const b = WAYPOINTS[(this.seg % (WAYPOINTS.length - 1)) + 1];
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    const f = this.along / len;
+    this.pose = { ...this.pose, x: a[0] + (b[0] - a[0]) * f - START[0], y: a[1] + (b[1] - a[1]) * f - START[1] };
   }
 
   stop(): void {

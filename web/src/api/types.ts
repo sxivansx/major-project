@@ -487,8 +487,25 @@ export interface RoomFrame {
   cells: Uint8Array; // h * w
 }
 
+export interface RoomStation {
+  n: number;
+  x: number;
+  y: number;
+  theta_deg: number; // CCW from map +x
+  inliers: number; // 0..1
+  rms_mm: number | null; // null for the first station
+}
+
+// POST /api/room/station
+export type RoomStationResult =
+  | ({ ok: true; search_ms?: number } & RoomStation)
+  | { ok: false; reason: string; inliers?: number; conflict?: number; search_ms?: number };
+
 export interface RoomState {
   state: "idle" | "mapping";
+  mode?: "walk" | "stations"; // stations: only still captures update the map
+  planned?: number;
+  stations?: RoomStation[];
   pose: { x: number; y: number; theta_deg: number } | null; // map frame, theta CCW from map +x
   path: [number, number][]; // ≤ 500 points
   keyframes: number;

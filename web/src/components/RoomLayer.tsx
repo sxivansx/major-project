@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
-import type { RoomFrame, RoomState } from "../api/types";
+import { Html } from "@react-three/drei";
+import type { RoomFrame, RoomStation, RoomState } from "../api/types";
 import { useOps } from "../store/ops";
 import { useRoom } from "../store/room";
 import { useStore } from "../store/store";
@@ -142,6 +143,30 @@ function PathAndPose({ room, floorZ }: { room: RoomState; floorZ: number }) {
   );
 }
 
+// Station mode: a numbered marker at each station with a heading tick along theta.
+function Stations({ stations, floorZ }: { stations: RoomStation[]; floorZ: number }) {
+  return (
+    <>
+      {stations.map((st) => (
+        <group key={st.n} position={[st.x, st.y, floorZ + 0.025]} rotation={[0, 0, (st.theta_deg * Math.PI) / 180]}>
+          <mesh>
+            <ringGeometry args={[0.1, 0.14, 32]} />
+            <meshBasicMaterial color={ACCENT} side={THREE.DoubleSide} />
+          </mesh>
+          {/* heading tick along local +x */}
+          <mesh position={[0.24, 0, 0]}>
+            <planeGeometry args={[0.18, 0.035]} />
+            <meshBasicMaterial color={ACCENT} side={THREE.DoubleSide} />
+          </mesh>
+          <Html center position={[0, 0, 0.05]} zIndexRange={[10, 0]}>
+            <div className="station-label">{st.n}</div>
+          </Html>
+        </group>
+      ))}
+    </>
+  );
+}
+
 function NextStation({ x, y, floorZ }: { x: number; y: number; floorZ: number }) {
   const poleH = 1.0;
   return (
@@ -171,6 +196,7 @@ export function RoomLayer() {
       <Floor grid={grid} floorZ={floorZ} />
       <Walls grid={grid} floorZ={floorZ} wallH={wallH > 0 ? wallH : 2.4} />
       {room && <PathAndPose room={room} floorZ={floorZ} />}
+      {room?.stations && room.stations.length > 0 && <Stations stations={room.stations} floorZ={floorZ} />}
       {st && <NextStation x={st.x} y={st.y} floorZ={floorZ} />}
     </group>
   );

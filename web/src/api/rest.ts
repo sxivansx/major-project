@@ -13,6 +13,7 @@ import type {
   Config,
   RoomFrame,
   RoomState,
+  RoomStationResult,
   SpeechEvent,
   SpeechStatus,
   Findings,
@@ -163,7 +164,8 @@ export const api = {
   speechClear: () => request<void>("POST", "/audio/speech/clear"),
 
   // room map (handheld 2D mapping)
-  roomStart: (cell_m?: number) => request<unknown>("POST", "/room/start", cell_m !== undefined ? { cell_m } : {}),
+  roomStart: (opts: { cell_m?: number; mode?: "walk" | "stations"; planned?: number } = {}) => request<unknown>("POST", "/room/start", opts),
+  roomStation: () => request<RoomStationResult>("POST", "/room/station"),
   roomStop: () => request<unknown>("POST", "/room/stop"),
   room: () => request<RoomState>("GET", "/room"),
   roomGrid: async (): Promise<RoomFrame> => parseRoom(await requestBinary("/room/grid")),

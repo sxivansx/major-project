@@ -7,7 +7,7 @@
 // Against the real core this will move the servo and run a short sweep.
 
 import { encodeAudio, encodeOpsLayers, encodeRoom, parseAudio, parseRoom, parseFrame, parseGrid, parseOpsLayers, parseSessionPoints } from "../src/api/frames";
-import type { AiAsk, AiSitrep, AiStatus, AiTriage, AudioCalibrateResult, AudioEvent, AudioSource, BinaryFrame, RoomState, SpeechEvent, SpeechStatus, Config, Findings, Job, Metrics, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
+import type { RoomStationResult, AiAsk, AiSitrep, AiStatus, AiTriage, AudioCalibrateResult, AudioEvent, AudioSource, BinaryFrame, RoomState, SpeechEvent, SpeechStatus, Config, Findings, Job, Metrics, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
 import { FINDING_KINDS } from "../src/api/types";
 
 const BASE = process.env.CHECK_URL ?? "http://127.0.0.1:8000";
@@ -616,6 +616,42 @@ else {
   ok(r2.state === "idle", "stop -> idle");
   const kept = parseRoom(await reqBin("/room/grid"));
   ok(kept.w === gg.w && kept.h === gg.h, "the map is kept after stop");
+
+  // station mode: start, add stations, 409s
+  const postRaw = (path: string, b?: unknown) =>
+    fetch(BASE + "/api" + path, { method: "POST", headers: { "content-type": "application/json" }, body: b === undefined ? undefined : JSON.stringify(b) });
+  const idle409 = await postRaw("/room/station");
+  ok(idle409.status === 409 && typeof ((await idle409.json()) as { error?: string }).error === "string", `add station while not mapping -> ${idle409.status} {error}`);
+  await req<unknown>("POST", "/room/start", { cell_m: 0.05, mode: "walk" });
+  const walk409 = await postRaw("/room/station");
+  ok(walk409.status === 409, `add station in walk mode -> ${walk409.status}`);
+  const rw = await req<RoomState>("GET", "/room");
+  ok(rw.mode === "walk", `walk mode reported (${rw.mode})`);
+  await req<unknown>("POST", "/room/start", { cell_m: 0.05, mode: "stations", planned: 6 });
+  const rs0 = await req<RoomState>("GET", "/room");
+  ok(rs0.state === "mapping" && rs0.mode === "stations" && rs0.planned === 6 && Array.isArray(rs0.stations) && rs0.stations.length === 0, `station mode: planned ${rs0.planned}, ${rs0.stations?.length} stations`);
+  const placed: RoomStationResult[] = [];
+  for (let k = 0; k < 2; k++) {
+    const t0 = Date.now();
+    const r = await req<RoomStationResult>("POST", "/room/station");
+    placed.push(r);
+    ok(
+      r.ok
+        ? r.n === k + 1 && typeof r.x === "number" && typeof r.y === "number" && typeof r.theta_deg === "number" && r.inliers >= 0 && r.inliers <= 1
+        : typeof r.reason === "string" && r.reason.length > 0,
+      r.ok ? `station ${r.n}: (${r.x}, ${r.y}) heading ${r.theta_deg}°, ${Math.round(r.inliers * 100)}% inliers, ${Date.now() - t0} ms` : `station not placed: ${r.reason}`,
+    );
+    if (IS_MOCK) ok(r.ok, `mock places station ${k + 1}`);
+  }
+  const rs1 = await req<RoomState>("GET", "/room");
+  const nOk = placed.filter((r) => r.ok).length;
+  ok(rs1.stations?.length === nOk, `room JSON lists ${rs1.stations?.length} stations`);
+  ok((rs1.stations ?? []).every((st, i) => st.n === i + 1 && typeof st.x === "number" && typeof st.y === "number" && typeof st.theta_deg === "number" && st.inliers >= 0 && st.inliers <= 1 && (st.rms_mm === null || typeof st.rms_mm === "number")), "station fields n, x, y, theta_deg, inliers, rms_mm");
+  if (nOk >= 1) ok((rs1.stations?.[0].rms_mm ?? null) === null || IS_MOCK === false, "the first station has no match rms (it starts the map)");
+  // two at once: the second is refused while the first is being placed
+  const both = await Promise.all([postRaw("/room/station"), (async () => (await sleep(50), postRaw("/room/station")))()]);
+  ok(both.some((r) => r.status === 409), `a second Add station while one is in flight -> ${both.map((r) => r.status).join(", ")}`);
+  await req<unknown>("POST", "/room/stop");
 }
 
 // ---- 7. config ----

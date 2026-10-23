@@ -16,7 +16,7 @@ import { AI_MODELS, OPS_DEFAULTS, aiAsk, aiSitrep, aiTriage, analyze, fitPlaneNe
 import { computeGrid, fakeScan, filterQuality, scanToPoints, type FakeScan, type Mount } from "./world";
 import { AUDIO_DEFAULT, AudioSim } from "./audio";
 import { SpeechSim } from "./speech";
-import { RoomSim } from "./room";
+import { RoomConflict, RoomSim } from "./room";
 
 const PORT = Number(process.env.PORT ?? 8000);
 // MOCK_AI=off mimics a core without an OpenRouter key: /ai/status unavailable,
@@ -818,11 +818,24 @@ async function handleApi(req: Request, path: string): Promise<Response> {
 
   // ---- room map (handheld 2D mapping) ----
   if (path === "/room/start" && m === "POST") {
-    const b = await body<{ cell_m?: number }>(req);
+    const b = await body<{ cell_m?: number; mode?: string; planned?: number }>(req);
     if (b.cell_m !== undefined && !(Number(b.cell_m) > 0)) return err(422, "cell_m must be > 0");
-    room.start(b.cell_m !== undefined ? Number(b.cell_m) : undefined);
-    sendLog("info", "room mapping started");
+    if (b.mode !== undefined && b.mode !== "walk" && b.mode !== "stations") return err(422, "mode must be walk or stations");
+    const mode = b.mode === "stations" ? "stations" : "walk";
+    room.start(b.cell_m !== undefined ? Number(b.cell_m) : undefined, mode, Number(b.planned ?? 6));
+    sendLog("info", mode === "walk" ? "room mapping started (walk mode)" : `room mapping started (station mode, ${Number(b.planned ?? 6)} stations planned)`);
     return json(room.snapshot(true));
+  }
+  if (path === "/room/station" && m === "POST") {
+    try {
+      const r = await room.addStation();
+      if (r.ok) sendLog("info", `station ${r.n} added at x ${r.x.toFixed(2)} m, y ${r.y.toFixed(2)} m (${Math.round(r.inliers * 100)}% matched)`);
+      else sendLog("warn", `station not added: ${r.reason}`);
+      return json(r);
+    } catch (e) {
+      if (e instanceof RoomConflict) return json({ error: e.message }, { status: 409 });
+      throw e;
+    }
   }
   if (path === "/room/stop" && m === "POST") {
     room.stop();

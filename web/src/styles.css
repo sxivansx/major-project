@@ -1383,3 +1383,24 @@ button.linklike:hover:not(:disabled) {
   width: 64px;
   padding: 3px 5px;
 }
+
+/* station mode */
+.ops-actions > button.big {
+  padding: 7px 22px;
+  font-size: 14px;
+}
+
+.station-label {
+  font: bold 11px var(--mono);
+  color: var(--accent);
+  background: var(--bg);
+  border: 1.5px solid var(--accent);
+  border-radius: 50%;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  user-select: none;
+}
