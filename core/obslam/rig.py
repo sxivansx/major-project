@@ -22,6 +22,7 @@ from .audio_pipeline import AudioPipeline
 from .config import Config
 from .geometry import lidar_to_base
 from .grid import Grid, build_grid
+from .room import RoomSession
 from .servo import SerialTilt, SimTilt, TiltError, TiltSource
 from .session import SessionStore
 from .sim import SimScanSource
@@ -108,6 +109,7 @@ class Rig:
         # the microphones are a sibling of the lidar, not part of it: their own source thread,
         # their own lock; they only read the map (through a cached analysis) to name candidates
         self.audio = AudioPipeline(config, publish, self.log, self._audio_findings, publish_json=self.publish_json)
+        self.room = RoomSession(publish, self.publish_json, self.log)
 
     def _audio_findings(self) -> dict | None:
         """Findings for the audio candidates: the same defaults as GET /ops/findings, so the ids
@@ -332,6 +334,7 @@ class Rig:
         if now - self._last_scan_pub >= 0.08:
             self._last_scan_pub = now
             self._publish(wire.encode_scan(seq, f.t, phi, f.angle, f.range, f.quality))
+        self.room.feed(f, phi)
 
     def _on_scan_exit(self, error: str | None) -> None:
         with self._lock:
@@ -656,6 +659,7 @@ class Rig:
         self.publish_status()
 
     def shutdown(self) -> None:
+        self.room.stop()
         self.stop_job()
         self.disconnect_lidar()
         self.disconnect_servo()

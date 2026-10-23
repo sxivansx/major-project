@@ -9,6 +9,7 @@ import numpy as np
 from .grid import LAYER_ID, LAYERS, Grid
 
 KIND_SCAN, KIND_POINTS, KIND_GRID, KIND_OPS = 1, 2, 3, 4
+KIND_ROOM = 6  # 5 is the audio preview (audio_wire.py)
 
 _SCAN_HDR = struct.Struct("<BxxxIdfI")  # kind, seq, t, phi, n  → 24 bytes
 _POINTS_HDR = struct.Struct("<BxxxIIfI")  # kind, job_id, step, phi, n → 20 bytes
@@ -67,6 +68,23 @@ def encode_ops_layers(w: int, h: int, cell: float, x0: float, y0: float, classes
     c = np.ascontiguousarray(classes, dtype="u1").reshape(h * w)
     r = np.ascontiguousarray(rel_height, dtype="<f4").reshape(h * w)
     return _OPS_HDR.pack(KIND_OPS, 0, 0, w, h, cell, x0, y0) + c.tobytes() + r.tobytes()
+
+
+_ROOM_HDR = struct.Struct("<BBHIIfff")  # kind=6, pad, pad, w, h, cell, x0, y0 → 24 bytes
+
+
+def encode_room(classes, cell: float, x0: float, y0: float) -> bytes:
+    """Room map (§3.5): u8 per cell, 0 unknown, 1 free, 2 occupied; row-major, row = y."""
+    c = np.ascontiguousarray(classes, dtype="u1")
+    h, w = c.shape
+    return _ROOM_HDR.pack(KIND_ROOM, 0, 0, w, h, cell, x0, y0) + c.tobytes()
+
+
+def decode_room(buf: bytes) -> dict:
+    kind, _, _, w, h, cell, x0, y0 = _ROOM_HDR.unpack_from(buf)
+    assert kind == KIND_ROOM
+    cls = np.frombuffer(buf, "u1", w * h, _ROOM_HDR.size).reshape(h, w)
+    return {"w": w, "h": h, "cell": cell, "x0": x0, "y0": y0, "classes": cls}
 
 
 def decode_ops_layers(buf: bytes) -> dict:

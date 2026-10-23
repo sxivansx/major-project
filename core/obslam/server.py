@@ -14,7 +14,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from serial.tools import list_ports
 
 from . import wire
@@ -126,6 +126,10 @@ class AudioCalibrate(BaseModel):
     clicks: list[CalibrationClick]
     apply: bool = False  # write yaw + offsets to the config (and calibrated=true if the order is confirmed)
     refine_positions: bool = False  # ≥ 6 claps: also fit the mic positions (applied too when apply=true)
+
+
+class RoomStart(BaseModel):
+    cell_m: float = Field(0.05, ge=0.02, le=0.2)
 
 
 class SpeechToggle(BaseModel):
@@ -295,6 +299,25 @@ def create_app(
     def audio_clear():
         rig.audio.clear()
         return Response(status_code=204)
+
+    # ---- handheld room map (§3.5) -------------------------------------------------------------------
+    @app.post(f"{api}/room/start")
+    async def room_start(body: RoomStart | None = None):
+        if not rig.status()["lidar"]["connected"]:
+            raise RigError("connect the LiDAR first")
+        return await asyncio.to_thread(rig.room.start, (body or RoomStart()).cell_m)
+
+    @app.post(f"{api}/room/stop")
+    async def room_stop():
+        return await asyncio.to_thread(rig.room.stop)
+
+    @app.get(f"{api}/room")
+    def room_info():
+        return rig.room.info()
+
+    @app.get(f"{api}/room/grid")
+    def room_grid():
+        return Response(rig.room.grid_frame(), media_type="application/octet-stream")
 
     # ---- spoken calls for help (§5.7) --------------------------------------------------------------
     @app.get(f"{api}/audio/speech")
