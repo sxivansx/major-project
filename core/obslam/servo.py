@@ -239,7 +239,12 @@ class SerialTilt(TiltSource):
                 # Over Wi-Fi the ESP32 closes our socket when it reboots or when another
                 # client takes its single tilt connection. Reopen once and repeat the
                 # command; it is the same command the operator just asked for.
-                if not self.port.startswith("tcp://"):
+                # Only absolute targets and queries are repeated: "go to 95°" twice still ends at
+                # 95° (pin_connection.md / approach.md: never replay a movement blindly). Anything
+                # else (calibration C, limits L, encoder E, network N with arguments) is not.
+                cmd = line.strip().split()[0].upper() if line.strip() else ""
+                idempotent = cmd in ("T", "H", "S", "?", "I", "W") or line.strip() == "N"
+                if not self.port.startswith("tcp://") or not idempotent:
                     raise TiltError(f"servo link lost: {e}") from e
                 log.warning("tilt link to %s lost (%s), reconnecting", self.port, e)
                 try:
