@@ -319,7 +319,7 @@ export interface AiAsk {
 export interface AudioConfig {
   port: string; // tcp://host:8901
   mics_mm: [number, number, number][]; // sound-port positions in the array frame, mm
-  array_yaw_deg: number; // array x-axis relative to base +x, deg counter-clockwise
+  array_yaw_deg: number; // bearing of the array's +x axis, clockwise from base +x (like every bearing)
   calibrated: boolean;
   trigger_db: number; // spike = short-term energy this many dB above the noise floor
   min_gap_ms: number; // dead time between events

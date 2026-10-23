@@ -236,15 +236,22 @@ One client at a time (a new one replaces the old). Streaming runs only while a c
 u32  magic        0x31445541  ('AUD1')
 u32  seq          increments per frame; a gap = frames lost
 u64  t_us         esp_timer_get_time() at the first sample of this frame
-u32  sample_rate  48000
+u32  sample_rate  16000 | 24000 | 48000 (default 24000, set with `A rate`)
 u16  channels     4   (order: mic1, mic2, mic3, mic4)
-u16  n            samples per channel in this frame (480 = 10 ms)
+u16  n            samples per channel in this frame = sample_rate / 100 (10 ms: 160 / 240 / 480)
 u16  shift        right shift applied to the 32-bit I2S word (default 14)
-u16  flags        bit0 = I2S read timeout in this frame, bit1 = samples dropped before this frame
+u16  flags        bit0 = I2S read timeout in this frame, bit1 = frames dropped before this one (seq shows how many)
 n × 4 × i16       interleaved: s0m1 s0m2 s0m3 s0m4 s1m1 ...
 ```
 
-384 KB/s at 48 kHz. Tilt protocol additions (port 8900 / USB): `A` → `AUDIO rate=48000 shift=14 clients=<0|1> frames=<n> dropped=<n> i2s_timeouts=<n>`; `A shift <8..16>` → `OK` (gain; lower shift = louder, clips sooner).
+Frame size = 28 + n × 8 bytes: 128 KB/s at 16 kHz, 193 KB/s at 24 kHz, 384 KB/s at 48 kHz. Frames are never older than ~300 ms when sent: if the link is slower than the stream, the firmware skips the backlog down to the newest 50 ms, adds the skipped samples to `dropped`, and sets bit1 on the next frame sent (the `seq` gap gives the count). Over TCP the ESP32's lwIP send buffer (5,744 B) caps throughput at about 5,744 B / RTT, e.g. ~150 KB/s at a 38 ms Wi-Fi round trip, so on a slow link use 16 kHz.
+
+Tilt protocol additions (port 8900 / USB):
+- `A` → `AUDIO rate=<16000|24000|48000> shift=<8..16> clients=<0|1> frames=<n> dropped=<n> i2s_timeouts=<n>`. `frames` = frames captured since boot; `dropped` = samples per channel not delivered (backlog skipped or ring full).
+- `A rate <16000|24000|48000>` → `OK` (persisted; applied within ~20 ms; the stream's next frames carry the new rate and n).
+- `A shift <8..16>` → `OK` (gain; lower shift = louder, clips sooner; persisted).
+- `A raw` → one diagnostic line: `RAW rate=… n=… fmt=philips data_bits=32 slot_bits=32 mask=both ws_width=32 ws_pol=0 bit_shift=1 left_align=1 big_endian=0 lsb_first=0 mclk_x=256 slave_bclk_div=8 pins=… shift=… pads_hi/4000=bclk4:…,ws5:…,din7:…,din6:… | i2s0.L(mic1) first=<8 hex words> min=… max=… nz=… ones=… toggle=<hex> | i2s0.R(mic2) … | i2s1.L(mic3) … | i2s1.R(mic4) …`. Raw 32-bit words of one block before the shift; `ones` counts 0xFFFFFFFF words, `toggle` ORs every bit that ever differed from the first word, `pads_hi` counts how often each pad read high in 4000 quick samples. Not for parsers.
+- `?` gains `audio=<on|off>`.
 
 ### 5.3 Core
 
@@ -297,3 +304,12 @@ channels × f32 level_dbfs (RMS of the block), then channels × n × (i16 min, i
 ```
 Channel-major (all of mic1's n points, then mic2's …). `t_unix` is the time of the **last** point; frames may overlap (each covers the last 100 ms), so clients de-duplicate by time. min/max are the stream's i16 values after `shift`, ±32767 = full scale (0 dBFS).
 Text: `{"type":"audio_event", ...AudioEvent}` on every detection.
+
+### 5.5 Calibration and additions (implemented)
+
+- Config `audio.channel_offsets_us` (4 floats): fixed per-channel capture delays fitted by calibration and removed before direction finding. Event `tdoa_us` stays the **raw** measurement so stored events can be reused for calibration.
+- `POST /audio/calibrate` `{"clicks":[{"event_id":12 | "tdoa_us":{…}, "bearing_deg":0, "elevation_deg":0}], "apply":false, "refine_positions":false}` → fitted `array_yaw_deg`, `channel_offsets_us`, optional refined `mics_mm`, per-click residuals, a channel-order check (e.g. ch2/ch3 swapped) with the suggested fix. `apply: true` writes the config and sets `calibrated: true` only if the channel order is confirmed and the residual is under 6 µs. Clap at array height (or give `elevation_deg`); ≥ 4 known bearings, ≥ 6 to refine positions.
+- `POST /audio/sim/emit` accepts `"kind": "knock" | "voice"`.
+- Events also carry `reasons[]`, `coherence[6]`, `residual_us`, `calibrated`, `map_age_s`; candidates carry `off_axis_deg`. Candidate window is at least ±3°, a wide region straddling the bearing counts, and events with confidence < 0.1 get none.
+- Status `audio` also carries `link`, `note`, `array_yaw_deg`, `map_age_s` and CPU stats.
+- The array is assumed fixed to the base, not the tilting cradle. With this left–right symmetric layout a ch2/ch3 swap gives a perfectly fitting but mirrored bearing; only the clap calibration catches it.

@@ -18,6 +18,9 @@ from pydantic import BaseModel
 from serial.tools import list_ports
 
 from . import wire
+from .acoustic import calibrate as calibrate_array
+from .audio_pipeline import AudioError
+from .audio_wire import KIND_AUDIO_PREVIEW
 from .config import Config, load_config, save_config
 from .grid import LAYERS
 from .rig import JobParams, Rig, RigError
@@ -53,7 +56,8 @@ class Broadcaster:
         self.loop.call_soon_threadsafe(self._fanout, msg)
 
     def _fanout(self, msg: str | bytes) -> None:
-        droppable = isinstance(msg, bytes) and msg[:1] == bytes([wire.KIND_SCAN])
+        # live previews are superseded by the next one within 50–100 ms: a slow client skips them
+        droppable = isinstance(msg, bytes) and msg[:1] in (bytes([wire.KIND_SCAN]), bytes([KIND_AUDIO_PREVIEW]))
         for q in list(self.clients):
             if droppable and q.qsize() > 8:
                 continue
@@ -97,6 +101,31 @@ class RouteRequest(BaseModel):
     cell: float | None = None
     max_step: float | None = None
     max_slope: float | None = None
+
+
+class AudioConnect(BaseModel):
+    source: Literal["tcp", "sim"] = "tcp"
+    port: str | None = None
+
+
+class AudioEmit(BaseModel):
+    bearing_deg: float
+    elevation_deg: float = 0.0
+    snr_db: float = 20.0
+    kind: Literal["knock", "voice"] = "knock"
+
+
+class CalibrationClick(BaseModel):
+    bearing_deg: float  # where the click really was: base bearing, clockwise from base +x
+    elevation_deg: float = 0.0
+    event_id: int | None = None  # take the raw tdoas from a stored event…
+    tdoa_us: dict[str, float] | None = None  # …or give them directly
+
+
+class AudioCalibrate(BaseModel):
+    clicks: list[CalibrationClick]
+    apply: bool = False  # write yaw + offsets to the config (and calibrated=true if the order is confirmed)
+    refine_positions: bool = False  # ≥ 6 claps: also fit the mic positions (applied too when apply=true)
 
 
 class AIRequest(BaseModel):
@@ -154,6 +183,10 @@ def create_app(
     @app.exception_handler(RigError)
     async def _rig_error(_: Request, e: RigError):
         return JSONResponse({"error": str(e)}, status_code=400)
+
+    @app.exception_handler(AudioError)
+    async def _audio_error(_: Request, e: AudioError):
+        return JSONResponse({"error": str(e)}, status_code=e.status_code)
 
     api = "/api"
 
@@ -227,6 +260,69 @@ def create_app(
         if cell is not None and cell <= 0:
             raise HTTPException(400, "cell must be > 0")
         return await asyncio.to_thread(rig.metrics, cell, z_min, z_max)
+
+    # ---- acoustic layer (docs/api.md §5.3) ---------------------------------------------------------
+    @app.post(f"{api}/audio/connect")
+    def audio_connect(body: AudioConnect):
+        rig.audio.connect(body.source, body.port)  # never blocks: the TCP link comes up in its own thread
+        rig.publish_status()
+        return rig.status()
+
+    @app.post(f"{api}/audio/disconnect")
+    async def audio_disconnect():
+        await asyncio.to_thread(rig.audio.disconnect)
+        rig.publish_status()
+        return rig.status()
+
+    @app.get(f"{api}/audio/events")
+    def audio_events(limit: int = Query(50, ge=0, le=200)):
+        return rig.audio.events(limit)
+
+    @app.post(f"{api}/audio/clear", status_code=204)
+    def audio_clear():
+        rig.audio.clear()
+        return Response(status_code=204)
+
+    @app.post(f"{api}/audio/sim/emit")
+    async def audio_sim_emit(body: AudioEmit):
+        return await asyncio.to_thread(rig.audio.emit_sim, body.bearing_deg, body.elevation_deg, body.snr_db, body.kind)
+
+    @app.post(f"{api}/audio/calibrate")
+    def audio_calibrate(body: AudioCalibrate):
+        """Clicks from known bearings → array yaw, per-channel capture offsets, channel-order check."""
+        by_id = {e["id"]: e for e in rig.audio.events(200)}
+        clicks = []
+        for k in body.clicks:
+            if k.tdoa_us is not None:
+                t = k.tdoa_us
+            elif k.event_id is not None:
+                ev = by_id.get(k.event_id)
+                if ev is None or len(ev.get("tdoa_us") or {}) != 6:
+                    raise HTTPException(400, f"no stored event {k.event_id} with six tdoas")
+                t = ev["tdoa_us"]
+            else:
+                raise HTTPException(400, "each click needs event_id or tdoa_us")
+            clicks.append({"bearing_deg": k.bearing_deg, "elevation_deg": k.elevation_deg, "tdoa_us": t})
+        a = config.audio
+        try:
+            res = calibrate_array(clicks, a.mics_mm, a.speed_of_sound, rig.audio.rate or 48000, refine_positions=body.refine_positions)
+        except (ValueError, KeyError) as e:
+            raise HTTPException(400, str(e)) from None
+        res["applied"] = False
+        if body.apply:
+            a.array_yaw_deg = res["array_yaw_deg"]
+            a.channel_offsets_us = res["channel_offsets_us"]
+            if "refined" in res:
+                a.mics_mm = res["refined"]["mics_mm"]
+            # yaw and offsets are worth keeping either way; "calibrated" is only earned when the
+            # click test also confirmed the channel order with a small misfit
+            a.calibrated = bool(res["ok"])
+            save_config(config, config_path)
+            rig.audio.config_changed()
+            rig.publish_status()
+            res["applied"] = True
+            res["calibrated"] = a.calibrated
+        return res
 
     # ---- operator products -------------------------------------------------------------------
     from .analysis import OpsParams, analyze, plan_route
@@ -403,6 +499,10 @@ def create_app(
     @app.put(f"{api}/config")
     def config_put(body: Config):
         config.mount, config.grid, config.lidar = body.mount, body.grid, body.lidar
+        # a client that predates the audio block must not reset the measured geometry to defaults
+        if "audio" in body.model_fields_set:
+            config.audio = body.audio
+            rig.audio.config_changed()
         save_config(config, config_path)
         rig.publish_status()
         return config.model_dump()

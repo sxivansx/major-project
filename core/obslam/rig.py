@@ -17,6 +17,8 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from . import wire
+from .analysis import OpsParams, analyze
+from .audio_pipeline import AudioPipeline
 from .config import Config
 from .geometry import lidar_to_base
 from .grid import Grid, build_grid
@@ -103,6 +105,18 @@ class Rig:
         self.session_loaded: str | None = None
         self.phi_max_deg = 60.0  # of the sweep that produced the live cloud
 
+        # the microphones are a sibling of the lidar, not part of it: their own source thread,
+        # their own lock; they only read the map (through a cached analysis) to name candidates
+        self.audio = AudioPipeline(config, publish, self.log, self._audio_findings, publish_json=self.publish_json)
+
+    def _audio_findings(self) -> dict | None:
+        """Findings for the audio candidates: the same defaults as GET /ops/findings, so the ids
+        an event names are the ids the operator sees at the default cell size."""
+        xyz = self.live_points()
+        if xyz.shape[0] < 1000:
+            return None
+        return analyze(xyz, OpsParams(), scanner_z_m=self.scanner_z_m(), phi_max_deg=self.phi_max_deg).findings
+
     def scanner_z_m(self) -> float:
         m = self.config.mount
         return (m.axis_z_mm + m.h_mm) / 1000.0
@@ -171,6 +185,7 @@ class Rig:
                 "live_points": int(self.live_points().shape[0]),
                 "session_loaded": self.session_loaded,
                 "alarms": sorted(self._alarms),
+                "audio": self.audio.status(),
             }
 
     def check_alarms(self) -> list[str]:
@@ -199,6 +214,7 @@ class Rig:
             job = self.job
             if job and job["state"] == "error":
                 alarms["job"] = f"job {job['job_id']} failed: {job['error']}"
+            alarms.update(self.audio.alarms())
             old = self._alarm_keys
             raised = [alarms[k] for k in alarms if k not in old]
             cleared = [old[k] for k in old if k not in alarms]
@@ -549,6 +565,7 @@ class Rig:
                 if time.monotonic() - last_grid >= 1.0:
                     last_grid = time.monotonic()
                     self._publish(wire.encode_grid(self.grid()))
+                    self.audio.map_changed()
         except RigError as e:
             state, error = "error", str(e)
         except Exception as e:  # noqa: BLE001
@@ -590,6 +607,7 @@ class Rig:
             self.job.update(state=state, error=error, eta_s=0.0, session_id=sid, finished=time.time())
             self.session_loaded = sid
         self._publish(wire.encode_grid(self.grid()))
+        self.audio.map_changed()
         self._publish_job()
         if state == "error":
             self.log("error", f"job {job_id} failed: {error}")
@@ -624,6 +642,7 @@ class Rig:
         for i in range(0, xyz.shape[0], POINTS_CHUNK):
             self._publish(wire.encode_points(0, i // POINTS_CHUNK, 0.0, xyz[i : i + POINTS_CHUNK]))
         self._publish(wire.encode_grid(self.grid()))
+        self.audio.map_changed()
         self.log("info", f"session {sid} loaded: {xyz.shape[0]} points")
         self.publish_status()
 
@@ -632,9 +651,11 @@ class Rig:
             self._live.clear()
             self._live_cat = None
             self.session_loaded = None
+        self.audio.map_changed()
         self.publish_status()
 
     def shutdown(self) -> None:
         self.stop_job()
         self.disconnect_lidar()
         self.disconnect_servo()
+        self.audio.disconnect()

@@ -368,11 +368,6 @@ if (ai.available) {
   ok(ak.status === 503, `ask without a key -> ${ak.status}`);
 }
 
-{
-  const mineOps = (await req<SessionMeta[]>("GET", "/sessions")).find((s) => s.name === "ops-check");
-  if (mineOps) await req<void>("DELETE", `/sessions/${mineOps.id}`);
-}
-
 // ---- 6c. acoustic layer (docs/api.md §5) ----
 console.log("\nAcoustic layer");
 {
@@ -505,6 +500,12 @@ const d1 = await req<Status>("POST", "/lidar/disconnect");
 ok(d1.lidar.connected === false, "lidar disconnect");
 const d2 = await req<Status>("POST", "/servo/disconnect");
 ok(d2.servo.connected === false, "servo disconnect");
+{
+  // after the acoustic checks: they aim knocks at the regions of this sweep's map
+  const mineOps = (await req<SessionMeta[]>("GET", "/sessions")).find((s) => s.name === "ops-check");
+  if (mineOps) await req<void>("DELETE", `/sessions/${mineOps.id}`);
+}
+
 ok(col.errors.length === 0, `no frame parse errors overall (${col.errors.length})`);
 
 ws.close();
