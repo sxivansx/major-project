@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from pathlib import Path
@@ -23,6 +24,7 @@ from .config import Config
 from .geometry import lidar_to_base
 from .grid import Grid, build_grid
 from .room import RoomSession
+from .slam2d import place_at
 from .servo import SerialTilt, SimTilt, TiltError, TiltSource
 from .session import SessionStore
 from .sim import SimScanSource
@@ -455,6 +457,7 @@ class Rig:
                 s = self.config.mount.phi_to_servo(phi)
                 if not (self.tilt.min_deg <= s <= self.tilt.max_deg):
                     raise RigError(f"phi {phi:.1f}° needs servo {s:.1f}°, outside limits")
+            station = self.room.station_pose()
             self._job_counter += 1
             job_id = self._job_counter
             self.job = {
@@ -468,14 +471,19 @@ class Rig:
                 "started": time.time(),
                 "eta_s": None,
                 "error": None,
+                # room mapping on track: this sweep is one station of a multi-station room cloud
+                "station": None if station is None else {"x": round(station[0], 3), "y": round(station[1], 3), "theta_deg": round(math.degrees(station[2]), 1)},
             }
-            self._live.clear()
+            if station is None:
+                self._live.clear()
+            else:
+                self.room.hold(True)
             self._live_cat = None
             self.session_loaded = None
             self.phi_max_deg = float(max(abs(params.phi_start), abs(params.phi_end)))
             self._job_stop.clear()
             self._job_thread = threading.Thread(
-                target=self._run_job, args=(params, job_id, phis), name=f"job-{job_id}", daemon=True
+                target=self._run_job, args=(params, job_id, phis, station), name=f"job-{job_id}", daemon=True
             )
             self._job_thread.start()
         self.log("info", f"job {job_id} '{params.name}' started: {len(phis)} steps")
@@ -518,7 +526,7 @@ class Rig:
             self.log("warn", "encoder did not settle in time, using its last reading")
         return self.config.mount.enc_to_phi(meas) if meas is not None else None
 
-    def _run_job(self, params: JobParams, job_id: int, phis: np.ndarray) -> None:
+    def _run_job(self, params: JobParams, job_id: int, phis: np.ndarray, station: tuple[float, float, float] | None = None) -> None:
         cfg = self.config
         cols = {k: [] for k in ("step", "phi", "phi_meas", "theta", "range", "quality", "t")}
         last_grid = 0.0
@@ -551,6 +559,8 @@ class Rig:
                 theta = np.concatenate(ths) if ths else np.zeros(0, np.float32)
                 rng = np.concatenate(rs) if rs else np.zeros(0, np.float32)
                 xyz = lidar_to_base(theta, rng, phi_used, cfg.mount)
+                if station is not None:
+                    xyz = place_at(xyz, station)
                 cols["step"].append(np.full(theta.shape[0], i, np.uint16))
                 cols["phi"].append(np.full(theta.shape[0], phi, np.float32))
                 cols["phi_meas"].append(np.full(theta.shape[0], np.nan if phi_meas is None else phi_meas, np.float32))
@@ -580,6 +590,8 @@ class Rig:
             self.home_servo()
         except RigError as e:
             log.warning("job %d: could not return to level: %s", job_id, e)
+        if station is not None:
+            self.room.hold(False)
 
         sid = None
         n_total = sum(a.shape[0] for a in cols["theta"])
@@ -598,6 +610,8 @@ class Rig:
                     "phi_step": params.phi_step,
                     "rotations": params.rotations,
                     "settle_ms": params.settle_ms,
+                    # the raw columns stay in the scanner frame; this is where the station stood in the room map
+                    "station": None if station is None else {"x": station[0], "y": station[1], "theta_rad": station[2]},
                     "state": state,
                     "encoder": self.tilt.encoder if self.tilt else None,
                     "lidar": {k: self.scan_info.get(k) for k in ("model", "serial", "firmware")},

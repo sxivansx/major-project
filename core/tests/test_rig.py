@@ -1,4 +1,5 @@
 import json
+import math
 import time
 
 import numpy as np
@@ -137,3 +138,36 @@ def test_job_stop(rig):
     rig.stop_job()
     assert rig.job["state"] == "stopped"
     assert 0 < rig.job["step"] < 121
+
+
+def test_sweeps_join_in_the_room_frame(rig):
+    rig.connect_servo("sim")
+    rig.connect_lidar("sim")
+
+    def sweep():
+        rig.start_job(JobParams(phi_start=0, phi_end=10, phi_step=10, rotations=1, settle_ms=0))
+        deadline = time.time() + 10
+        while rig.job["state"] == "running" and time.time() < deadline:
+            time.sleep(0.05)
+        assert rig.job["state"] == "done", rig.job
+
+    sweep()
+    first = rig.live_points().copy()
+    assert rig.job["station"] is None
+    # room mapping on track at a second station 2 m along x, turned 90°: the next sweep is placed there
+    # and joins the first instead of replacing it
+    rig.room.station_pose = lambda: (2.0, 0.0, math.pi / 2)
+    held = []
+    orig_hold = rig.room.hold
+    rig.room.hold = lambda on: (held.append(on), orig_hold(on))
+    sweep()
+    both = rig.live_points()
+    assert rig.job["station"] == {"x": 2.0, "y": 0.0, "theta_deg": 90.0}
+    assert held == [True, False]
+    second = both[first.shape[0]:]
+    assert both.shape[0] > first.shape[0] and second.shape[0] > 1000
+    # the sim scene seen from the second station, mapped back, overlays the first station's view
+    back = np.column_stack([second[:, 1], -(second[:, 0] - 2.0), second[:, 2]])
+    np.testing.assert_allclose(np.median(back, axis=0), np.median(first, axis=0), atol=0.3)
+    meta = rig.sessions.get(rig.job["session_id"])
+    assert abs(meta["station"]["theta_rad"] - math.pi / 2) < 1e-9
