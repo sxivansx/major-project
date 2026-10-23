@@ -127,3 +127,60 @@ def test_next_station_points_into_the_unseen_wing():
         m2.add_scan(scan_to_points(*lidar(p, rng)))
     assert not m2.lost
     assert m2.state()["next"]["open_edges"] <= nx["open_edges"]
+
+
+def test_six_station_sprint_places_every_station():
+    rng = np.random.default_rng(5)
+    m = RoomMapper()
+    # set down at six spots around the L-shaped room, facing anywhere; nothing tracked in between
+    truth = [(0.0, 0.0, 0.0), (1.8, -0.6, math.radians(70)), (3.2, 0.2, math.radians(200)),
+             (1.0, 1.2, math.radians(-40)), (0.6, 2.5, math.radians(130)), (-0.5, 0.8, math.radians(300))]
+    t0 = time.perf_counter()
+    for p in truth:
+        a, r, q = lidar(p, rng)
+        res = m.add_station(scan_to_points(a, r, q))
+        assert res["ok"], (p, res)
+    per_station_s = (time.perf_counter() - t0) / len(truth)
+    # the map frame is the first station's, which here is the world frame
+    for st, (x, y, th) in zip(m.stations, truth):
+        assert math.hypot(st["x"] - x, st["y"] - y) < 0.06, (st, (x, y, th))
+        assert abs(math.remainder(math.radians(st["theta_deg"]) - th, 2 * math.pi)) < math.radians(1.5)
+    assert 16.5 < m.area_m2() < 18.1
+    assert per_station_s < 3.0, per_station_s
+    assert [s["n"] for s in m.state()["stations"]] == [1, 2, 3, 4, 5, 6]
+
+
+def test_station_with_no_overlap_is_refused():
+    rng = np.random.default_rng(6)
+    m = RoomMapper()
+    m.add_station(scan_to_points(*lidar((0.0, 0.0, 0.0), rng)))
+    # carried into a 1.6 × 1.1 m closet elsewhere in the house: any fit against the L room puts some of
+    # its walls on floor already seen open, or behind a known wall
+    global ROOM
+    saved = ROOM
+    ROOM = [(10.0, 10.0, 11.6, 10.0), (11.6, 10.0, 11.6, 11.1), (11.6, 11.1, 10.0, 11.1), (10.0, 11.1, 10.0, 10.0)]
+    try:
+        closet = scan_to_points(*lidar((10.5, 10.4, 0.3), rng))
+    finally:
+        ROOM = saved
+    res = m.add_station(closet)
+    assert not res["ok"] and "matches the map" in res["reason"] and len(m.stations) == 1, res
+
+
+def test_station_mode_api_with_the_sim_lidar(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from obslam.server import create_app
+
+    app = create_app(config_path=tmp_path / "c.json", sessions_dir=tmp_path / "s", web_dist=tmp_path / "nope", sim_hz=20)
+    with TestClient(app) as c:
+        assert c.post("/api/room/station").status_code == 409  # not mapping
+        c.post("/api/lidar/connect", json={"source": "sim"})
+        st = c.post("/api/room/start", json={"mode": "stations", "planned": 6}).json()
+        assert st["mode"] == "stations" and st["planned"] == 6 and st["stations"] == []
+        r1 = c.post("/api/room/station").json()
+        assert r1["ok"] and r1["n"] == 1
+        r2 = c.post("/api/room/station").json()  # same spot again: matches itself
+        assert r2["ok"] and r2["n"] == 2 and abs(r2["x"]) < 0.05 and abs(r2["y"]) < 0.05, r2
+        info = c.get("/api/room").json()
+        assert [s["n"] for s in info["stations"]] == [1, 2] and info["grid"]["w"] > 10

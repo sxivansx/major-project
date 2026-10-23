@@ -32,6 +32,13 @@ MIN_FRONTIER_M = 0.40  # an open edge narrower than this is a gap between chair 
 STAND_CLEAR_M = 0.25  # a suggested station keeps this far from walls
 STAND_SEARCH_M = 0.8  # …and lies within this of the open edge it is meant to see past
 NEAR_M = 0.4  # an edge closer than this to the scanner is one it already stands at
+STATION_SPAN_M = 3.0  # a new station is searched for this far around the last one…
+STATION_STEP_M = 0.2
+STATION_STEP_DEG = 4.0  # …at any heading
+STATION_MIN_INLIERS = 0.55  # a station sees new room, so overlap is lower than for a walking scan…
+STATION_MAX_RMS_M = 0.040  # …but what does overlap must sit tight (real still scans: 15–25 mm; a wrong fit ≈ 50)
+STATION_MAX_CONFLICT = 0.2  # walls seen where the map knows open floor: more than this and the placement is wrong
+STATION_PRIOR = 0.02  # inlier fraction given up per metre from the last station (breaks ties in symmetric rooms)
 BIN_DEG = 0.5
 
 
@@ -78,6 +85,17 @@ def distance_field(occ: np.ndarray, cell: float, clip_m: float) -> np.ndarray:
     return np.minimum(d, big)
 
 
+def place_at(xyz: np.ndarray, pose) -> np.ndarray:
+    """Scanner-frame 3D points → room-map frame: turn about z by theta, shift by (x, y)."""
+    x, y, th = pose
+    c, s = math.cos(th), math.sin(th)
+    out = np.empty_like(xyz)
+    out[:, 0] = c * xyz[:, 0] - s * xyz[:, 1] + x
+    out[:, 1] = s * xyz[:, 0] + c * xyz[:, 1] + y
+    out[:, 2] = xyz[:, 2]
+    return out
+
+
 @dataclass
 class Match:
     pose: tuple[float, float, float]
@@ -108,6 +126,8 @@ class RoomMapper:
         self._next: dict | None = None
         self._next_key: tuple | None = None
         self._frontier: np.ndarray | None = None
+        self._vcoarse: np.ndarray | None = None
+        self.stations: list[dict] = []
         self._coarse: np.ndarray | None = None
 
     # ---- grid helpers ------------------------------------------------------------------------------
@@ -123,6 +143,7 @@ class RoomMapper:
         h = self.n // 2 * 2
         occ2 = occ[:h, :h].reshape(h // 2, 2, h // 2, 2).any(axis=(1, 3))
         self._coarse = distance_field(occ2, self.cell * 2, COARSE_CLIP_M)
+        self._vcoarse = None  # built on demand for station searches
 
     @staticmethod
     def _lookup(field_: np.ndarray, cell: float, x0: float, y0: float, xy: np.ndarray, clip: float) -> np.ndarray:
@@ -267,6 +288,111 @@ class RoomMapper:
             self.keyframes += 1
         return m
 
+    # ---- stations (scanner set down still, carried in between) ---------------------------------------
+    def _global(self, pts: np.ndarray, center, span_m: float = STATION_SPAN_M, keep: int = 6) -> list[tuple[float, float, float]]:
+        """Brute force over ±span_m and all headings on a 4× coarse field; the best `keep` poses."""
+        c4 = self.cell * 4
+        if self._vcoarse is None:
+            occ = self.L > L_OCC
+            h = self.n // 4 * 4
+            occ4 = occ[:h, :h].reshape(h // 4, 4, h // 4, 4).any(axis=(1, 3))
+            self._vcoarse = distance_field(occ4, c4, 1.0)
+        sub = pts[:: max(1, pts.shape[0] // 200)]
+        offs = np.arange(-span_m, span_m + 1e-9, STATION_STEP_M)
+        dx, dy = np.meshgrid(offs, offs, indexing="ij")
+        T = np.stack([dx.ravel() + center[0], dy.ravel() + center[1]], axis=1)
+        cands: list[tuple[float, float, float, float]] = []
+        for th in np.radians(np.arange(0.0, 360.0, STATION_STEP_DEG)):
+            w = transform(sub, (0.0, 0.0, th))
+            d = self._lookup(self._vcoarse, c4, self.x0, self.y0, w[None, :, :] + T[:, None, :], 1.0)
+            cost = (d * d).mean(axis=1)
+            for k in np.argsort(cost)[:2]:
+                cands.append((float(cost[k]), float(T[k, 0]), float(T[k, 1]), float(th)))
+        cands.sort()
+        out: list[tuple[float, float, float]] = []
+        for _, x, y, th in cands:  # distinct poses only
+            if all(math.hypot(x - a, y - b) > 0.4 or abs(math.remainder(th - t, 2 * math.pi)) > math.radians(15) for a, b, t in out):
+                out.append((x, y, th))
+            if len(out) >= keep:
+                break
+        return out
+
+    def _conflict(self, pts: np.ndarray, pose) -> float:
+        """Fraction of beams that contradict the map: the return lands on floor known to be open (far
+        from any wall), or the beam passes through a known wall on its way (a placement behind a wall)."""
+        sub = pts[:: max(1, pts.shape[0] // 360)]
+        w = transform(sub, pose)
+        ix, iy = self._idx(w)
+        ok = (ix >= 0) & (ix < self.n) & (iy >= 0) & (iy < self.n)
+        bad = np.zeros(w.shape[0], bool)
+        bad[ok] = (self.L[iy[ok], ix[ok]] < L_FREE) & (self._fine[iy[ok], ix[ok]] > INLIER_M)
+        x, y = pose[0], pose[1]
+        vec = w - np.array([x, y])
+        dist = np.hypot(vec[:, 0], vec[:, 1])
+        step = self.cell
+        ns = np.maximum((dist - 3 * self.cell) / step, 0).astype(np.int64)  # stop short of the return's own wall
+        total = int(ns.sum())
+        if total:
+            beam = np.repeat(np.arange(w.shape[0]), ns)
+            k = np.arange(total) - np.repeat(np.cumsum(ns) - ns, ns)
+            t = (k * step) / np.repeat(dist, ns)
+            sx, sy = self._idx(np.column_stack([x + vec[beam, 0] * t, y + vec[beam, 1] * t]))
+            inside = (sx >= 0) & (sx < self.n) & (sy >= 0) & (sy < self.n)
+            hit = np.zeros(total, bool)
+            hit[inside] = self.L[sy[inside], sx[inside]] > L_OCC
+            crossed = np.zeros(w.shape[0], bool)
+            crossed[beam[hit]] = True
+            bad |= crossed
+        return float(bad.mean())
+
+    def add_station(self, pts: np.ndarray, guess=None) -> dict:
+        """A still scan from a new spot. The first one starts the map; later ones are located with a wide
+        search around `guess` (default: the last station) and integrated only if they overlap enough."""
+        if pts.shape[0] < 50:
+            return {"ok": False, "reason": "too few LiDAR points: is it running and unobstructed?"}
+        n = len(self.stations) + 1
+        if self.key_pose is None:
+            self.integrate(pts, self.pose)
+            self.key_pose = self.pose
+            self.keyframes = 1
+            self.path.append((self.pose[0], self.pose[1]))
+            st = {"n": n, "x": 0.0, "y": 0.0, "theta_deg": 0.0, "inliers": 1.0, "rms_mm": None}
+            self.stations.append(st)
+            return {"ok": True, **st}
+        last = self.stations[-1] if self.stations else {"x": self.pose[0], "y": self.pose[1]}
+        center = guess if guess is not None else (last["x"], last["y"])
+        best, best_score = None, -1.0
+        for c in self._global(pts, center):
+            p = self._search(pts, c, 0.2, 0.04, 4.0, 1.0)
+            p = self._refine(pts, p)
+            rms, inl = self._quality(pts, p)
+            bad = self._conflict(pts, p)
+            score = inl - bad - STATION_PRIOR * math.hypot(p[0] - center[0], p[1] - center[1])
+            if score > best_score:
+                best_score, best = score, (p, rms, inl, bad)
+        p, rms, inl, bad = best
+        ok = inl >= STATION_MIN_INLIERS and bad <= STATION_MAX_CONFLICT and (rms == rms and rms <= STATION_MAX_RMS_M)
+        self.last = Match(p, rms, inl, ok)
+        if not ok:
+            return {
+                "ok": False,
+                "inliers": round(inl, 3),
+                "conflict": round(bad, 3),
+                "reason": f"only {inl * 100:.0f}% of this view matches the map: put the scanner where it can see some walls already mapped, within 3 m of the last station",
+            }
+        self.pose = p
+        self.lost = False
+        self.integrate(pts, p)
+        self.key_pose = p
+        self.keyframes += 1
+        self.path.append((p[0], p[1]))
+        st = {
+            "n": n, "x": round(p[0], 3), "y": round(p[1], 3), "theta_deg": round(math.degrees(p[2]), 1),
+            "inliers": round(inl, 3), "rms_mm": None if rms != rms else round(rms * 1000, 1),
+        }
+        self.stations.append(st)
+        return {"ok": True, **st}
+
     # ---- output ----------------------------------------------------------------------------------
     def classes(self) -> tuple[np.ndarray, float, float]:
         """u8 grid cropped to what has been seen (+0.5 m): 0 unknown, 1 free, 2 occupied, 3 open edge; and its x0, y0."""
@@ -367,5 +493,6 @@ class RoomMapper:
                 "ok": m.ok,
             },
             "lost": self.lost,
+            "stations": self.stations,
             "next": self.next_station() if self.key_pose is not None else None,
         }
