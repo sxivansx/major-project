@@ -54,6 +54,7 @@ export interface Status {
   live_points: number;
   session_loaded: string | null;
   alarms?: string[];
+  audio?: AudioStatus; // newer cores (docs/api.md §5)
 }
 
 export interface Metrics {
@@ -94,6 +95,7 @@ export interface Config {
     min_range_m: number;
     max_range_m: number;
   };
+  audio?: AudioConfig; // newer cores (docs/api.md §5.3)
 }
 
 export interface SessionMeta {
@@ -170,7 +172,7 @@ export interface GridFrame {
   data: Float32Array; // h * w, row-major, row = y, NaN = empty
 }
 
-export type BinaryFrame = ScanFrame | PointsFrame | GridFrame | OpsLayersFrame;
+export type BinaryFrame = ScanFrame | PointsFrame | GridFrame | OpsLayersFrame | AudioFrame;
 
 // ---- operator layer: /api/ops/* and /api/ai/* (docs/api.md, section 3) ----
 
@@ -310,4 +312,63 @@ export interface AiAsk {
   answer: string;
   model?: string;
   cost_usd?: number;
+}
+
+// ---- acoustic layer: four microphones (docs/api.md, section 5) ----
+
+export interface AudioConfig {
+  port: string; // tcp://host:8901
+  mics_mm: [number, number, number][]; // sound-port positions in the array frame, mm
+  array_yaw_deg: number; // array x-axis relative to base +x, deg counter-clockwise
+  calibrated: boolean;
+  trigger_db: number; // spike = short-term energy this many dB above the noise floor
+  min_gap_ms: number; // dead time between events
+  speed_of_sound: number; // m/s
+}
+
+export interface AudioStatus {
+  connected: boolean;
+  source?: "tcp" | "sim" | null;
+  port?: string | null;
+  rate?: number | null;
+  frames?: number | null;
+  lost_frames?: number | null;
+  levels_dbfs?: number[] | null;
+  noise_dbfs?: number[] | null;
+  clipping?: boolean[] | null;
+  calibrated?: boolean | null;
+}
+
+export interface AudioCandidate {
+  kind: string; // void | shadow | unknown | obstacle | depression
+  id: string;
+  distance_m: number;
+  bearing_deg: number;
+}
+
+export interface AudioEvent {
+  id: number;
+  t: number; // unix seconds, core clock
+  t_us?: number; // ESP32 clock
+  peak_dbfs: number;
+  snr_db: number;
+  bearing_deg: number | null; // clockwise from base +x; null if unresolved
+  bearing_sigma_deg: number | null; // 1σ
+  elevation_deg: number | null; // |elevation|
+  confidence: number; // 0..1
+  tdoa_us: Record<string, number>; // "12" … "34"
+  candidates: AudioCandidate[];
+  label?: string;
+}
+
+// Kind 5: per-channel min/max envelopes of the last 100 ms at 1 kHz.
+export interface AudioFrame {
+  kind: 5;
+  channels: number;
+  n: number; // points per channel
+  seq: number;
+  t_unix: number;
+  levels_dbfs: Float32Array; // channels
+  mins: Int16Array[]; // channels × n
+  maxs: Int16Array[];
 }

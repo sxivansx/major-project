@@ -14,6 +14,7 @@ import { encodeGrid, encodeOpsLayers, encodePoints, encodeScan, encodeSessionPoi
 import type { Config, GridLayer, Job, JobRequest, SessionMeta, Status } from "../src/api/types";
 import { AI_MODELS, OPS_DEFAULTS, aiAsk, aiSitrep, aiTriage, analyze, fitPlaneNear, nearestPassable, planRoute, type OpsParams, type OpsResult } from "./ops";
 import { computeGrid, fakeScan, filterQuality, scanToPoints, type FakeScan, type Mount } from "./world";
+import { AUDIO_DEFAULT, AudioSim } from "./audio";
 
 const PORT = Number(process.env.PORT ?? 8000);
 // MOCK_AI=off mimics a core without an OpenRouter key: /ai/status unavailable,
@@ -28,6 +29,7 @@ const config: Config = {
   mount: { axis_z_mm: 80, h_mm: 0, lidar_yaw_deg: 0, center_deg: 90, invert: false, enc_center_deg: 90, enc_invert: false },
   grid: { cell_m: 0.05, z_min_m: -0.5, z_max_m: 2.5, layer: "max" },
   lidar: { min_quality: 10, min_range_m: 0.1, max_range_m: 30 },
+  audio: { ...AUDIO_DEFAULT, mics_mm: AUDIO_DEFAULT.mics_mm.map((p) => [...p] as [number, number, number]) },
 };
 
 const status: Status = {
@@ -37,6 +39,15 @@ const status: Status = {
   live_points: 0,
   session_loaded: null,
 };
+
+// four-microphone array (docs/api.md §5); status.audio always reflects the sim
+const audio = new AudioSim(
+  () => config.audio!,
+  () => opsResult(OPS_DEFAULTS).findings,
+  (buf) => broadcast(buf),
+  (ev) => broadcast(JSON.stringify({ type: "audio_event", ...ev })),
+);
+Object.defineProperty(status, "audio", { get: () => audio.status, enumerable: true });
 
 // The ESP32-S3 Wi-Fi relay: tcp://host:8899 (lidar) and tcp://host:8900 (servo)
 const isTcpPort = (p: string | undefined) => /^tcp:\/\/[^/\s:]+:\d+$/i.test(p ?? "");
@@ -719,6 +730,41 @@ async function handleApi(req: Request, path: string): Promise<Response> {
     return json(planRoute(opsResult(p), from, to));
   }
 
+  // ---- acoustic layer ----
+  if (path === "/audio/connect" && m === "POST") {
+    const b = await body<{ source?: string; port?: string }>(req);
+    if (b.source !== "tcp" && b.source !== "sim") return err(422, "source must be tcp or sim");
+    if (b.source === "tcp" && !/^tcp:\/\/[^/\s:]+:\d+$/i.test(b.port ?? "")) return err(422, "port must be tcp://host:8901");
+    await sleep(200);
+    audio.start(b.source, b.source === "sim" ? "sim" : b.port!);
+    if (b.source === "tcp") config.audio!.port = b.port!;
+    sendLog("info", `audio connected (${b.source}${b.source === "tcp" ? " " + b.port : ""})`);
+    sendStatus();
+    return json(status);
+  }
+  if (path === "/audio/disconnect" && m === "POST") {
+    audio.stop();
+    sendLog("info", "audio disconnected");
+    sendStatus();
+    return json(status);
+  }
+  if (path === "/audio/events" && m === "GET") {
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") ?? 50) || 50));
+    return json(audio.events.slice(0, limit));
+  }
+  if (path === "/audio/clear" && m === "POST") {
+    audio.clear();
+    return new Response(null, { status: 204 });
+  }
+  if (path === "/audio/sim/emit" && m === "POST") {
+    if (!audio.status.connected) return err(409, "audio not connected");
+    if (audio.status.source !== "sim") return err(409, "sim source only");
+    const b = await body<{ bearing_deg?: number; elevation_deg?: number; snr_db?: number }>(req);
+    const bearing = Number(b.bearing_deg ?? 0);
+    if (!Number.isFinite(bearing)) return err(422, "bearing_deg must be a number");
+    return json(audio.emit(((bearing % 360) + 360) % 360, Number(b.elevation_deg ?? 0) || 0, Number(b.snr_db ?? 20) || 20));
+  }
+
   // ---- assistant layer (canned, reads the findings only) ----
   if (path === "/ai/status" && m === "GET")
     return json(
@@ -760,6 +806,7 @@ async function handleApi(req: Request, path: string): Promise<Response> {
     if (b.mount) Object.assign(config.mount, b.mount);
     if (b.grid) Object.assign(config.grid, b.grid);
     if (b.lidar) Object.assign(config.lidar, b.lidar);
+    if (b.audio) Object.assign(config.audio!, b.audio);
     refreshServoStatus();
     sendLog("info", "config updated");
     sendStatus();

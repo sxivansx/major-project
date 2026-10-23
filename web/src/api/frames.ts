@@ -2,7 +2,7 @@
 // Everything is little-endian (docs/api.md). Shared by the app, the mock
 // server and the headless check script, so keep this file dependency-free.
 
-import type { BinaryFrame, GridFrame, GridLayer, OpsLayersFrame, PointsFrame, ScanFrame } from "./types";
+import type { AudioFrame, BinaryFrame, GridFrame, GridLayer, OpsLayersFrame, PointsFrame, ScanFrame } from "./types";
 
 const LAYER_BY_CODE: GridLayer[] = ["max", "min", "mean", "count"];
 export const LAYER_CODE: Record<GridLayer, number> = { max: 0, min: 1, mean: 2, count: 3 };
@@ -107,6 +107,63 @@ export function parseOpsLayers(buf: ArrayBuffer): OpsLayersFrame {
   return { kind: 4, w, h, cell_m, x0_m, y0_m, classes, height };
 }
 
+// Kind 5, audio preview (docs/api.md §5.4):
+//   u8 kind=5, u8 channels, u16 n, u32 seq, f64 t_unix,      16 bytes
+//   channels × f32 level_dbfs,
+//   channels × n × (i16 min, i16 max), channel-major
+// Read through a DataView so no alignment is assumed anywhere.
+export const AUDIO_HEADER = 16;
+
+export function parseAudio(buf: ArrayBuffer): AudioFrame {
+  need(buf, AUDIO_HEADER, "audio header");
+  const dv = new DataView(buf);
+  const kind = dv.getUint8(0);
+  if (kind !== 5) throw new FrameError(`audio: kind ${kind}, expected 5`);
+  const channels = dv.getUint8(1);
+  const n = dv.getUint16(2, true);
+  const seq = dv.getUint32(4, true);
+  const t_unix = dv.getFloat64(8, true);
+  if (channels === 0 || channels > 16) throw new FrameError(`audio: ${channels} channels`);
+  const bodyAt = AUDIO_HEADER + channels * 4;
+  need(buf, bodyAt + channels * n * 4, "audio body");
+  const levels_dbfs = new Float32Array(channels);
+  for (let c = 0; c < channels; c++) levels_dbfs[c] = dv.getFloat32(AUDIO_HEADER + c * 4, true);
+  const mins: Int16Array[] = [];
+  const maxs: Int16Array[] = [];
+  let o = bodyAt;
+  for (let c = 0; c < channels; c++) {
+    const mn = new Int16Array(n);
+    const mx = new Int16Array(n);
+    for (let i = 0; i < n; i++, o += 4) {
+      mn[i] = dv.getInt16(o, true);
+      mx[i] = dv.getInt16(o + 2, true);
+    }
+    mins.push(mn);
+    maxs.push(mx);
+  }
+  return { kind: 5, channels, n, seq, t_unix, levels_dbfs, mins, maxs };
+}
+
+export function encodeAudio(f: Omit<AudioFrame, "kind">): ArrayBuffer {
+  const { channels, n } = f;
+  const buf = new ArrayBuffer(AUDIO_HEADER + channels * 4 + channels * n * 4);
+  const dv = new DataView(buf);
+  dv.setUint8(0, 5);
+  dv.setUint8(1, channels);
+  dv.setUint16(2, n, true);
+  dv.setUint32(4, f.seq >>> 0, true);
+  dv.setFloat64(8, f.t_unix, true);
+  for (let c = 0; c < channels; c++) dv.setFloat32(AUDIO_HEADER + c * 4, f.levels_dbfs[c], true);
+  let o = AUDIO_HEADER + channels * 4;
+  for (let c = 0; c < channels; c++) {
+    for (let i = 0; i < n; i++, o += 4) {
+      dv.setInt16(o, f.mins[c][i], true);
+      dv.setInt16(o + 2, f.maxs[c][i], true);
+    }
+  }
+  return buf;
+}
+
 export function parseFrame(buf: ArrayBuffer): BinaryFrame {
   if (buf.byteLength < 1) throw new FrameError("empty binary frame");
   const kind = new Uint8Array(buf, 0, 1)[0];
@@ -119,6 +176,8 @@ export function parseFrame(buf: ArrayBuffer): BinaryFrame {
       return parseGrid(buf);
     case 4:
       return parseOpsLayers(buf);
+    case 5:
+      return parseAudio(buf);
     default:
       throw new FrameError(`unknown frame kind ${kind}`);
   }

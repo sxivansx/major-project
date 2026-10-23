@@ -1103,3 +1103,61 @@ button.toggled {
   flex: 1;
   min-width: 0;
 }
+
+/* ---- sound tab ---- */
+.compass-wrap {
+  display: flex;
+  justify-content: center;
+}
+
+.compass-label {
+  fill: var(--text-dim);
+  font: 11px var(--mono);
+}
+
+.compass-label.accent {
+  fill: var(--accent);
+}
+
+.audio-events td.cands {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--mono);
+}
+
+.audio-events tr.dim td {
+  color: var(--text-dim);
+}
+
+.audio-port {
+  width: 220px;
+}
+
+.geom {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.geom-form {
+  flex: 1;
+  min-width: 200px;
+}
+
+.geom-form table.list input {
+  width: 72px;
+  padding: 2px 4px;
+}
+
+.mic-sketch {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  flex: none;
+}
+
+.ops-sound {
+  line-height: 1.5;
+  font-size: 13px;
+}

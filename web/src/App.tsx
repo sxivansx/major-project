@@ -5,6 +5,8 @@ import { startMetricsFollow } from "./store/metrics";
 import { clientLog, useStore, type Tab } from "./store/store";
 import { OpsTab } from "./components/OpsTab";
 import { LiveTab } from "./components/LiveTab";
+import { SoundTab } from "./components/SoundTab";
+import { loadAudioEvents } from "./store/audio";
 import { CloudTab } from "./components/CloudTab";
 import { SessionsPanel } from "./components/SessionsPanel";
 import { LogPanel } from "./components/LogPanel";
@@ -17,6 +19,7 @@ import { StatusBar } from "./components/StatusBar";
 const TABS: { id: Tab; label: string }[] = [
   { id: "ops", label: "Operator" },
   { id: "live", label: "Live scan" },
+  { id: "sound", label: "Sound" },
   { id: "cloud", label: "Point cloud and height map" },
   { id: "sessions", label: "Sessions" },
   { id: "log", label: "Log" },
@@ -40,6 +43,8 @@ async function bootstrap() {
   else clientLog("error", `GET /api/ports failed: ${errorText(ports.reason)}`);
   if (sessions.status === "fulfilled") st.setSessions(sessions.value);
   else clientLog("error", `GET /api/sessions failed: ${errorText(sessions.reason)}`);
+  // older cores have no audio layer: loadAudioEvents keeps the error to itself
+  if (status.status === "fulfilled" && status.value.audio) void loadAudioEvents();
 }
 
 export default function App() {
@@ -69,6 +74,7 @@ export default function App() {
         <div className="tab-body">
           {tab === "ops" && <OpsTab />}
           {tab === "live" && <LiveTab />}
+          {tab === "sound" && <SoundTab />}
           {tab === "cloud" && <CloudTab />}
           {tab === "sessions" && <SessionsPanel />}
           {tab === "log" && <LogPanel />}

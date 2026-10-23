@@ -6,8 +6,8 @@
 //
 // Against the real core this will move the servo and run a short sweep.
 
-import { encodeOpsLayers, parseFrame, parseGrid, parseOpsLayers, parseSessionPoints } from "../src/api/frames";
-import type { AiAsk, AiSitrep, AiStatus, AiTriage, BinaryFrame, Config, Findings, Job, Metrics, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
+import { encodeAudio, encodeOpsLayers, parseAudio, parseFrame, parseGrid, parseOpsLayers, parseSessionPoints } from "../src/api/frames";
+import type { AiAsk, AiSitrep, AiStatus, AiTriage, AudioEvent, BinaryFrame, Config, Findings, Job, Metrics, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
 import { FINDING_KINDS } from "../src/api/types";
 
 const BASE = process.env.CHECK_URL ?? "http://127.0.0.1:8000";
@@ -371,6 +371,94 @@ if (ai.available) {
 {
   const mineOps = (await req<SessionMeta[]>("GET", "/sessions")).find((s) => s.name === "ops-check");
   if (mineOps) await req<void>("DELETE", `/sessions/${mineOps.id}`);
+}
+
+// ---- 6c. acoustic layer (docs/api.md §5) ----
+console.log("\nAcoustic layer");
+{
+  // kind-5 codec round trip, odd n so nothing lines up on 4 or 8 bytes
+  const n = 3;
+  const mins = [0, 1, 2, 3].map((c) => new Int16Array([-100 - c, -32768, -1]));
+  const maxs = [0, 1, 2, 3].map((c) => new Int16Array([100 + c, 32767, 0]));
+  const buf = encodeAudio({ channels: 4, n, seq: 7, t_unix: 1761250000.25, levels_dbfs: new Float32Array([-40, -41.5, -39, -60]), mins, maxs });
+  ok(buf.byteLength === 16 + 4 * 4 + 4 * n * 4, `kind-5 frame is ${buf.byteLength} bytes (16 + 16 + 4·3·4)`);
+  const f = parseAudio(buf);
+  ok(f.kind === 5 && f.channels === 4 && f.n === n && f.seq === 7 && Math.abs(f.t_unix - 1761250000.25) < 1e-6, "kind-5 header round trip");
+  ok(Math.abs(f.levels_dbfs[1] + 41.5) < 1e-6 && f.levels_dbfs[3] === -60, "kind-5 levels round trip");
+  let same = true;
+  for (let c = 0; c < 4; c++) for (let i = 0; i < n; i++) if (f.mins[c][i] !== mins[c][i] || f.maxs[c][i] !== maxs[c][i]) same = false;
+  ok(same, "kind-5 min/max envelopes round trip (channel-major, incl. ±full scale)");
+  ok(parseFrame(buf).kind === 5, "parseFrame dispatches kind 5");
+}
+const stA = await req<Status>("GET", "/status");
+if (!stA.audio) {
+  console.log("  (skipped: this core reports no audio in its status)");
+} else {
+  const cfgA = await req<Config>("GET", "/config");
+  ok(!!cfgA.audio && Array.isArray(cfgA.audio.mics_mm) && cfgA.audio.mics_mm.length === 4 && typeof cfgA.audio.trigger_db === "number", "config has the audio block");
+  const badSrc = await fetch(BASE + "/api/audio/connect", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ source: "usb" }) });
+  ok(badSrc.status === 400 || badSrc.status === 422, `audio/connect with a bad source -> ${badSrc.status}`);
+  col.frames.length = 0;
+  col.text.length = 0;
+  const sa = await req<Status>("POST", "/audio/connect", { source: "sim", port: "sim" });
+  ok(sa.audio?.connected === true && sa.audio.source === "sim", "audio connect (sim)");
+  await sleep(1200);
+  const af = col.frames.filter((x) => x.kind === 5);
+  ok(af.length >= 10 && af.length <= 30, `${af.length} kind-5 frames in 1.2 s (≤ 20 Hz)`);
+  if (af.length && af[0].kind === 5) {
+    const a0 = af[af.length - 1];
+    if (a0.kind === 5) {
+      ok(a0.channels === 4 && a0.n === 100, `audio frame ${a0.channels} ch × ${a0.n} points`);
+      let okEnv = true;
+      for (let c = 0; c < a0.channels; c++) for (let i = 0; i < a0.n; i++) if (a0.mins[c][i] > a0.maxs[c][i]) okEnv = false;
+      ok(okEnv, "min ≤ max everywhere");
+      ok(Array.from(a0.levels_dbfs).every((v) => Number.isFinite(v) && v <= 0), `levels ${Array.from(a0.levels_dbfs).map((v) => v.toFixed(1)).join(" ")} dBFS`);
+      let seqUp = true;
+      for (let i = 1; i < af.length; i++) {
+        const p = af[i - 1];
+        const q = af[i];
+        if (p.kind === 5 && q.kind === 5 && q.seq <= p.seq) seqUp = false;
+      }
+      ok(seqUp, "seq increases");
+    }
+  }
+  const stB = await req<Status>("GET", "/status");
+  const au = stB.audio!;
+  ok(au.levels_dbfs?.length === 4 && au.noise_dbfs?.length === 4 && au.clipping?.length === 4, "status.audio has levels, noise and clipping per mic");
+  // a knock from the direction of a known finding must list it as a candidate
+  const target = fd.voids[0] ?? fd.shadows[0] ?? fd.obstacles[0];
+  const bearing = target ? target.bearing_deg : 40;
+  col.text.length = 0;
+  const em = await req<AudioEvent>("POST", "/audio/sim/emit", { bearing_deg: bearing, elevation_deg: 10, snr_db: 22 });
+  await waitFor(() => col.text.some((m) => m.type === "audio_event"), 2000, "audio_event");
+  const wsEv = col.text.find((m) => m.type === "audio_event") as unknown as AudioEvent | undefined;
+  ok(!!wsEv, "audio_event arrives on the WebSocket");
+  const ev = wsEv ?? em;
+  ok(typeof ev.id === "number" && typeof ev.t === "number" && typeof ev.peak_dbfs === "number" && typeof ev.snr_db === "number", `event #${ev.id} peak ${ev.peak_dbfs} dBFS snr ${ev.snr_db} dB`);
+  ok(ev.bearing_deg !== null && ev.bearing_sigma_deg !== null && ev.bearing_sigma_deg > 0, `bearing ${ev.bearing_deg}° ± ${ev.bearing_sigma_deg}°`);
+  const diff = ev.bearing_deg === null ? 999 : Math.abs((((ev.bearing_deg - bearing) % 360) + 540) % 360 - 180);
+  ok(diff <= 2 * (ev.bearing_sigma_deg ?? 0), `emitted ${bearing}° lies within ± 2σ (off by ${diff.toFixed(1)}°)`);
+  ok(ev.confidence >= 0 && ev.confidence <= 1, `confidence ${ev.confidence}`);
+  ok(Object.keys(ev.tdoa_us).sort().join(",") === "12,13,14,23,24,34", "tdoa_us has the six pairs");
+  ok(ev.candidates.every((c) => ids.has(c.id) && typeof c.distance_m === "number" && typeof c.kind === "string"), `${ev.candidates.length} candidates, all from the findings`);
+  if (target) ok(ev.candidates.some((c) => c.id === target.id), `candidates include ${target.id} (the finding the knock was aimed at)`);
+  const order = ev.candidates.map((c) => (c.kind === "void" ? 0 : c.kind === "obstacle" ? 2 : 1));
+  ok(order.every((v, i) => i === 0 || v >= order[i - 1]), "candidates: voids, then unseen regions, then obstacles");
+  ok(!JSON.stringify(ev).toLowerCase().includes("person") && !JSON.stringify(ev).toLowerCase().includes("survivor"), "event never names a person");
+  const evs = await req<AudioEvent[]>("GET", "/audio/events?limit=5");
+  ok(Array.isArray(evs) && evs.length >= 1 && evs.length <= 5 && evs[0].id === ev.id, `GET /audio/events -> ${evs.length}, newest first`);
+  ok(evs.every((e, i) => i === 0 || e.t <= evs[i - 1].t), "events sorted newest first");
+  const cfgB = await req<Config>("PUT", "/config", { ...cfgA, audio: { ...cfgA.audio!, trigger_db: 15, min_gap_ms: 500 } });
+  ok(cfgB.audio?.trigger_db === 15 && cfgB.audio?.min_gap_ms === 500, "PUT /config audio block echoes the change");
+  await req<Config>("PUT", "/config", cfgA);
+  const clr = await fetch(BASE + "/api/audio/clear", { method: "POST" });
+  ok(clr.status === 204 || clr.status === 200, `POST /audio/clear -> ${clr.status}`);
+  const evs2 = await req<AudioEvent[]>("GET", "/audio/events");
+  ok(evs2.every((e) => e.id !== ev.id), "events cleared");
+  const sd = await req<Status>("POST", "/audio/disconnect");
+  ok(sd.audio?.connected === false, "audio disconnect");
+  const emOff = await fetch(BASE + "/api/audio/sim/emit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bearing_deg: 10 }) });
+  ok(emOff.status === 409 || emOff.status === 400, `sim/emit while disconnected -> ${emOff.status}`);
 }
 
 // ---- 7. config ----

@@ -8,6 +8,7 @@ import { OpsAdvanced } from "./OpsAdvanced";
 import { OpsMap, type OpsMapHandle } from "./OpsMap";
 import { OpsSummary } from "./OpsSummary";
 import { Shell, type BigNumber } from "./Shell";
+import { LOW_CONFIDENCE, RECENT_MAP_S, bearingText, coreNowSec, useAudio, useCoreNow } from "../store/audio";
 
 // The Operator tab, simple view: three numbers, one map, what we have, three
 // buttons. Everything else sits behind Advanced.
@@ -49,6 +50,10 @@ export function OpsTab() {
   const maxStep = useOps((s) => s.maxStep);
   const maxSlope = useOps((s) => s.maxSlope);
 
+  const soundEvents = useAudio((s) => s.events);
+  const latestSound = soundEvents[0] ?? null;
+  const soundNow = useCoreNow(!!latestSound && coreNowSec() - latestSound.t < RECENT_MAP_S + 2);
+  const soundFresh = !!latestSound && soundNow - latestSound.t < RECENT_MAP_S;
   const mapRef = useRef<OpsMapHandle>(null);
   const [scanErr, setScanErr] = useState<string | null>(null);
   const [scanBusy, setScanBusy] = useState(false);
@@ -124,6 +129,12 @@ export function OpsTab() {
     },
     { label: "Possible voids", value: haveAnalysis ? findings!.voids.length : "–" },
     { label: "Next", value: nextStationText(findings), className: "ops-next" },
+    {
+      label: "Sound",
+      value: latestSound ? (latestSound.bearing_deg === null ? "unresolved" : bearingText(latestSound)) : "–",
+      // grey when the direction is weak or older than the wedges on the map
+      className: "ops-next" + (latestSound && (latestSound.confidence < LOW_CONFIDENCE || !soundFresh || latestSound.bearing_deg === null) ? " dim" : ""),
+    },
   ];
 
   return (
@@ -154,6 +165,7 @@ export function OpsTab() {
                     <span className="sw hatch-diag" /> not seen yet
                     <span className="sw sw-void" /> V1 possible void
                     <span className="dim">arrow: next station</span>
+                    {soundFresh && <span className="dim">blue wedge: sound direction</span>}
                   </>
                 )}
                 <span className="spacer" />

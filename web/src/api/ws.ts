@@ -7,6 +7,8 @@ import { FrameError, parseFrame } from "./frames";
 import type { Job, ScanFrame, Status, WsTextMessage } from "./types";
 import { cloud, cloudAppend } from "../store/cloud";
 import { clientLog, useStore } from "../store/store";
+import { audioAddEvent, audioPushFrame } from "../store/audio";
+import type { AudioEvent } from "./types";
 
 const SCAN_MIN_MS = 100;
 const CLOUD_MIN_MS = 200;
@@ -149,6 +151,11 @@ class WsClient {
         st.addLog(level, String(m.msg ?? ""), typeof m.t === "number" ? m.t : undefined, "server");
         break;
       }
+      case "audio_event": {
+        const { type: _t, ...ev } = msg as unknown as { type: "audio_event" } & AudioEvent;
+        audioAddEvent(ev as AudioEvent);
+        break;
+      }
       case "pong":
         break;
       default:
@@ -175,6 +182,9 @@ class WsClient {
         break;
       case 3:
         useStore.getState().setGrid(frame);
+        break;
+      case 5:
+        audioPushFrame(frame);
         break;
     }
   }

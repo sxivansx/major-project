@@ -6,6 +6,7 @@ import type {
   AiSitrep,
   AiStatus,
   AiTriage,
+  AudioEvent,
   Config,
   Findings,
   GridFrame,
@@ -140,6 +141,13 @@ export const api = {
   aiTriage: (body: { cell?: number }) => request<AiTriage>("POST", "/ai/triage", body),
   aiSitrep: (body: { cell?: number }) => request<AiSitrep>("POST", "/ai/sitrep", body),
   aiAsk: (question: string) => request<AiAsk>("POST", "/ai/ask", { question }),
+
+  // acoustic layer (docs/api.md §5)
+  audioConnect: (body: { source: "tcp" | "sim"; port: string }) => request<Status>("POST", "/audio/connect", body),
+  audioDisconnect: () => request<Status>("POST", "/audio/disconnect"),
+  audioEvents: (limit = 50) => request<AudioEvent[]>("GET", `/audio/events?limit=${limit}`),
+  audioClear: () => request<void>("POST", "/audio/clear"),
+  audioEmit: (body: { bearing_deg: number; elevation_deg?: number; snr_db?: number }) => request<unknown>("POST", "/audio/sim/emit", body),
 };
 
 export function errorText(e: unknown): string {

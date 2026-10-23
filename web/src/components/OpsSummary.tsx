@@ -1,5 +1,6 @@
-import type { Findings } from "../api/types";
-import { fmtTime, fmtUsd } from "../lib/format";
+import type { AudioEvent, Findings } from "../api/types";
+import { fmt, fmtTime, fmtUsd } from "../lib/format";
+import { LOW_CONFIDENCE, RECENT_TEXT_S, bearingText, candidateWord, coreNowSec, eventWord, useAudio, useCoreNow } from "../store/audio";
 import { decisionsAvailable, useOps } from "../store/ops";
 import { AskBox } from "./OpsAssistant";
 
@@ -25,6 +26,39 @@ function fromFindings(f: Findings): string {
         : `Next: move ${f.next_station.distance_m} m toward ${f.next_station.bearing_deg}° (${f.next_station.reason}).`,
     );
   return lines.join("\n");
+}
+
+// One plain sentence per detected sound. Directions only: never a position.
+export function soundSentence(ev: AudioEvent): string {
+  const when = `${eventWord(ev)} at ${fmtTime(ev.t)}`;
+  const conf = `confidence ${fmt(ev.confidence, 2)}`;
+  if (ev.bearing_deg === null) return `${when}: direction not resolved (${conf}).`;
+  const along = ev.candidates.length
+    ? `Along that direction: ${ev.candidates
+        .slice(0, 4)
+        .map((c) => `${candidateWord(c.kind)} ${c.id}${c.kind === "void" ? ` at ${fmt(c.distance_m, 1)} m` : ""}`)
+        .join(", ")}${ev.candidates.length > 4 ? ` and ${ev.candidates.length - 4} more` : ""}.`
+    : "Nothing mapped along that direction yet.";
+  if (ev.confidence < LOW_CONFIDENCE) return `${when} from about ${bearingText(ev)}, low confidence (${fmt(ev.confidence, 2)}): treat the direction as a guess. ${along}`;
+  return `${when} from ${bearingText(ev)} (${conf}). ${along}`;
+}
+
+function SoundLines() {
+  const events = useAudio((s) => s.events);
+  const active = events.length > 0 && coreNowSec() - events[0].t < RECENT_TEXT_S + 2;
+  const now = useCoreNow(active, 5000);
+  const recent = events.filter((e) => now - e.t < RECENT_TEXT_S).slice(0, 5);
+  if (recent.length === 0) return null;
+  return (
+    <div className="ops-sound">
+      {recent.map((e) => (
+        <div key={e.id} className={e.confidence < LOW_CONFIDENCE || e.bearing_deg === null ? "dim" : ""}>
+          {soundSentence(e)}
+        </div>
+      ))}
+      <div className="ai-label">from the microphones: a direction from the scanner, not a distance</div>
+    </div>
+  );
 }
 
 export function OpsSummary() {
@@ -62,6 +96,7 @@ export function OpsSummary() {
           </div>
         )}
         {text && !sitrep && <div className="ai-label">from the findings (summary service: {sitrepError})</div>}
+        <SoundLines />
         <div className="ops-ask-wrap">{ask}</div>
       </div>
     </section>

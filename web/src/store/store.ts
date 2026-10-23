@@ -14,7 +14,7 @@ import type {
 } from "../api/types";
 
 export type WsState = "connecting" | "open" | "closed";
-export type Tab = "ops" | "live" | "cloud" | "sessions" | "log";
+export type Tab = "ops" | "live" | "sound" | "cloud" | "sessions" | "log";
 
 export interface LogEntry {
   id: number;
@@ -87,7 +87,7 @@ export interface State extends UiState {
 
 let logId = 0;
 
-const TAB_IDS: Tab[] = ["ops", "live", "cloud", "sessions", "log"];
+const TAB_IDS: Tab[] = ["ops", "live", "sound", "cloud", "sessions", "log"];
 function initialTab(): Tab {
   const h = typeof location !== "undefined" ? location.hash.replace(/^#/, "") : "";
   return (TAB_IDS as string[]).includes(h) ? (h as Tab) : "ops";

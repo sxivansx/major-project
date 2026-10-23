@@ -22,7 +22,7 @@ export function LiveSensor() {
 
   let lidarText: string;
   if (lidar?.connected) {
-    const name = lidar.model ? (lidar.model.startsWith("S2") ? `RPLIDAR ${lidar.model}` : lidar.model) : "LiDAR";
+    const name = lidar.model ? (/^S\d/.test(lidar.model) ? `RPLIDAR ${lidar.model}` : lidar.model) : "LiDAR";
     const where = lidar.source === "sim" ? "simulator" : lidar.port ? `on ${lidar.port}` : "connected";
     const health = healthWord(lidar.health);
     const healthText = health === "good" ? "healthy" : health === "–" ? "health unknown" : `health ${health}`;
