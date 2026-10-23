@@ -45,6 +45,20 @@ def test_alarm_raised_when_the_source_dies(rig):
     assert any("cleared: lidar stream died" in m for m in rig.msgs if isinstance(m, str))
 
 
+def test_changing_value_keeps_one_alarm(rig):
+    rig.connect_servo("sim")
+    rig.connect_lidar("sim")
+    time.sleep(0.1)
+    rig._scan_connected_at -= 10
+    rig.scan_info["health"] = "warning"
+    rig.check_alarms()
+    n = sum(1 for m in rig.msgs if isinstance(m, str) and "alarm: lidar health" in m)
+    rig.scan_info["health"] = "error"  # same kind, new text: updated, not re-raised
+    rig.check_alarms()
+    assert sum(1 for m in rig.msgs if isinstance(m, str) and "alarm: lidar health" in m) == n == 1
+    assert rig.status()["alarms"] == ["lidar health error"]
+
+
 def test_metrics_empty(rig):
     m = rig.metrics()
     assert m["points"] == 0 and m["grid"]["filled"] == 0 and m["floor"] is None

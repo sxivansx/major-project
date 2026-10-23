@@ -78,6 +78,7 @@ class Rig:
         self._last_scan_pub = 0.0
         self._scan_connected_at = 0.0
         self._alarms: set[str] = set()
+        self._alarm_keys: dict[str, str] = {}
 
         self.tilt: TiltSource | None = None
 
@@ -163,37 +164,42 @@ class Rig:
 
     def check_alarms(self) -> list[str]:
         """Called about once a second. Raises/clears alarms with one log line each."""
-        alarms: list[str] = []
+        # Keyed by kind, so a changing number (6.3 Hz, then 6.6 Hz) updates one alarm instead of
+        # raising and clearing a new one every second. Over Wi-Fi the first seconds after connect
+        # replay buffered rotations in bursts, hence the longer grace period.
+        alarms: dict[str, str] = {}
         now = time.time()
         with self._lock:
-            if self.scan is not None and now - self._scan_connected_at > 3.0:
+            if self.scan is not None and now - self._scan_connected_at > 8.0:
                 last_t = self.latest.t if self.latest else self._scan_connected_at
                 age = now - last_t
                 hz = self.stats.hz
                 if age > 2.0:
-                    alarms.append(f"no lidar frames for {age:.0f} s")
+                    alarms["no_frames"] = f"no lidar frames for {age:.0f} s"
                 elif hz is not None and hz < 8.0:
-                    alarms.append(f"scan rate low: {hz:.1f} Hz")
+                    alarms["rate"] = f"scan rate low: {hz:.1f} Hz"
                 if self.stats.pts_per_rev and self.stats.pts_per_rev < 1000:
-                    alarms.append(f"only {self.stats.pts_per_rev} points per rotation")
+                    alarms["points"] = f"only {self.stats.pts_per_rev} points per rotation"
                 health = self.scan_info.get("health")
                 if health not in (None, "good"):
-                    alarms.append(f"lidar health {health}")
+                    alarms["health"] = f"lidar health {health}"
             if self.scan is None and self.scan_error:
-                alarms.append(f"lidar stream died: {self.scan_error}")
+                alarms["died"] = f"lidar stream died: {self.scan_error}"
             job = self.job
             if job and job["state"] == "error":
-                alarms.append(f"job {job['job_id']} failed: {job['error']}")
-            current = set(alarms)
-            raised, cleared = current - self._alarms, self._alarms - current
-            self._alarms = current
+                alarms["job"] = f"job {job['job_id']} failed: {job['error']}"
+            old = self._alarm_keys
+            raised = [alarms[k] for k in alarms if k not in old]
+            cleared = [old[k] for k in old if k not in alarms]
+            self._alarm_keys = alarms
+            self._alarms = set(alarms.values())
         for a in sorted(raised):
             self.log("warn", f"alarm: {a}")
         for a in sorted(cleared):
             self.log("info", f"cleared: {a}")
         if raised or cleared:
             self.publish_status()
-        return alarms
+        return sorted(alarms.values())
 
     def snapshot_csv(self, rotations: int = 1, timeout: float = 5.0) -> bytes:
         """The next `rotations` full rotations at the current tilt, raw, as CSV. For bias measurements."""
