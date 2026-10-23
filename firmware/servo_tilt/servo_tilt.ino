@@ -1,4 +1,4 @@
-// servo_tilt.ino -- OBSLAM payload: tilt-servo controller
+// servo_tilt.ino -- On-board SLAM payload: tilt-servo controller
 //
 // Drives one GS2010MG 180-degree servo (50 Hz PWM) that tilts the LiDAR cradle,
 // reads the cradle angle back from an AS5600 magnetic encoder on the tilt axle

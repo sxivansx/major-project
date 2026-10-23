@@ -12,8 +12,9 @@ from obslam.servo import SerialTilt, TiltError
 class FakeTiltServer(threading.Thread):
     """Speaks the firmware's line protocol over TCP, like the ESP32-S3 does on port 8900."""
 
-    def __init__(self):
+    def __init__(self, banner: bytes = b"OBSLAM-TILT v1\n"):
         super().__init__(daemon=True)
+        self.banner = banner
         self.srv = socket.socket()
         self.srv.bind(("127.0.0.1", 0))
         self.srv.listen(1)
@@ -38,7 +39,7 @@ class FakeTiltServer(threading.Thread):
         self.conn.close()
 
     def serve(self, conn):
-        conn.sendall(b"OBSLAM-TILT v1\n")  # boot banner, like the serial firmware
+        conn.sendall(self.banner)  # boot banner, like the serial firmware
         f = conn.makefile("rwb", buffering=0)
         try:
             lines = list(self._lines(f))
@@ -50,7 +51,7 @@ class FakeTiltServer(threading.Thread):
             line = raw.decode().strip()
             self.lines.append(line)
             if line == "I":
-                f.write(b"OBSLAM-TILT v1\n")
+                f.write(self.banner)
             elif line == "?":
                 f.write(f"STATUS angle={self.angle:.1f} meas={self.angle + 0.3:.1f} min=0 max=180 range=180 us_min=500 us_max=2500 enc=ok settled=1 ip=192.168.4.7\n".encode())
             elif line.startswith("T "):
@@ -74,6 +75,15 @@ def test_tilt_over_tcp():
     assert t.raw("?").startswith("STATUS")
     t.disconnect()
     assert "T 120.00" in srv.lines
+
+
+def test_tilt_accepts_a_board_flashed_under_an_older_name():
+    srv = FakeTiltServer(banner=b"LEGACY-TILT v1\n")
+    srv.start()
+    t = SerialTilt(f"tcp://127.0.0.1:{srv.port}")
+    t.connect()  # any <NAME>-TILT banner identifies the tilt firmware
+    assert t.move(100.0) == 100.0
+    t.disconnect()
 
 
 def test_tilt_tcp_reconnects_after_the_esp_drops_the_socket():

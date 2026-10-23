@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""audio_check.py: validate the OBSLAM four-microphone stream.
+"""audio_check.py: validate the On-board SLAM four-microphone stream.
 
 Two transports, both per docs/api.md section 5.2:
 
@@ -359,7 +359,7 @@ def run_udp(host, port, sink, seconds, listen_port):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Validate the OBSLAM microphone stream (TCP AUD1 or UDP AUD2).")
+    ap = argparse.ArgumentParser(description="Validate the On-board SLAM microphone stream (TCP AUD1 or UDP AUD2).")
     ap.add_argument("host", help="scanner address, e.g. 192.168.4.1 or obslam-tilt.local[:port]")
     ap.add_argument("--udp", action="store_true", help="subscribe to the UDP stream (AUDS to port 8902)")
     ap.add_argument("--port", type=int, help="scanner port (default 8901 for TCP, 8902 for --udp)")
