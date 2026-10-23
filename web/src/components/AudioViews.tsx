@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, errorText } from "../api/rest";
-import type { AudioConfig, AudioEvent } from "../api/types";
+import type { AudioConfig, AudioEvent, AudioSource } from "../api/types";
 import { fmt, fmtTime } from "../lib/format";
 import {
   CLIP,
@@ -8,7 +8,9 @@ import {
   RECENT_TEXT_S,
   bearingText,
   candidateWord,
+  excludedList,
   predictTdoa,
+  sourceHalfWidth,
   useAudio,
   wave,
 } from "../store/audio";
@@ -50,14 +52,16 @@ export function Waveforms() {
   const connected = useStore((s) => !!s.status?.audio?.connected);
   const events = useAudio((s) => s.events);
   const selectedId = useAudio((s) => s.selectedId);
-  const ext = useRef({ noise, clipping, connected, events, selectedId });
+  const status = useStore((s) => s.status);
+  const excludedKey = excludedList(status).map((x) => x.mic).join(",");
+  const ext = useRef({ noise, clipping, connected, events, selectedId, excluded: [] as number[] });
   const dirty = useRef(true);
 
   useEffect(() => {
     scaleRef.current = scale;
-    ext.current = { noise, clipping, connected, events, selectedId };
+    ext.current = { noise, clipping, connected, events, selectedId, excluded: excludedKey ? excludedKey.split(",").map(Number) : [] };
     dirty.current = true;
-  }, [scale, noise, clipping, connected, events, selectedId]);
+  }, [scale, noise, clipping, connected, events, selectedId, excludedKey]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -87,7 +91,7 @@ export function Waveforms() {
       if (wave.version === seen && !dirty.current) return;
       seen = wave.version;
       dirty.current = false;
-      const { noise, clipping, connected, events, selectedId } = ext.current;
+      const { noise, clipping, connected, events, selectedId, excluded } = ext.current;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = C.bg;
       ctx.fillRect(0, 0, W, H);
@@ -152,10 +156,14 @@ export function Waveforms() {
           }
         }
 
-        // lane label
-        ctx.fillStyle = C.dim;
+        // lane label on a backing so it stays readable over a loud lane
+        const ex = excluded.includes(c + 1);
+        const lab = ex ? `Mic ${c + 1} · excluded from direction finding` : `Mic ${c + 1}`;
         ctx.textAlign = "left";
-        ctx.fillText(`Mic ${c + 1}`, 6, top + 13);
+        ctx.fillStyle = "rgba(28,28,28,0.85)";
+        ctx.fillRect(3, top + 3, ctx.measureText(lab).width + 6, 13);
+        ctx.fillStyle = ex ? C.err : C.dim;
+        ctx.fillText(lab, 6, top + 13);
 
         // level meter: −60 … 0 dBFS, noise floor tick, clipping in red
         const lvl = wave.levels[c];
@@ -191,19 +199,21 @@ export function Waveforms() {
           if (tms < start || tms > end) continue;
           const x = Math.round(((tms - start) / WINDOW_MS) * plotW) + 0.5;
           const sel = ev.id === selectedId;
-          ctx.strokeStyle = C.accent;
+          const col = ev.noise ? "#6f6f6f" : C.accent;
+          ctx.strokeStyle = col;
           ctx.lineWidth = sel ? 2 : 1;
           ctx.beginPath();
           ctx.moveTo(x, 0);
           ctx.lineTo(x, H - AXIS);
           ctx.stroke();
           ctx.lineWidth = 1;
+          if (ev.noise && !sel) continue; // grey line only: noise is not worth a label
           const label = ev.bearing_deg === null ? "?" : `${Math.round(ev.bearing_deg)}°`;
           ctx.font = C.mono;
           const w = ctx.measureText(label).width;
           ctx.fillStyle = "rgba(28,28,28,0.85)";
           ctx.fillRect(x + 3, 2, w + 4, 13);
-          ctx.fillStyle = C.accent;
+          ctx.fillStyle = col;
           ctx.textAlign = "left";
           ctx.fillText(label, x + 5, 12);
         }
@@ -253,14 +263,16 @@ function wedgePath(cx: number, cy: number, r: number, bearing: number, half: num
   return `M ${cx} ${cy} L ${cx + r * Math.cos(a0)} ${cy + r * Math.sin(a0)} A ${r} ${r} 0 ${large} 1 ${cx + r * Math.cos(a1)} ${cy + r * Math.sin(a1)} Z`;
 }
 
-export function Compass({ events, now }: { events: AudioEvent[]; now: number }) {
+export function Compass({ sources, events, now, showNoise }: { sources: AudioSource[]; events: AudioEvent[]; now: number; showNoise: boolean }) {
   const selectedId = useAudio((s) => s.selectedId);
+  const highlightSourceId = useAudio((s) => s.highlightSourceId);
   const size = 232;
   const cx = size / 2;
   const cy = size / 2;
   const R = size / 2 - 30;
-  const shown = events.filter((e) => e.bearing_deg !== null && (now - e.t < RECENT_TEXT_S || e.id === selectedId));
-  const newest = shown[0];
+  const ticks = events.filter((e) => e.bearing_deg !== null && (showNoise || !e.noise) && (now - e.t < RECENT_TEXT_S || e.id === selectedId));
+  const sorted = [...sources].sort((a, b) => a.confidence - b.confidence); // strongest drawn last
+  const strongest = sorted[sorted.length - 1];
   return (
     <svg className="compass" viewBox={`0 0 ${size} ${size}`} width={size} height={size} role="img" aria-label="Sound directions">
       <circle cx={cx} cy={cy} r={R} fill="none" stroke="#383838" />
@@ -281,31 +293,46 @@ export function Compass({ events, now }: { events: AudioEvent[]; now: number }) 
           </g>
         );
       })}
-      {[...shown].reverse().map((e) => {
-        const age = Math.max(0, now - e.t);
-        const fade = Math.max(0.15, 1 - age / RECENT_TEXT_S);
-        const sel = e.id === selectedId;
-        const isNew = e === newest;
-        const half = Math.min(180, 2 * (e.bearing_sigma_deg ?? 10));
-        const low = e.confidence < LOW_CONFIDENCE;
+      {sorted.map((s) => {
+        const low = s.confidence < LOW_CONFIDENCE;
+        const strength = 0.35 + 0.65 * Math.max(0, Math.min(1, s.confidence));
+        const hl = s.id === highlightSourceId;
+        const top = s === strongest;
         return (
-          <g key={e.id}>
+          <g key={s.id}>
             <path
-              d={wedgePath(cx, cy, R, e.bearing_deg!, half)}
+              d={wedgePath(cx, cy, R, s.bearing_deg, Math.min(180, sourceHalfWidth(s)))}
               fill={low ? "#8c8c8c" : "#4d9de0"}
-              fillOpacity={(isNew || sel ? 0.3 : 0.12) * fade}
-              stroke={sel ? "#ffffff" : "none"}
+              fillOpacity={0.3 * strength}
+              stroke={hl ? "#ffffff" : "none"}
             />
             <line
               x1={cx}
               y1={cy}
-              x2={cx + Math.cos(e.bearing_deg! * DEG) * R}
-              y2={cy + Math.sin(e.bearing_deg! * DEG) * R}
-              stroke={sel ? "#ffffff" : low ? "#8c8c8c" : "#4d9de0"}
-              strokeOpacity={fade}
-              strokeWidth={isNew || sel ? 2.5 : 1}
+              x2={cx + Math.cos(s.bearing_deg * DEG) * R}
+              y2={cy + Math.sin(s.bearing_deg * DEG) * R}
+              stroke={low ? "#8c8c8c" : "#4d9de0"}
+              strokeOpacity={strength}
+              strokeWidth={top ? 3 : 1 + 1.5 * s.confidence}
             />
           </g>
+        );
+      })}
+      {ticks.map((e) => {
+        const a = e.bearing_deg! * DEG;
+        const sel = e.id === selectedId;
+        const fade = Math.max(0.25, 1 - Math.max(0, now - e.t) / RECENT_TEXT_S);
+        return (
+          <line
+            key={e.id}
+            x1={cx + Math.cos(a) * (R - 9)}
+            y1={cy + Math.sin(a) * (R - 9)}
+            x2={cx + Math.cos(a) * (R + 3)}
+            y2={cy + Math.sin(a) * (R + 3)}
+            stroke={sel ? "#ffffff" : e.noise ? "#6f6f6f" : "#b8b8b8"}
+            strokeOpacity={sel ? 1 : 0.5 * fade}
+            strokeWidth={sel ? 2 : 1}
+          />
         );
       })}
       <circle cx={cx} cy={cy} r={3} fill="#4d9de0" />
@@ -330,6 +357,7 @@ export function EventList({ events }: { events: AudioEvent[] }) {
           <th className="num">bearing</th>
           <th className="num">elev</th>
           <th>confidence</th>
+          <th>source</th>
           <th>along it</th>
         </tr>
       </thead>
@@ -337,7 +365,8 @@ export function EventList({ events }: { events: AudioEvent[] }) {
         {events.map((e) => (
           <tr
             key={e.id}
-            className={(e.id === selectedId ? "sel " : "") + (e.confidence < LOW_CONFIDENCE ? "dim" : "")}
+            className={(e.id === selectedId ? "sel " : "") + (e.noise || e.confidence < LOW_CONFIDENCE ? "dim" : "")}
+            title={e.noise ? `noise${e.reasons?.length ? ": " + e.reasons.join(", ") : ""}` : undefined}
             onClick={() => setSelected(e.id === selectedId ? null : e.id)}
           >
             <td className="mono">{fmtTime(e.t)}</td>
@@ -349,6 +378,7 @@ export function EventList({ events }: { events: AudioEvent[] }) {
               </span>{" "}
               <span className="mono">{fmt(e.confidence, 2)}</span>
             </td>
+            <td className="mono">{e.noise ? "noise" : e.source_id != null ? `#${e.source_id}` : "–"}</td>
             <td className="cands" title={e.candidates.map((c) => `${candidateWord(c.kind)} ${c.id} at ${fmt(c.distance_m, 1)} m`).join(", ")}>
               {e.candidates.length ? e.candidates.map((c) => c.id).join(" ") : "–"}
             </td>

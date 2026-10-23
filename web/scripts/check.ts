@@ -7,7 +7,7 @@
 // Against the real core this will move the servo and run a short sweep.
 
 import { encodeAudio, encodeOpsLayers, parseAudio, parseFrame, parseGrid, parseOpsLayers, parseSessionPoints } from "../src/api/frames";
-import type { AiAsk, AiSitrep, AiStatus, AiTriage, AudioEvent, BinaryFrame, Config, Findings, Job, Metrics, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
+import type { AiAsk, AiSitrep, AiStatus, AiTriage, AudioCalibrateResult, AudioEvent, AudioSource, BinaryFrame, Config, Findings, Job, Metrics, PortInfo, RouteResult, SessionMeta, Status } from "../src/api/types";
 import { FINDING_KINDS } from "../src/api/types";
 
 const BASE = process.env.CHECK_URL ?? "http://127.0.0.1:8000";
@@ -446,6 +446,69 @@ if (!stA.audio) {
   const cfgB = await req<Config>("PUT", "/config", { ...cfgA, audio: { ...cfgA.audio!, trigger_db: 15, min_gap_ms: 500 } });
   ok(cfgB.audio?.trigger_db === 15 && cfgB.audio?.min_gap_ms === 500, "PUT /config audio block echoes the change");
   await req<Config>("PUT", "/config", cfgA);
+  // sources (§5.6): five knocks from one direction become one tapping source
+  const srcProbe = await fetch(BASE + "/api/audio/sources");
+  if (srcProbe.status === 404) console.log("  (sources skipped: this core has no /audio/sources)");
+  else {
+    const tapAt = (bearing + 180) % 360; // away from anything the earlier knock started
+    col.text.length = 0;
+    const tapIds: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const e = await req<AudioEvent>("POST", "/audio/sim/emit", { bearing_deg: tapAt, elevation_deg: 5, snr_db: 24 });
+      if (typeof e.id === "number") tapIds.push(e.id);
+      await sleep(1100);
+    }
+    const srcs = await req<{ active: AudioSource[]; history: AudioSource[] }>("GET", "/audio/sources");
+    ok(Array.isArray(srcs.active) && Array.isArray(srcs.history), `GET /audio/sources -> ${srcs.active.length} active, ${srcs.history.length} in history`);
+    const tap = srcs.active.find((x) => tapIds.some((id) => x.event_ids.includes(id)));
+    ok(!!tap, "the knocks formed an active source");
+    if (tap) {
+      ok(tap.kind === "tapping", `kind ${tap.kind} (≥ 3 knocks 0.3–6 s apart)`);
+      ok(tap.n_events >= 5 && tapIds.every((id) => tap.event_ids.includes(id)), `${tap.n_events} events, all five knocks in it`);
+      const off = Math.abs((((tap.bearing_deg - tapAt) % 360) + 540) % 360 - 180);
+      ok(off <= Math.max(10, 2 * tap.spread_deg), `bearing ${tap.bearing_deg}° ± ${tap.spread_deg}° (aimed at ${tapAt}°, off by ${off.toFixed(1)}°)`);
+      ok(tap.confidence > 0 && tap.confidence <= 0.99 && tap.active === true, `confidence ${tap.confidence}`);
+      ok(tap.last_t >= tap.first_t && tap.candidates.every((c) => ids.has(c.id) && typeof c.off_axis_deg === "number"), `${tap.candidates.length} candidates with off-axis angles`);
+      const evsT = await req<AudioEvent[]>("GET", "/audio/events?limit=50");
+      ok(evsT.filter((e) => tapIds.includes(e.id)).every((e) => e.source_id === tap.id), "the knocks carry source_id of that source");
+    }
+    ok(col.text.some((m) => m.type === "audio_sources" && Array.isArray((m as { active?: unknown }).active)), "audio_sources messages on the WebSocket");
+    const stS = await req<Status>("GET", "/status");
+    ok((stS.audio?.sources_active ?? 0) >= 1, `status.audio.sources_active ${stS.audio?.sources_active}`);
+    const all = await req<AudioEvent[]>("GET", "/audio/events?limit=200");
+    const noisy = all.filter((e) => e.noise);
+    ok(noisy.every((e) => e.confidence < 0.1 && e.candidates.length === 0 && (e.source_id === null || e.source_id === undefined)), `${noisy.length} noise events: confidence < 0.1, no candidates, no source`);
+    ok(all.every((e) => !e.mics_used || e.mics_used.every((m) => m >= 1 && m <= 4)), "mics_used lists mic numbers");
+    ok(Array.isArray(stS.audio?.excluded_mics ?? []), `excluded_mics ${JSON.stringify(stS.audio?.excluded_mics ?? [])}`);
+  }
+
+  // clap calibration (§5.5): four claps at 0, 90, 180, 270
+  const calProbe = await fetch(BASE + "/api/audio/calibrate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clicks: [] }) });
+  if (calProbe.status === 404) console.log("  (calibration skipped: this core has no /audio/calibrate)");
+  else {
+    ok(calProbe.status === 400 || calProbe.status === 422, `calibrate with no claps -> ${calProbe.status}`);
+    const claps: { event_id: number; bearing_deg: number }[] = [];
+    for (const b of [0, 90, 180, 270]) {
+      const e = await req<AudioEvent>("POST", "/audio/sim/emit", { bearing_deg: b, elevation_deg: 0, snr_db: 26 });
+      if (typeof e.id === "number") claps.push({ event_id: e.id, bearing_deg: b });
+      await sleep(400);
+    }
+    ok(claps.length === 4, "four test claps recorded");
+    const three = await fetch(BASE + "/api/audio/calibrate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clicks: claps.slice(0, 3) }) });
+    ok(three.status === 400, `three claps -> ${three.status} (needs ≥ 4)`);
+    const cal = await req<AudioCalibrateResult>("POST", "/audio/calibrate", { clicks: claps, apply: false });
+    const yawOff = Math.abs((((cal.array_yaw_deg - (cfgA.audio?.array_yaw_deg ?? 0)) % 360) + 540) % 360 - 180);
+    ok(Number.isFinite(cal.array_yaw_deg) && yawOff < 5, `fitted yaw ${cal.array_yaw_deg}° (config ${cfgA.audio?.array_yaw_deg}°)`);
+    ok(Array.isArray(cal.channel_offsets_us) && cal.channel_offsets_us.length === 4, `offsets ${cal.channel_offsets_us.join(", ")} µs`);
+    ok(typeof cal.residual_us === "number" && cal.per_click.length === 4, `residual ${cal.residual_us} µs, ${cal.per_click.length} claps`);
+    ok(!!cal.order && typeof cal.order.confirmed === "boolean" && typeof cal.order.verdict === "string", `order: ${cal.order?.verdict}`);
+    ok(cal.applied === false, "apply: false leaves the config alone");
+    const calA = await req<AudioCalibrateResult>("POST", "/audio/calibrate", { clicks: claps, apply: true });
+    const cfgC = await req<Config>("GET", "/config");
+    ok(calA.applied === true && cfgC.audio?.calibrated === calA.ok, `apply: true -> calibrated ${cfgC.audio?.calibrated} (ok ${calA.ok})`);
+    await req<Config>("PUT", "/config", cfgA);
+  }
+
   const clr = await fetch(BASE + "/api/audio/clear", { method: "POST" });
   ok(clr.status === 204 || clr.status === 200, `POST /audio/clear -> ${clr.status}`);
   const evs2 = await req<AudioEvent[]>("GET", "/audio/events");

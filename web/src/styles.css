@@ -936,6 +936,14 @@ button.toggled {
   min-height: 0;
 }
 
+.ops-advanced-grid {
+  grid-auto-rows: max-content;
+}
+
+.ops-advanced-grid > * {
+  min-height: auto;
+}
+
 .ops-advanced-grid.cols-3 {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
@@ -1160,4 +1168,110 @@ button.toggled {
 .ops-sound {
   line-height: 1.5;
   font-size: 13px;
+}
+
+/* sources (§5.6) */
+.source-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.source-card {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.source-card.sel {
+  border-color: var(--accent);
+}
+
+.source-card.weak .source-kind,
+.source-card.weak .source-head .mono {
+  color: var(--text-dim);
+}
+
+.source-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 14px;
+}
+
+.source-head .spacer {
+  flex: 1;
+}
+
+.source-kind {
+  font-weight: 600;
+}
+
+.source-line {
+  margin-top: 2px;
+}
+
+button.linklike {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin-top: 4px;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+button.linklike:hover:not(:disabled) {
+  background: transparent;
+  text-decoration: underline;
+}
+
+.detections-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.detections-head .spacer {
+  flex: 1;
+}
+
+.mic-health {
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+/* clap calibration wizard */
+.wizard-panel {
+  grid-column: 1 / -1;
+}
+
+.wizard {
+  font-size: 13px;
+}
+
+.wizard-list {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  line-height: 1.6;
+}
+
+.wizard-step {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.wizard-text {
+  flex: 1;
+  line-height: 1.5;
+}
+
+.wizard-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.wizard .btn-row > button {
+  flex: none;
 }

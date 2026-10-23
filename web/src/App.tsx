@@ -6,7 +6,7 @@ import { clientLog, useStore, type Tab } from "./store/store";
 import { OpsTab } from "./components/OpsTab";
 import { LiveTab } from "./components/LiveTab";
 import { SoundTab } from "./components/SoundTab";
-import { loadAudioEvents } from "./store/audio";
+import { loadAudioEvents, loadAudioSources } from "./store/audio";
 import { CloudTab } from "./components/CloudTab";
 import { SessionsPanel } from "./components/SessionsPanel";
 import { LogPanel } from "./components/LogPanel";
@@ -44,7 +44,10 @@ async function bootstrap() {
   if (sessions.status === "fulfilled") st.setSessions(sessions.value);
   else clientLog("error", `GET /api/sessions failed: ${errorText(sessions.reason)}`);
   // older cores have no audio layer: loadAudioEvents keeps the error to itself
-  if (status.status === "fulfilled" && status.value.audio) void loadAudioEvents();
+  if (status.status === "fulfilled" && status.value.audio) {
+    void loadAudioEvents();
+    void loadAudioSources();
+  }
 }
 
 export default function App() {

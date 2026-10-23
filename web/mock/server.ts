@@ -46,6 +46,7 @@ const audio = new AudioSim(
   () => opsResult(OPS_DEFAULTS).findings,
   (buf) => broadcast(buf),
   (ev) => broadcast(JSON.stringify({ type: "audio_event", ...ev })),
+  (active) => broadcast(JSON.stringify({ type: "audio_sources", active })),
 );
 Object.defineProperty(status, "audio", { get: () => audio.status, enumerable: true });
 
@@ -759,10 +760,34 @@ async function handleApi(req: Request, path: string): Promise<Response> {
   if (path === "/audio/sim/emit" && m === "POST") {
     if (!audio.status.connected) return err(409, "audio not connected");
     if (audio.status.source !== "sim") return err(409, "sim source only");
-    const b = await body<{ bearing_deg?: number; elevation_deg?: number; snr_db?: number }>(req);
+    const b = await body<{ bearing_deg?: number; elevation_deg?: number; snr_db?: number; kind?: string }>(req);
     const bearing = Number(b.bearing_deg ?? 0);
     if (!Number.isFinite(bearing)) return err(422, "bearing_deg must be a number");
-    return json(audio.emit(((bearing % 360) + 360) % 360, Number(b.elevation_deg ?? 0) || 0, Number(b.snr_db ?? 20) || 20));
+    const kind = b.kind === "voice" ? "voice" : "knock";
+    return json(audio.emit(((bearing % 360) + 360) % 360, Number(b.elevation_deg ?? 0) || 0, Number(b.snr_db ?? 20) || 20, kind));
+  }
+  if (path === "/audio/sources" && m === "GET") return json(audio.sources());
+  if (path === "/audio/calibrate" && m === "POST") {
+    const b = await body<{ clicks?: { bearing_deg: number; elevation_deg?: number; event_id?: number; tdoa_us?: Record<string, number> }[]; apply?: boolean }>(req);
+    if (!Array.isArray(b.clicks)) return err(422, "clicks required");
+    let res;
+    try {
+      res = audio.calibrate(b.clicks);
+    } catch (e) {
+      return err(400, (e as Error).message);
+    }
+    const out: Record<string, unknown> = { ...res, applied: false };
+    if (b.apply) {
+      const a = config.audio!;
+      a.array_yaw_deg = res.array_yaw_deg;
+      a.channel_offsets_us = res.channel_offsets_us;
+      a.calibrated = res.ok;
+      out.applied = true;
+      out.calibrated = a.calibrated;
+      sendLog("info", `audio calibration applied: yaw ${res.array_yaw_deg}°, residual ${res.residual_us} µs, ${res.ok ? "calibrated" : "not calibrated"}`);
+      sendStatus();
+    }
+    return json(out);
   }
 
   // ---- assistant layer (canned, reads the findings only) ----

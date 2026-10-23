@@ -7,8 +7,8 @@ import { FrameError, parseFrame } from "./frames";
 import type { Job, ScanFrame, Status, WsTextMessage } from "./types";
 import { cloud, cloudAppend } from "../store/cloud";
 import { clientLog, useStore } from "../store/store";
-import { audioAddEvent, audioPushFrame } from "../store/audio";
-import type { AudioEvent } from "./types";
+import { audioAddEvent, audioPushFrame, audioSetSources } from "../store/audio";
+import type { AudioEvent, AudioSource } from "./types";
 
 const SCAN_MIN_MS = 100;
 const CLOUD_MIN_MS = 200;
@@ -154,6 +154,11 @@ class WsClient {
       case "audio_event": {
         const { type: _t, ...ev } = msg as unknown as { type: "audio_event" } & AudioEvent;
         audioAddEvent(ev as AudioEvent);
+        break;
+      }
+      case "audio_sources": {
+        const m = msg as unknown as { active?: AudioSource[] };
+        audioSetSources(Array.isArray(m.active) ? m.active : []);
         break;
       }
       case "pong":

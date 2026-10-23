@@ -9,7 +9,7 @@
 import { useEffect, useState } from "react";
 import { create } from "zustand";
 import { api, errorText } from "../api/rest";
-import type { AudioEvent, AudioFrame, Status } from "../api/types";
+import type { AudioEvent, AudioFrame, AudioSource, Status } from "../api/types";
 import { clientLog, useStore } from "./store";
 
 export const RING_MS = 6000;
@@ -41,6 +41,9 @@ let lastLevelPush = 0;
 
 export interface AudioState {
   events: AudioEvent[]; // newest first
+  sources: AudioSource[]; // active sources (§5.6)
+  sourcesSupported: boolean | null; // null until GET /audio/sources answered
+  highlightSourceId: number | null; // "Show on map" from the Sound tab
   selectedId: number | null;
   eventsError: string | null;
   levels: number[] | null; // dBFS per channel from the latest frame (throttled)
@@ -50,6 +53,9 @@ export interface AudioState {
 
 export const useAudio = create<AudioState>((set) => ({
   events: [],
+  sources: [],
+  sourcesSupported: null,
+  highlightSourceId: null,
   selectedId: null,
   eventsError: null,
   levels: null,
@@ -93,6 +99,20 @@ export function audioAddEvent(ev: AudioEvent): void {
   });
 }
 
+export function audioSetSources(active: AudioSource[]): void {
+  useAudio.setState({ sources: active, sourcesSupported: true });
+}
+
+export async function loadAudioSources(): Promise<void> {
+  try {
+    const r = await api.audioSources();
+    useAudio.setState({ sources: r.active ?? [], sourcesSupported: true });
+  } catch {
+    // a core without §5.6 has no sources: the views fall back to raw events
+    useAudio.setState({ sourcesSupported: false });
+  }
+}
+
 export async function loadAudioEvents(): Promise<void> {
   try {
     const evs = await api.audioEvents(50);
@@ -110,6 +130,7 @@ export async function loadAudioEvents(): Promise<void> {
 export async function clearAudioEvents(): Promise<void> {
   await api.audioClear();
   useAudio.setState({ events: [], selectedId: null });
+  await loadAudioSources();
 }
 
 export function clearWave(): void {
@@ -213,4 +234,53 @@ export function predictTdoa(
   for (let i = 0; i < mics.length; i++)
     for (let j = i + 1; j < mics.length; j++) out[`${i + 1}${j + 1}`] = (arrival[i] - arrival[j]) * 1e6;
   return out;
+}
+
+// ---- sources (§5.6) ----
+
+// Half-width of a source's wedge: the larger of its spread and its sigma.
+export function sourceHalfWidth(s: AudioSource): number {
+  return Math.max(s.spread_deg || 0, s.sigma_deg || 0, 1);
+}
+
+export function sourceBearingText(s: AudioSource): string {
+  return `${Math.round(s.bearing_deg)}° ± ${Math.round(sourceHalfWidth(s))}°`;
+}
+
+export function sourceKindWord(s: AudioSource): string {
+  return s.kind === "tapping" ? "Tapping" : "Sound";
+}
+
+export function knocksText(n: number, kind: string): string {
+  const unit = kind === "tapping" ? "knock" : "sound";
+  return `${n} ${unit}${n === 1 ? "" : "s"}`;
+}
+
+export function agoText(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s} s ago`;
+  const m = Math.floor(s / 60);
+  return `${m} min ${s % 60 < 10 ? "0" : ""}${s % 60} s ago`;
+}
+
+// Operator order: repeated tapping first (the signal that matters), then by
+// confidence, newest on a tie.
+export function sourceRank(a: AudioSource, b: AudioSource): number {
+  const ta = a.kind === "tapping" ? 1 : 0;
+  const tb = b.kind === "tapping" ? 1 : 0;
+  if (ta !== tb) return tb - ta;
+  if (a.confidence !== b.confidence) return b.confidence - a.confidence;
+  return b.last_t - a.last_t;
+}
+
+export function strongestSource(sources: AudioSource[]): AudioSource | null {
+  return sources.length ? [...sources].sort(sourceRank)[0] : null;
+}
+
+// excluded_mics → [{mic (1-based), reason}]
+export function excludedList(st: Status | null | undefined): { mic: number; reason: string }[] {
+  const raw = st?.audio?.excluded_mics ?? [];
+  return raw
+    .map((x) => (typeof x === "number" ? { mic: x, reason: "" } : { mic: x.mic ?? x.channel ?? 0, reason: x.reason ?? "" }))
+    .filter((x) => x.mic > 0);
 }

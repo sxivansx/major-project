@@ -3,7 +3,18 @@ import { CLASS_NAMES, FINDING_KINDS, type Finding, type FindingKind, type Findin
 import { rampRgb } from "../lib/colormap";
 import { fmt } from "../lib/format";
 import { findingById, planRoute, useOps } from "../store/ops";
-import { LOW_CONFIDENCE, RECENT_MAP_S, bearingText, coreNowSec, useAudio, useCoreNow } from "../store/audio";
+import { LOW_CONFIDENCE, RECENT_MAP_S, bearingText, coreNowSec, knocksText, sourceHalfWidth, sourceRank, useAudio, useCoreNow } from "../store/audio";
+import type { AudioCandidate } from "../api/types";
+
+interface Wedge {
+  bearing: number; // deg, clockwise from +x
+  half: number; // half-width, deg
+  confidence: number;
+  fade: number; // 0..1
+  label: string | null;
+  candidates: AudioCandidate[];
+  highlight: boolean;
+}
 
 // Top-down operator map on a plain canvas. World frame is the base frame:
 // scanner at the origin, +x the lidar's 0° (cable) mark, +y up on screen.
@@ -289,12 +300,41 @@ export const OpsMap = forwardRef<OpsMapHandle, Props>(function OpsMap({ scanning
   const setRouteMode = useOps((s) => s.setRouteMode);
   const simple = !advanced;
   const soundEvents = useAudio((s) => s.events);
-  const soundActive = soundEvents.some((e) => e.bearing_deg !== null && coreNowSec() - e.t < RECENT_MAP_S);
-  const now = useCoreNow(soundActive);
-  const recentSound = useMemo(
-    () => soundEvents.filter((e) => e.bearing_deg !== null && now - e.t < RECENT_MAP_S && now - e.t > -5),
-    [soundEvents, now],
-  );
+  const sources = useAudio((s) => s.sources);
+  const sourcesSupported = useAudio((s) => s.sourcesSupported);
+  const highlightSourceId = useAudio((s) => s.highlightSourceId);
+  const useRaw = sourcesSupported === false;
+  const soundActive = useRaw ? soundEvents.some((e) => e.bearing_deg !== null && coreNowSec() - e.t < RECENT_MAP_S) : sources.length > 0;
+  const now = useCoreNow(soundActive, useRaw ? 1000 : 5000);
+  const wedges: Wedge[] = useMemo(() => {
+    if (!useRaw)
+      return [...sources]
+        .sort(sourceRank)
+        .map((s, i) => ({
+          bearing: s.bearing_deg,
+          half: sourceHalfWidth(s),
+          confidence: s.confidence,
+          fade: Math.max(0.4, 1 - Math.max(0, now - s.last_t) / 120),
+          // label the ones worth reading: tapping, or confident, at most four
+          label:
+            i < 4 && (s.kind === "tapping" || s.confidence >= LOW_CONFIDENCE || s.id === highlightSourceId)
+              ? `${s.kind === "tapping" ? "tapping" : "sound"} ${Math.round(s.bearing_deg)}° · ${knocksText(s.n_events, s.kind)}`
+              : null,
+          candidates: s.candidates,
+          highlight: s.id === highlightSourceId,
+        }));
+    return soundEvents
+      .filter((e) => e.bearing_deg !== null && !e.noise && now - e.t < RECENT_MAP_S && now - e.t > -5)
+      .map((e, i) => ({
+        bearing: e.bearing_deg!,
+        half: 2 * (e.bearing_sigma_deg ?? 10),
+        confidence: e.confidence,
+        fade: Math.max(0, Math.min(1, 1 - (now - e.t) / RECENT_MAP_S)),
+        label: i === 0 ? `sound ${bearingText(e)}` : null,
+        candidates: e.candidates,
+        highlight: false,
+      }));
+  }, [useRaw, sources, soundEvents, now, highlightSourceId]);
 
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -447,51 +487,55 @@ export const OpsMap = forwardRef<OpsMapHandle, Props>(function OpsMap({ scanning
         ctx.strokeRect(Math.round(gx) + 0.5, Math.round(gy) + 0.5, Math.round(gw), Math.round(gh));
       }
 
-      // sound directions: wedges bearing ± 2σ from the scanner (a direction,
-      // never a distance), fading out over RECENT_MAP_S; newest on top and
-      // strongest; the candidate regions along them outlined in the accent
-      if (recentSound.length) {
+      // sound: one wedge per active source (bearing ± max(spread, σ), opacity
+      // and thickness by confidence, a direction never a distance), with the
+      // candidate regions along it outlined in the accent colour. A core
+      // without sources (§5.6) gets the raw events of the last minute instead.
+      if (wedges.length) {
         const x0 = sx(0);
         const y0 = sy(0);
-        const b = boundsOf(layers, findings);
-        const reach = Math.max(3, Math.hypot(b[0], b[1]), Math.hypot(b[0], b[3]), Math.hypot(b[2], b[1]), Math.hypot(b[2], b[3]));
+        const bb = boundsOf(layers, findings);
+        const reach = Math.max(3, Math.hypot(bb[0], bb[1]), Math.hypot(bb[0], bb[3]), Math.hypot(bb[2], bb[1]), Math.hypot(bb[2], bb[3]));
         const rad = reach * scale;
-        for (let i = recentSound.length - 1; i >= 0; i--) {
-          const ev = recentSound[i];
-          const fade = Math.max(0, Math.min(1, 1 - (now - ev.t) / RECENT_MAP_S));
-          const newest = i === 0;
-          const low = ev.confidence < LOW_CONFIDENCE;
-          const a = ev.bearing_deg! * DEG;
-          const half = Math.min(180, 2 * (ev.bearing_sigma_deg ?? 10)) * DEG;
+        for (let i = wedges.length - 1; i >= 0; i--) {
+          const w = wedges[i];
+          const low = w.confidence < LOW_CONFIDENCE;
+          const strength = (0.35 + 0.65 * Math.max(0, Math.min(1, w.confidence))) * w.fade;
+          const a = w.bearing * DEG;
+          const half = Math.min(180, w.half) * DEG;
           ctx.beginPath();
           ctx.moveTo(x0, y0);
           ctx.arc(x0, y0, rad, a - half, a + half);
           ctx.closePath();
-          ctx.fillStyle = low ? `rgba(140,140,140,${0.14 * fade})` : `rgba(77,157,224,${(newest ? 0.22 : 0.1) * fade})`;
+          ctx.fillStyle = low ? `rgba(140,140,140,${0.12 * strength})` : `rgba(77,157,224,${0.26 * strength})`;
           ctx.fill();
-          ctx.strokeStyle = low ? `rgba(140,140,140,${0.8 * fade})` : `rgba(77,157,224,${(newest ? 0.95 : 0.5) * fade})`;
-          ctx.lineWidth = newest ? 2 : 1;
+          if (w.highlight) {
+            ctx.strokeStyle = "rgba(255,255,255,0.9)";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+          }
+          ctx.strokeStyle = low ? `rgba(140,140,140,${0.8 * strength})` : `rgba(77,157,224,${strength})`;
+          ctx.lineWidth = 1 + 2.5 * Math.max(0, Math.min(1, w.confidence));
           ctx.beginPath();
           ctx.moveTo(x0, y0);
           ctx.lineTo(x0 + Math.cos(a) * rad, y0 + Math.sin(a) * rad);
           ctx.stroke();
           ctx.lineWidth = 1;
-          if (newest) {
-            const lr = Math.min(rad * 0.55, Math.max(60, Math.min(W, H) * 0.3));
-            label(ctx, `sound ${bearingText(ev)}${low ? " (low confidence)" : ""}`, x0 + Math.cos(a) * lr + 6, y0 + Math.sin(a) * lr - 6, low ? C.dim : C.accent);
+          if (w.label) {
+            const lr = Math.min(rad * 0.55, Math.max(70, Math.min(W, H) * 0.3)) + i * 16;
+            label(ctx, w.label, x0 + Math.cos(a) * lr + 6, y0 + Math.sin(a) * lr - 6, w.highlight ? "#ffffff" : low ? C.dim : C.accent);
           }
         }
         if (findings) {
           const done = new Set<string>();
-          for (const ev of recentSound) {
-            const fade = Math.max(0.25, Math.min(1, 1 - (now - ev.t) / RECENT_MAP_S));
-            for (const cand of ev.candidates) {
+          for (const w of wedges) {
+            for (const cand of w.candidates) {
               if (done.has(cand.id)) continue;
               done.add(cand.id);
               const hit = findingById(findings, cand.id);
               if (!hit) continue;
               const fb = hit.item.bbox_m;
-              ctx.globalAlpha = fade;
+              ctx.globalAlpha = Math.max(0.3, w.fade);
               ctx.strokeStyle = C.accent;
               ctx.lineWidth = 2;
               ctx.strokeRect(Math.round(sx(fb[0])) + 0.5, Math.round(sy(fb[3])) + 0.5, Math.max(2, Math.round((fb[2] - fb[0]) * scale)), Math.max(2, Math.round((fb[3] - fb[1]) * scale)));
@@ -623,7 +667,7 @@ export const OpsMap = forwardRef<OpsMapHandle, Props>(function OpsMap({ scanning
     const ro = new ResizeObserver(paint);
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [view, layers, findings, route, routeEnds, routeStart, selected, hover, toggles, simple, terrainImg, travImg, notSeenImg, shadowImg, blindImg, scanningText, recentSound, now]);
+  }, [view, layers, findings, route, routeEnds, routeStart, selected, hover, toggles, simple, terrainImg, travImg, notSeenImg, shadowImg, blindImg, scanningText, wedges]);
 
   // ---- mouse ----
 

@@ -7,12 +7,16 @@ import {
   audioDisconnect,
   clearAudioEvents,
   clearWave,
+  excludedList,
   loadAudioEvents,
+  loadAudioSources,
   useAudio,
   useCoreNow,
 } from "../store/audio";
 import { useStore } from "../store/store";
 import { Compass, EventList, GeometryForm, TdoaTable, TriggerForm, Waveforms } from "./AudioViews";
+import { CalibrationWizard } from "./AudioCalibration";
+import { MicHealth, SourceCards } from "./AudioSources";
 import { Shell, useAdvancedFlag, type BigNumber } from "./Shell";
 
 // Sound: four microphone waveforms, the detected spikes, and the direction
@@ -119,18 +123,28 @@ export function SoundTab() {
   const levels = useAudio((s) => s.levels);
   const selectedId = useAudio((s) => s.selectedId);
   const eventsError = useAudio((s) => s.eventsError);
+  const sources = useAudio((s) => s.sources);
+  const sourcesSupported = useAudio((s) => s.sourcesSupported);
+  const [showAll, setShowAll] = useState(false);
+  const [showNoise, setShowNoise] = useState(false);
   const audio = status?.audio;
   const supported = !!audio || !!config?.audio;
   const connected = !!audio?.connected;
-  const now = useCoreNow(events.length > 0);
+  const now = useCoreNow(events.length > 0 || sources.length > 0);
 
   useEffect(() => {
-    if (supported) void loadAudioEvents();
+    if (supported) {
+      void loadAudioEvents();
+      void loadAudioSources();
+    }
   }, [supported]);
 
   const lv = connected ? (levels ?? audio?.levels_dbfs ?? null) : null;
   const loudest = lv && lv.length ? Math.max(...lv) : null;
-  const noise = connected && audio?.noise_dbfs?.length ? audio.noise_dbfs.reduce((a, b) => a + b, 0) / audio.noise_dbfs.length : null;
+  // mean floor of the mics used for direction finding (an excluded mic is reported in the health strip)
+  const excludedMics = excludedList(status).map((x) => x.mic);
+  const usedFloors = (audio?.noise_dbfs ?? []).filter((_, i) => !excludedMics.includes(i + 1));
+  const noise = connected && usedFloors.length ? usedFloors.reduce((a, b) => a + b, 0) / usedFloors.length : null;
   const clipping = connected && !!audio?.clipping?.some(Boolean);
   const calibrated = config?.audio?.calibrated ?? audio?.calibrated ?? null;
 
@@ -160,11 +174,24 @@ export function SoundTab() {
           "–"
         ),
     },
-    { label: "Events", value: fmtInt(events.length) },
+    sourcesSupported === false
+      ? { label: "Events", value: fmtInt(events.length) }
+      : {
+          label: "Sources",
+          value: (
+            <>
+              {fmtInt(sources.length)}
+              <small>
+                {fmtInt(events.filter((e) => !e.noise).length)} detections · {fmtInt(events.filter((e) => e.noise).length)} noise
+              </small>
+            </>
+          ),
+        },
     { label: "Calibrated", value: calibrated === null ? "–" : calibrated ? "yes" : "no", className: calibrated === false ? "warn" : "" },
   ];
 
-  const recent = events.filter((e) => now - e.t < RECENT_TEXT_S);
+  const shownEvents = showNoise ? events : events.filter((e) => !e.noise);
+  const recent = shownEvents.filter((e) => now - e.t < RECENT_TEXT_S);
   const selected = events.find((e) => e.id === selectedId) ?? events[0] ?? null;
 
   return (
@@ -180,30 +207,55 @@ export function SoundTab() {
                 : "not connected"}
             </span>
           </div>
-          {!supported ? <div className="empty ops-connect">This core has no audio layer yet.</div> : <Waveforms />}
+          {!supported ? (
+            <div className="empty ops-connect">This core has no audio layer yet.</div>
+          ) : (
+            <>
+              <Waveforms />
+              <MicHealth />
+            </>
+          )}
         </section>
       }
       side={
         <section className="panel ops-right">
           <div className="panel-head">
-            <span>Direction</span>
+            <span>Sources</span>
             <span className="sub">0° = lidar cable mark, clockwise</span>
           </div>
           <div className="panel-body ops-summary">
+            {sourcesSupported !== false && <SourceCards sources={sources} now={now} />}
             <div className="compass-wrap">
-              <Compass events={events} now={now} />
+              <Compass sources={sourcesSupported === false ? [] : sources} events={shownEvents} now={now} showNoise={showNoise} />
             </div>
-            <div className="hint">
-              Direction only: the array cannot tell how far away a sound is. Wedges are ± 2σ; recent ones last {RECENT_TEXT_S / 60} min.
-            </div>
+            <div className="hint">Direction only: the array cannot tell how far away a sound is. Wedges are sources (± spread), ticks single detections.</div>
             {eventsError && supported && <div className="error">events: {eventsError}</div>}
-            <EventList events={recent.length ? recent : events.slice(0, 20)} />
+            <div className="detections-head">
+              <button className="linklike" onClick={() => setShowAll(!showAll)} aria-expanded={showAll}>
+                {showAll || sourcesSupported === false ? "▾" : "▸"} All detections ({shownEvents.length})
+              </button>
+              <span className="spacer" />
+              <label className="inline-check">
+                <input type="checkbox" checked={showNoise} onChange={(e) => setShowNoise(e.target.checked)} />
+                show noise
+              </label>
+            </div>
+            {(showAll || sourcesSupported === false) && <EventList events={recent.length ? recent : shownEvents.slice(0, 20)} />}
           </div>
         </section>
       }
       actions={<AudioConnectBar />}
       advanced={
         <div className="ops-advanced-grid cols-3">
+          <section className="panel wizard-panel">
+            <div className="panel-head">
+              <span>Clap calibration</span>
+              <span className="sub">{config?.audio?.calibrated ? "calibrated" : "not calibrated"}</span>
+            </div>
+            <div className="panel-body">
+              <CalibrationWizard />
+            </div>
+          </section>
           <div className="ops-advanced-col">
             <section className="panel">
               <div className="panel-head">

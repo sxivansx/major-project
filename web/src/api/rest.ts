@@ -6,7 +6,10 @@ import type {
   AiSitrep,
   AiStatus,
   AiTriage,
+  AudioCalibrateClick,
+  AudioCalibrateResult,
   AudioEvent,
+  AudioSource,
   Config,
   Findings,
   GridFrame,
@@ -147,7 +150,11 @@ export const api = {
   audioDisconnect: () => request<Status>("POST", "/audio/disconnect"),
   audioEvents: (limit = 50) => request<AudioEvent[]>("GET", `/audio/events?limit=${limit}`),
   audioClear: () => request<void>("POST", "/audio/clear"),
-  audioEmit: (body: { bearing_deg: number; elevation_deg?: number; snr_db?: number }) => request<unknown>("POST", "/audio/sim/emit", body),
+  audioEmit: (body: { bearing_deg: number; elevation_deg?: number; snr_db?: number; kind?: "knock" | "voice" }) =>
+    request<unknown>("POST", "/audio/sim/emit", body),
+  audioSources: () => request<{ active: AudioSource[]; history: AudioSource[] }>("GET", "/audio/sources"),
+  audioCalibrate: (body: { clicks: AudioCalibrateClick[]; apply?: boolean; refine_positions?: boolean }) =>
+    request<AudioCalibrateResult>("POST", "/audio/calibrate", body),
 };
 
 export function errorText(e: unknown): string {

@@ -324,6 +324,7 @@ export interface AudioConfig {
   trigger_db: number; // spike = short-term energy this many dB above the noise floor
   min_gap_ms: number; // dead time between events
   speed_of_sound: number; // m/s
+  channel_offsets_us?: number[]; // fixed per-channel capture delays from calibration (§5.5)
 }
 
 export interface AudioStatus {
@@ -337,13 +338,22 @@ export interface AudioStatus {
   noise_dbfs?: number[] | null;
   clipping?: boolean[] | null;
   calibrated?: boolean | null;
+  link?: string | null; // "up" | "connecting"
+  note?: string | null;
+  array_yaw_deg?: number | null;
+  sources_active?: number | null; // §5.6
+  // mics dropped from direction finding (noise floor > 12 dB above the others), §5.6;
+  // the shape is not pinned down, so numbers and {mic, reason} objects are both read
+  excluded_mics?: (number | { mic?: number; channel?: number; reason?: string })[] | null;
+  error?: string | null;
 }
 
 export interface AudioCandidate {
-  kind: string; // void | shadow | unknown | obstacle | depression
+  kind: string; // void | shadow | unknown | obstacle
   id: string;
   distance_m: number;
   bearing_deg: number;
+  off_axis_deg?: number;
 }
 
 export interface AudioEvent {
@@ -359,6 +369,59 @@ export interface AudioEvent {
   tdoa_us: Record<string, number>; // "12" … "34"
   candidates: AudioCandidate[];
   label?: string;
+  // §5.5 / §5.6 additions
+  noise?: boolean; // confidence < 0.1: kept, never part of a source
+  source_id?: number | null;
+  mics_used?: number[];
+  reasons?: string[];
+  residual_us?: number | null;
+  calibrated?: boolean;
+}
+
+// A sound source: events that keep coming from one direction (§5.6).
+export interface AudioSource {
+  id: number;
+  kind: "tapping" | "sound" | string;
+  bearing_deg: number;
+  spread_deg: number;
+  sigma_deg: number;
+  n_events: number;
+  first_t: number;
+  last_t: number;
+  rate_per_min?: number;
+  confidence: number;
+  peak_dbfs?: number;
+  event_ids: number[];
+  candidates: AudioCandidate[];
+  active: boolean;
+}
+
+export interface AudioCalibrateClick {
+  bearing_deg: number;
+  elevation_deg?: number;
+  event_id?: number;
+  tdoa_us?: Record<string, number>;
+}
+
+export interface AudioCalibrateResult {
+  n_clicks: number;
+  array_yaw_deg: number;
+  channel_offsets_us: number[];
+  channel_offsets_samples?: number[];
+  residual_us: number;
+  per_click: { bearing_deg: number; fitted_bearing_deg: number | null; error_deg: number | null; residual_us: number }[];
+  order?: {
+    identity_residual_us: number;
+    best_rival_residual_us: number;
+    best_rival_channel_to_mic: number[];
+    best_rival_mirrored: boolean;
+    confirmed: boolean;
+    verdict: string;
+  };
+  refined?: { mics_mm: [number, number, number][]; moved_mm: number[]; residual_before_us: number };
+  ok: boolean;
+  applied: boolean;
+  calibrated?: boolean;
 }
 
 // Kind 5: per-channel min/max envelopes of the last 100 ms at 1 kHz.
