@@ -11,6 +11,7 @@ import {
   excludedList,
   predictTdoa,
   sourceHalfWidth,
+  speechWhy,
   useAudio,
   wave,
 } from "../store/audio";
@@ -256,6 +257,18 @@ export function Waveforms() {
 
 // ---- compass ----
 
+const DISTRESS_KEEP_S = 300; // red dots for calls for help stay this long, fading
+
+function arcPath(cx: number, cy: number, r: number, bearing: number, half: number): string {
+  const a0 = (bearing - half) * DEG;
+  const a1 = (bearing + half) * DEG;
+  return `M ${cx + r * Math.cos(a0)} ${cy + r * Math.sin(a0)} A ${r} ${r} 0 ${half * 2 > 180 ? 1 : 0} 1 ${cx + r * Math.cos(a1)} ${cy + r * Math.sin(a1)}`;
+}
+
+function distressWord(e: { matched: string[]; sounds_like: { word: string }[] }): string {
+  return e.matched[0] ?? e.sounds_like[0]?.word ?? "call for help";
+}
+
 function wedgePath(cx: number, cy: number, r: number, bearing: number, half: number): string {
   const a0 = (bearing - half) * DEG;
   const a1 = (bearing + half) * DEG;
@@ -266,11 +279,15 @@ function wedgePath(cx: number, cy: number, r: number, bearing: number, half: num
 export function Compass({ sources, events, now, showNoise }: { sources: AudioSource[]; events: AudioEvent[]; now: number; showNoise: boolean }) {
   const selectedId = useAudio((s) => s.selectedId);
   const highlightSourceId = useAudio((s) => s.highlightSourceId);
-  const size = 232;
+  const size = 280;
   const cx = size / 2;
   const cy = size / 2;
   const R = size / 2 - 30;
   const ticks = events.filter((e) => e.bearing_deg !== null && (showNoise || !e.noise) && (now - e.t < RECENT_TEXT_S || e.id === selectedId));
+  const speech = useAudio((s) => s.speech);
+  // newest first in the store; draw oldest first so the newest dot is on top
+  const distress = speech.filter((e) => e.flagged && e.bearing_deg !== null && now - e.t < DISTRESS_KEEP_S).reverse();
+  const newest = distress[distress.length - 1];
   const sorted = [...sources].sort((a, b) => a.confidence - b.confidence); // strongest drawn last
   const strongest = sorted[sorted.length - 1];
   return (
@@ -335,6 +352,30 @@ export function Compass({ sources, events, now, showNoise }: { sources: AudioSou
           />
         );
       })}
+      {distress.map((e) => {
+        const b = e.bearing_deg!;
+        const fade = Math.max(0.3, 1 - Math.max(0, now - e.t) / DISTRESS_KEEP_S);
+        const top = e === newest;
+        return (
+          <g key={`sp${e.id}`} opacity={fade}>
+            <title>{`${speechWhy(e)}: "${e.transcript}" at ${Math.round(b)}°`}</title>
+            {e.bearing_sigma_deg != null && (
+              <path d={arcPath(cx, cy, R, b, Math.min(90, e.bearing_sigma_deg))} fill="none" stroke={C.err} strokeWidth={2} />
+            )}
+            <circle cx={cx + Math.cos(b * DEG) * R} cy={cy + Math.sin(b * DEG) * R} r={top ? 6 : 4.5} fill={C.err} stroke={C.bg} strokeWidth={1.5} />
+          </g>
+        );
+      })}
+      {newest && (() => {
+        const b = newest.bearing_deg!;
+        const lx = cx + Math.cos(b * DEG) * (R - 16);
+        const ly = cy + Math.sin(b * DEG) * (R - 16) + 4;
+        return (
+          <text x={lx} y={ly} textAnchor={Math.cos(b * DEG) > 0.3 ? "end" : Math.cos(b * DEG) < -0.3 ? "start" : "middle"} className="compass-label err">
+            {`${distressWord(newest)} ${Math.round(b)}°`}
+          </text>
+        );
+      })()}
       <circle cx={cx} cy={cy} r={3} fill="#4d9de0" />
       <text x={cx + R - 2} y={cy - 6} textAnchor="end" className="compass-label">
         +x

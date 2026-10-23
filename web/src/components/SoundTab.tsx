@@ -17,6 +17,7 @@ import { useStore } from "../store/store";
 import { Compass, EventList, GeometryForm, TdoaTable, TriggerForm, Waveforms } from "./AudioViews";
 import { CalibrationWizard } from "./AudioCalibration";
 import { MicHealth, SourceCards } from "./AudioSources";
+import { SpeechPanel } from "./SpeechPanel";
 import { Shell, useAdvancedFlag, type BigNumber } from "./Shell";
 
 // Sound: four microphone waveforms, the detected spikes, and the direction
@@ -224,11 +225,12 @@ export function SoundTab() {
             <span className="sub">0° = lidar cable mark, clockwise</span>
           </div>
           <div className="panel-body ops-summary">
-            {sourcesSupported !== false && <SourceCards sources={sources} now={now} />}
             <div className="compass-wrap">
               <Compass sources={sourcesSupported === false ? [] : sources} events={shownEvents} now={now} showNoise={showNoise} />
             </div>
-            <div className="hint">Direction only: the array cannot tell how far away a sound is. Wedges are sources (± spread), ticks single detections.</div>
+            <div className="hint">Direction only: the array cannot tell how far away a sound is. Red dots are calls for help, wedges sources (± spread), ticks single detections.</div>
+            <SpeechPanel />
+            {sourcesSupported !== false && <SourceCards sources={sources} now={now} />}
             {eventsError && supported && <div className="error">events: {eventsError}</div>}
             <div className="detections-head">
               <button className="linklike" onClick={() => setShowAll(!showAll)} aria-expanded={showAll}>
