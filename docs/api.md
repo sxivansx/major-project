@@ -217,8 +217,10 @@ Works with the tilt level (φ 0°) and the scanner carried by hand: each rotatio
 
 REST: `POST /api/room/start {"cell_m": 0.05}` (resets; 400 without a LiDAR), `POST /api/room/stop` (keeps the map), `GET /api/room` → room JSON + `grid {w,h,cell,x0,y0}`, `GET /api/room/grid` → the kind-6 frame.
 
-WS binary kind 6 (≤ 2 Hz while mapping): `<BBHIIfff` kind=6, pad, pad, w, h, cell, x0, y0 (24 bytes), then u8 × w·h row-major, row = y: 0 unknown, 1 free, 2 occupied (cropped to what has been seen + 0.5 m).
-WS JSON (≤ 5 Hz): `{"type": "room", state: "idle"|"mapping", pose {x, y, theta_deg}, path [[x, y]] (≤ 500), keyframes, scans, area_m2, match {rms_mm, inliers, ok}, lost, note}`.
+WS binary kind 6 (≤ 2 Hz while mapping): `<BBHIIfff` kind=6, pad, pad, w, h, cell, x0, y0 (24 bytes), then u8 × w·h row-major, row = y: 0 unknown, 1 free, 2 occupied, 3 open edge (free next to unknown; cropped to what has been seen + 0.5 m).
+WS JSON (≤ 5 Hz): `{"type": "room", state: "idle"|"mapping", pose {x, y, theta_deg}, path [[x, y]] (≤ 500), keyframes, scans, area_m2, match {rms_mm, inliers, ok}, lost, note, next}`.
+
+`next` = `{station: {x, y, distance_m, bearing_deg, edge {x, y, width_m}} | null, open_edges, complete}`: where to carry the scanner for the next view. Open edges are clusters (≥ 0.4 m) of free cells next to unknown ones; each is approached at its point nearest the scanner (≥ 0.4 m away), the station is the nearest free cell ≥ 0.25 m from any wall within 0.8 m of that point, and the edge with the best min(width, 2 m) / (1 + distance)² wins. `bearing_deg` is in the LiDAR convention (clockwise from its cable mark as it points now). `complete` = no open edges left after the first keyframe. Recomputed on each keyframe or 0.2 m of movement.
 
 ## 4. Session on disk
 

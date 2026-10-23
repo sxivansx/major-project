@@ -104,3 +104,26 @@ def test_room_api_with_the_sim_lidar(tmp_path):
         g = wire.decode_room(c.get("/api/room/grid").content)
         assert g["w"] == info["grid"]["w"] and (g["classes"] == 2).any()
         assert c.post("/api/room/stop").json()["state"] == "idle"
+
+
+def test_next_station_points_into_the_unseen_wing():
+    rng = np.random.default_rng(2)
+    m = RoomMapper()
+    # from the far right of the main room the upper-left wing (x < 2, y > 1) is mostly hidden
+    for _ in range(3):
+        m.add_scan(scan_to_points(*lidar((3.5, -1.0, 0.0), rng)))
+    nx = m.state()["next"]
+    st = nx["station"]
+    assert st is not None and nx["open_edges"] >= 1 and not nx["complete"]
+    assert st["distance_m"] > 0.4
+    cls, _, _ = m.classes()
+    assert (cls == 3).any()
+    # walking the whole room closes it
+    m2 = RoomMapper()
+    path = [(0.0, 0.0, 0.0)] + [(0.04 * k, 0.0, 0.0) for k in range(1, 70)]
+    path += [(2.76 - 0.04 * k, 0.0, 0.0) for k in range(1, 45)]  # back to x ≈ 1.0
+    path += [(1.0, 0.04 * k, 0.0) for k in range(1, 50)]  # up into the wing
+    for p in path:
+        m2.add_scan(scan_to_points(*lidar(p, rng)))
+    assert not m2.lost
+    assert m2.state()["next"]["open_edges"] <= nx["open_edges"]

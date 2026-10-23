@@ -28,6 +28,10 @@ KEY_TURN_DEG = 4.0
 INLIER_M = 0.10
 MIN_INLIERS = 0.35  # below this fraction of points within INLIER_M of a wall, the scan is not trusted
 RANGE_MIN_M, RANGE_MAX_M = 0.15, 12.0
+MIN_FRONTIER_M = 0.40  # an open edge narrower than this is a gap between chair legs, not somewhere to go
+STAND_CLEAR_M = 0.25  # a suggested station keeps this far from walls
+STAND_SEARCH_M = 0.8  # …and lies within this of the open edge it is meant to see past
+NEAR_M = 0.4  # an edge closer than this to the scanner is one it already stands at
 BIN_DEG = 0.5
 
 
@@ -101,6 +105,9 @@ class RoomMapper:
         self.path: list[tuple[float, float]] = []
         self._velocity = (0.0, 0.0, 0.0)
         self._fine: np.ndarray | None = None
+        self._next: dict | None = None
+        self._next_key: tuple | None = None
+        self._frontier: np.ndarray | None = None
         self._coarse: np.ndarray | None = None
 
     # ---- grid helpers ------------------------------------------------------------------------------
@@ -262,10 +269,12 @@ class RoomMapper:
 
     # ---- output ----------------------------------------------------------------------------------
     def classes(self) -> tuple[np.ndarray, float, float]:
-        """u8 grid cropped to what has been seen (+0.5 m): 0 unknown, 1 free, 2 occupied; and its x0, y0."""
+        """u8 grid cropped to what has been seen (+0.5 m): 0 unknown, 1 free, 2 occupied, 3 open edge; and its x0, y0."""
         c = np.zeros(self.L.shape, np.uint8)
         c[self.L < L_FREE] = 1
         c[self.L > L_OCC] = 2
+        if self._frontier is not None and self._frontier.shape == c.shape:
+            c[self._frontier & (c == 1)] = 3  # open edge (as of the last next_station)
         ys, xs = np.nonzero(c)
         if ys.size == 0:
             return c[:1, :1], self.x0, self.y0
@@ -273,6 +282,70 @@ class RoomMapper:
         y_lo, y_hi = max(0, ys.min() - m), min(self.n, ys.max() + m + 1)
         x_lo, x_hi = max(0, xs.min() - m), min(self.n, xs.max() + m + 1)
         return c[y_lo:y_hi, x_lo:x_hi], self.x0 + x_lo * self.cell, self.y0 + y_lo * self.cell
+
+    # ---- where to go next ------------------------------------------------------------------------
+    def frontier_mask(self) -> np.ndarray:
+        """Free cells next to unknown ones: the open edges of the map."""
+        free = self.L < L_FREE
+        unknown = (self.L >= L_FREE) & (self.L <= L_OCC)
+        u = np.pad(unknown, 1)
+        near_unknown = u[:-2, 1:-1] | u[2:, 1:-1] | u[1:-1, :-2] | u[1:-1, 2:]
+        return free & near_unknown
+
+    def next_station(self) -> dict:
+        """The open edge most worth seeing past (nearest, then widest), and a clear spot near it to scan from.
+        Recomputed only when the map changed (keyframe) or the scanner moved 0.2 m."""
+        key = (self.keyframes, round(self.pose[0] / 0.2), round(self.pose[1] / 0.2))
+        if key == self._next_key and self._next is not None:
+            return self._next
+        from .analysis import label_regions
+
+        self._next_key = key
+        fr = self.frontier_mask()
+        self._frontier = fr
+        labels, n = label_regions(fr, 8)
+        px, py, th = self.pose
+        best, best_score, edges = None, -1.0, 0
+        if n and self._fine is not None:
+            sizes = np.bincount(labels.ravel(), minlength=n + 1)
+            free_clear = (self.L < L_FREE) & (self._fine >= STAND_CLEAR_M)
+            fy_all, fx_all = np.nonzero(free_clear)
+            fxw = self.x0 + (fx_all + 0.5) * self.cell
+            fyw = self.y0 + (fy_all + 0.5) * self.cell
+            for k in range(1, n + 1):
+                width = sizes[k] * self.cell
+                if width < MIN_FRONTIER_M:
+                    continue
+                ys, xs = np.nonzero(labels == k)
+                cxw = self.x0 + (xs + 0.5) * self.cell
+                cyw = self.y0 + (ys + 0.5) * self.cell
+                d_me = np.hypot(cxw - px, cyw - py)
+                far = d_me >= NEAR_M
+                if not far.any():
+                    continue
+                edges += 1
+                # a long edge (the whole rim of what one spot can see) is approached at its nearest
+                # point, so each suggestion is a short step rather than its far-away middle
+                j = int(np.argmin(np.where(far, d_me, np.inf)))
+                ex, ey = float(cxw[j]), float(cyw[j])
+                d_edge = np.hypot(fxw - ex, fyw - ey)
+                ok = d_edge <= STAND_SEARCH_M
+                if not ok.any():
+                    continue
+                i = int(np.argmin(np.where(ok, d_edge, np.inf)))
+                sx, sy = float(fxw[i]), float(fyw[i])
+                dist = math.hypot(sx - px, sy - py)
+                score = min(width, 2.0) / (1.0 + dist) ** 2  # near beats wide
+                if score > best_score:
+                    best_score = score
+                    rel = math.degrees(th - math.atan2(sy - py, sx - px)) % 360.0  # LiDAR convention: clockwise from its 0° mark
+                    best = {
+                        "x": round(sx, 3), "y": round(sy, 3),
+                        "distance_m": round(dist, 2), "bearing_deg": round(rel, 1),
+                        "edge": {"x": round(float(ex), 3), "y": round(float(ey), 3), "width_m": round(float(width), 2)},
+                    }
+        self._next = {"station": best, "open_edges": edges, "complete": edges == 0 and self.keyframes > 1}
+        return self._next
 
     def area_m2(self) -> float:
         return float((self.L < L_FREE).sum()) * self.cell * self.cell
@@ -294,4 +367,5 @@ class RoomMapper:
                 "ok": m.ok,
             },
             "lost": self.lost,
+            "next": self.next_station() if self.key_pose is not None else None,
         }
