@@ -52,7 +52,7 @@ open -e core/.env          # paste the keys, save
 1. Power the ESP32 rig from the **powerbank only**. Never connect the laptop USB and the powerbank to the ESP at the same time.
 2. Wait about 10 s for the ESP32 to boot. It always starts its own access point.
 3. On the Mac, join Wi-Fi **`SLAM-Test`**, password **`SLAMtest24`**. The rig is then at **192.168.4.1** (LiDAR on TCP 8899, tilt on 8900, audio on 8901 TCP / 8902 UDP).
-4. Internet at the same time (Sarvam, Jev and Gemini need it): plug in the iPhone, turn on **Personal Hotspot**, and in **System Settings → Network → ⋯ → Set Service Order** drag **iPhone USB** above **Wi-Fi**. The Mac then reaches the rig over Wi-Fi and the internet over the iPhone.
+4. Internet at the same time (Sarvam, Jev and Gemini need it): plug in the iPhone, turn on **Personal Hotspot**, and in **System Settings → Network → ⋯ → Set Service Order** drag **iPhone USB** above **Wi-Fi**. The Mac then reaches the rig over Wi-Fi and the internet over the iPhone. A wired Ethernet adapter works too; macOS already ranks it above Wi-Fi.
 5. Quick check: `ping -c 3 192.168.4.1` answers, and `curl -sI https://api.sarvam.ai | head -1` prints an HTTP line.
 
 Optional, the ESP32's stored network (its NVS): the rig can also join a normal Wi-Fi network as well as its own AP. Send it once over the tilt port, it is saved and survives reboots (SSID and password without spaces):
@@ -125,6 +125,7 @@ A flagged call shows as a red dot on the Sound tab compass and a red banner on O
 | LiDAR "not streaming", 0 Hz | rig powered? on `SLAM-Test`? `ping 192.168.4.1`; reconnect the LiDAR; only one client can hold port 8899 |
 | No audio / many lost frames | powerbank must feed the mics; stay on the rig's AP, a home router drops frames |
 | "AI unavailable" or speech off | keys missing in `core/.env`, or no internet (check the iPhone USB service order) |
+| Servo moves only a few degrees | a freshly flashed board limits travel to 81–99°: send `L 0 180` in the servo console |
 | Servo accepts commands but does not tilt | it needs its own 5–6 V, ≥ 3 A supply with ground shared with the ESP32; a shared powerbank browns out |
 | `make driver` fails | `xcode-select --install`, then `git submodule update --init` |
 | `uv` / `bun` not found | open a new terminal tab after installing (PATH) |
