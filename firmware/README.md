@@ -2,7 +2,9 @@
 
 One Arduino sketch, `servo_tilt/servo_tilt.ino`, for an ESP32 that drives the GS2010MG servo tilting the LiDAR cradle and reads the cradle angle back from an AS5600 magnetic encoder on the tilt axle. The Mac talks to it over USB serial (or TCP over Wi-Fi) with the line protocol in `docs/api.md` section 2 (that file is the contract; this README only covers wiring, building and a hand test).
 
-Pins on the ESP32-S3 follow the hardware team's `pin_connection.md` (ESP32-S3 WROOM-1 N16R8): servo GPIO 17, LiDAR UART RX 13 / TX 14, I2C 11/12, microphones on GPIO 4–7, GPIO 8/9 left unconnected.
+**Contents:** [Wiring](#wiring) · [Toolchain](#toolchain) · [Compile and flash](#compile-and-flash) · [Quick manual test](#quick-manual-test) · [LiDAR over USB](#lidar-pass-through-over-usb-esp32-s3) · [Wi-Fi](#wi-fi-esp32-s3) · [Microphones](#microphones-esp32-s3) · [Encoder setup](#encoder-setup) · [Behaviour notes](#behaviour-notes)
+
+Pins on the ESP32-S3 follow the carrier board's pin map (ESP32-S3 WROOM-1 N16R8): servo GPIO 17, LiDAR UART RX 13 / TX 14, I2C 11/12, microphones on GPIO 4–7, GPIO 8/9 left unconnected.
 
 On the ESP32-S3 it also relays the RPLIDAR: the LiDAR's 1 Mbaud UART is wired to the S3, and its bytes are passed through unchanged, both ways, to the Mac, either over the board's second USB socket or over Wi-Fi (TCP 8899). Slamtec's SDK in `s2bridge` decodes them on the Mac exactly as if the LiDAR were plugged in directly.
 
@@ -66,7 +68,7 @@ Rules:
 - Magnet: a **6 mm diametrically magnetised** disc (poles across the diameter, not through the thickness; the kind sold with AS5600 breakouts). An axially magnetised magnet reads `nomag` no matter the spacing.
 - Mount the magnet **centred on the axle**, its face parallel to the chip, with a **0.5–3 mm air gap** to the chip package. The chip must be on the axle's axis, so fix the breakout to the frame, not to the cradle.
 - Keep steel and other magnets a few cm away. Use `E` to check the spacing (see "Encoder setup" below).
-- To move the I2C pins, change `AS5600_SDA` / `AS5600_SCL` in the sketch (there is one pair for the S3 and one for the plain ESP32). Do not use GPIO 8/9 on the S3: the wiring doc keeps them unconnected. On the plain ESP32, GPIO 8 and 9 are flash pins: never use them.
+- To move the I2C pins, change `AS5600_SDA` / `AS5600_SCL` in the sketch (there is one pair for the S3 and one for the plain ESP32). Do not use GPIO 8/9 on the S3: the carrier board leaves them unconnected. On the plain ESP32, GPIO 8 and 9 are flash pins: never use them.
 
 ```
    5–6 V / 3 A supply            ESP32 (S3 pins; plain ESP32 in brackets)
@@ -97,7 +99,7 @@ Rules:
 
 - The LiDAR pulls about **1.2 A while the motor spins up** (~450 mA running). Through the ESP32's 5 V pin that comes from the USB port and browns the board out, so it needs a separate 5 V source with its ground tied to the ESP32's.
 - TX goes to RX: LiDAR **TX → GPIO 13**, LiDAR **RX ← GPIO 14**. Swapped wires give `lidar_rx=0` in `?` while the motor spins.
-- To use other pins, change `#define LIDAR_RX_PIN 13` / `#define LIDAR_TX_PIN 14` in the sketch (any free GPIO works, UART1 is routed through the GPIO matrix). Avoid the S3 strapping pins (0, 3, 45, 46), the flash/PSRAM pins (26–37 on modules with octal PSRAM), USB D−/D+ (19, 20), UART0 (43, 44), I2C (11, 12), the microphones (4–7), the servo (17) and the unconnected GPIO 8/9. GPIO 15 is the legacy motor-control assignment in the wiring doc: leave it alone.
+- To use other pins, change `#define LIDAR_RX_PIN 13` / `#define LIDAR_TX_PIN 14` in the sketch (any free GPIO works, UART1 is routed through the GPIO matrix). Avoid the S3 strapping pins (0, 3, 45, 46), the flash/PSRAM pins (26–37 on modules with octal PSRAM), USB D−/D+ (19, 20), UART0 (43, 44), I2C (11, 12), the microphones (4–7), the servo (17) and the unconnected GPIO 8/9. GPIO 15 is the carrier board's legacy motor-control pin: leave it alone.
 
 ### The two USB cables (ESP32-S3)
 
@@ -106,7 +108,7 @@ Rules:
 | **UART** (CP2102N bridge) | `/dev/cu.usbserial-XXXX` (or `/dev/cu.SLAB_USBtoUART`) | the tilt protocol (`I`, `?`, `T`, …), 115200 |
 | **USB** (native, ESP32-S3 USB-Serial/JTAG) | `/dev/cu.usbmodemXXXX` | the raw LiDAR byte stream for `s2bridge --serial` (any baud); also used for flashing |
 
-Plug both into the Mac. Over Wi-Fi neither cable needs to carry data. The wiring doc's rule applies: no powered laptop USB while the powerbank also feeds the board's 5 V header, unless the carrier's isolation has been checked.
+Plug both into the Mac. Over Wi-Fi neither cable needs to carry data. The carrier board's power rule applies: no powered laptop USB while the powerbank also feeds the board's 5 V header, unless the carrier's isolation has been checked.
 
 ## Toolchain
 
@@ -287,7 +289,7 @@ STATUS angle=90 ... ip=192.168.x.y tcp_rx=... tcp_tx=... buf=.../1048576 audio=o
 
 Four INMP441 MEMS microphones, captured **simultaneously** at 24 kHz (default; 16 or 48 kHz with `A rate`) and streamed either as `AUD2` UDP datagrams to a subscriber on port **8902** (preferred) or as `AUD1` frames on TCP **8901** (`docs/api.md` §5.2). The array gives direction only; the core turns the stream into bearings.
 
-### Wiring recap (pin_connection.md §3)
+### Wiring recap
 
 | Mic pin | Mic 1 (top) | Mic 2 (left) | Mic 3 (right) | Mic 4 (bottom) |
 |---|---|---|---|---|
@@ -306,7 +308,7 @@ Four INMP441 MEMS microphones, captured **simultaneously** at 24 kHz (default; 1
 ### How all four are sampled together
 
 - **I2S0** is the master receiver: it drives BCLK (GPIO 4, 64 × the sample rate: 1.536 MHz at 24 kHz) and WS (GPIO 5, the sample rate) for all four mics and reads mics 1/2 on GPIO 7.
-- **I2S1** is a slave receiver for mics 3/4 on GPIO 6. It must see the *same* BCLK/WS, but the wiring doc rules out the jumper wires that would bring them to I2S1's own pins. So the firmware routes the pads internally: after I2S0 has made GPIO 4/5 its outputs, it also turns on their input buffers (`gpio_input_enable`, the output stays routed) and connects them to I2S1's slave clock inputs through the GPIO matrix:
+- **I2S1** is a slave receiver for mics 3/4 on GPIO 6. It must see the *same* BCLK/WS, but the carrier board rules out the jumper wires that would bring them to I2S1's own pins. So the firmware routes the pads internally: after I2S0 has made GPIO 4/5 its outputs, it also turns on their input buffers (`gpio_input_enable`, the output stays routed) and connects them to I2S1's slave clock inputs through the GPIO matrix:
 
   ```c
   esp_rom_gpio_connect_in_signal(4, I2S1I_BCK_IN_IDX, false);   // signal 31
@@ -455,7 +457,7 @@ The same detector drives `settled=` in `STATUS`, evaluated continuously from the
 - Every target is clamped twice: to `[0, range]` and then to the soft limits from `L`. The reply echoes the clamped angle, so `T 400` on a 180 servo answers `OK 180`.
 - `T`, `S` and `H` reply `OK <deg> <meas>` when an encoder is fitted and `OK <deg>` without one. The second token is always the commanded angle, so a parser that reads only that still works. `meas` on a `T`/`H` reply is the reading at the moment the pulse was set (the cradle has not moved yet); use `W` or `?` for the reading after the move.
 - `S <deg> <ms>` moves in 20 ms steps (one 50 Hz servo frame) and blocks until done; `ms` must be in `0..60000`. The reply arrives after the move. The encoder keeps being polled during `S` and `W`.
-- `L` and `C` are stored in NVS (`Preferences`, namespace `tilt`) and survive reboots and reflashes. Defaults are `L 0 180` and `C 500 2500 180`; send those to reset. `C` refuses pulses outside 500–2500 µs (the ESP32Servo library hard-clips there) and ranges other than 180 or 270. If `C` shrinks the range, the soft limits are pulled into the new range. A board flashed with the old firmware keeps its stored `C 500 2500 270` until you send `C 500 2500 180`.
+- `L` and `C` are stored in NVS (`Preferences`, namespace `tilt`) and survive reboots and reflashes. A fresh board starts with `L 81 99`: a narrow, safe window (1400–1600 µs) so a new servo cannot drive the cradle into its stops. Once the cradle moves freely, send `L 0 180` to open the full travel. `C` defaults to `C 500 2500 180`. `C` refuses pulses outside 500–2500 µs (the ESP32Servo library hard-clips there) and ranges other than 180 or 270. If `C` shrinks the range, the soft limits are pulled into the new range. A board flashed with the old firmware keeps its stored `C 500 2500 270` until you send `C 500 2500 180`.
 - `E zero` and `E dir` are stored in the same namespace (`enc_zero`, `enc_dir`). Both refuse (`ERR no encoder`, `ERR enc=nomag`, `ERR enc=err`) unless there is a valid reading with a magnet behind it; `weak`/`strong` are accepted.
 - Changing `L` does not move the servo; changing `C` re-issues the pulse for the current angle under the new mapping, so the cradle may move slightly.
 - On boot the servo goes to `range/2` (90° by default, clamped to the soft limits) so `?` reports a real angle. `angle` is always the last commanded angle; `meas` is the only measured value.

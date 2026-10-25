@@ -60,7 +60,7 @@ USB serial at 115200 8N1, or TCP 8900 over Wi-Fi. `\n`-terminated ASCII, one rep
 | `E` / `E zero` / `E dir` | `ENC raw=<0..4095> deg=<deg> zero=<deg> dir=<1\|-1> status=<…>` / `OK <meas>` | encoder diagnostics; `zero` aligns `meas` to the current commanded angle, `dir` flips direction; both persisted |
 | `S <deg> <ms>` | `OK <deg>` | ease to angle over ms, reply when done |
 | `H` | `OK <deg>` | go to RANGE/2 |
-| `L <min> <max>` | `OK` | soft limits, persisted in NVS |
+| `L <min> <max>` | `OK` | soft limits, persisted in NVS. A fresh board starts at `L 81 99` (1400–1600 µs); `L 0 180` opens the full travel |
 | `C <us_min> <us_max> <range>` | `OK` | pulse calibration (default 500 2500 180), persisted in NVS |
 | anything else | `ERR <msg>` | |
 
