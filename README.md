@@ -50,7 +50,7 @@ make setup     # builds the LiDAR driver, installs the Python and web dependenci
 make sim       # starts the backend on :8000 and the dashboard on :5173
 ```
 
-Open **http://localhost:5173** and press **Scan** on the Operator tab. A sweep takes about 15 seconds. When it finishes, the map fills in with walkable floor, obstacles and possible voids.
+Open **http://localhost:5173** and press **Scan** on the Operator tab. A sweep takes about 15 seconds. When it finishes, the map fills in with walkable floor, obstacles and possible voids. For simulated sound, connect the `sim` source on the Sound tab and press **Test knock**.
 
 To try the AI parts, copy `core/.env.example` to `core/.env` and add any of the keys. [SETUP.md](SETUP.md#4-api-keys-coreenv) says what each key does.
 
