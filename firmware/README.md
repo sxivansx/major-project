@@ -1,4 +1,4 @@
-# firmware: tilt servo controller
+# firmware: the ESP32-S3 rig controller
 
 One Arduino sketch, `servo_tilt/servo_tilt.ino`, for an ESP32 that drives the GS2010MG servo tilting the LiDAR cradle and reads the cradle angle back from an AS5600 magnetic encoder on the tilt axle. The Mac talks to it over USB serial (or TCP over Wi-Fi) with the line protocol in `docs/api.md` section 2 (that file is the contract; this README only covers wiring, building and a hand test).
 

@@ -2,6 +2,8 @@
 
 Everything needed to clone this repo on a new Mac, connect to the rig and run the dashboard. About 10 minutes the first time, most of it downloads.
 
+**No rig?** Do sections 1–3, then run `make sim` (section 6). The API keys in section 4 are optional.
+
 ## 1. Tools (once per Mac)
 
 ```bash
