@@ -1,38 +1,119 @@
-# web: On-board SLAM dashboard
+# web: the dashboard
 
-Internal bench tool for the RPLIDAR S2M1 on the servo-tilted cradle. Talks to the core server (`docs/api.md`, section 3) over REST and a WebSocket.
+The browser dashboard for obslam. It talks to the core server over REST and a WebSocket ([../docs/api.md](../docs/api.md), section 3). It's built with React 18, react-three-fiber (3D) and zustand (state), and bundled with Bun and Vite.
 
-```
+For what each part of each screen means from an operator's point of view, see [../docs/dashboard-guide.pdf](../docs/dashboard-guide.pdf). This file is for people working on the code.
+
+## Run
+
+```bash
 bun install        # once
-bun run mock       # fake core on http://127.0.0.1:8000 (no hardware needed)
-bun run dev        # Vite on http://127.0.0.1:5173, proxies /api and /ws to :8000 (or CORE_URL=http://127.0.0.1:8001)
-bun run build      # production bundle in web/dist (the core serves it in prod)
+bun run mock       # a fake core on http://127.0.0.1:8000, no hardware or Python needed
+bun run dev        # Vite on http://127.0.0.1:5173, proxies /api and /ws to :8000
+bun run build      # production bundle in web/dist (the core serves it with `make serve`)
 ```
 
-Also: `bun run typecheck` (both tsconfigs) and `bun run check` (headless REST + WS contract check against whatever is on :8000; against the real core it moves the servo and runs a short sweep).
+- If the core runs on another port: `CORE_URL=http://127.0.0.1:8001 bun run dev`.
+- `bun run typecheck` checks both tsconfigs.
+- `bun run check` is a headless REST and WebSocket contract check against whatever is on :8000. Against the real core it moves the servo and runs a short sweep.
 
-## Layout
+## One layout for every tab
 
-Every tab is one shell: a row of large numbers with sentence-case labels, the main view left (about 70 %) with one plain-language column right, an action bar, and an **Advanced ▸** drawer under it (own scroll, at most about 45 % of the height, remembered per tab in localStorage) that holds the engineering panels. There is no sidebar; the Connection, Servo, Mount and filters and Scan job panels live in the drawers.
+Every tab uses the same shell (`src/components/Shell.tsx`):
 
-**Operator** (the default tab) is for the person at the deployment point. Numbers: Seen (coverage %), Possible voids, Next (the next-station suggestion as "1.3 m toward 206°" or "rotate scanner 90°"). The map (top-down canvas, scanner marker, 1 m grid, drag to pan, wheel to zoom, Fit) has a single rendering of the kind-4 layers from `GET /api/ops/layers`: green = can walk (lighter where marginal), red = blocked, one hatch for everything not seen yet (shadow, blind and unknown alike); only voids (V1…) are outlined and labelled, plus the next-station arrow. Hover says x, y and "can walk" / "blocked" / "not seen". "What we have" is the situation report from `POST /api/ai/sitrep`, fetched after every analysis (a core without a key answers with a template; when a model wrote it the block says "assistant summary" with the cost), and an Ask box (`POST /api/ai/ask`, plain-text answer, a route answer is drawn on the map); without a decisions model it says "Assistant off: no API key". Action bar: Scan (the Scan job form in the store; "scanning… step 12 of 61" inline), Route (click start then goal; "4.2 m, passable" or "no passable route: …"; the button then clears) and Report (map PNG + findings JSON). Analysis never refreshes while a sweep is running: it refreshes on mount, on Refresh, and when a kind-3 grid frame arrives with no job running or the job stops after one arrived; meanwhile the previous analysis stays, the map says "scanning… 12/61" and the numbers go grey. `findings.scan` from newer cores is used when present. If the lidar or servo is not connected and no session is loaded, the map area says so. Advanced: layer toggles (terrain ramp, traversability, shadow and blind hatches, findings, next station), cell size and max-step parameters, Refresh analysis, Fit, Stop sweep, the Scan job form, the full situation block, route details, the four finding lists (click to highlight and pan), and the assistant ranking (`POST /api/ai/triage`). With Advanced open the map also outlines and labels obstacles, depressions and shadows, and the hover readout shows the height and the class name.
+1. **Numbers:** a row of three or four large figures with plain labels.
+2. **Main view:** on the left, about 70 % of the width.
+3. **Side column:** on the right, in plain sentences.
+4. **Action bar:** the buttons for that tab.
+5. **Advanced ▸:** a drawer under the action bar with the engineering panels. It scrolls on its own, takes at most about 45 % of the height, and its open or closed state is remembered per tab.
 
-**Live scan**. Numbers: Scan rate, Points per scan, Range (min–max), Health (good / warning / error, "off" when not connected). The polar plot full size (range rings, native clockwise angle, points coloured by quality; the range select stays in its corner). "Sensor" column: sentences built from the status ("RPLIDAR S2M1 on /dev/cu.usbserial-0001, healthy, 10.0 Hz, 3,147 points per scan." / "Servo at 90° (level), encoder ok, settled."), the connect controls right there when something is not connected (source s2 / sim, port with Refresh, baud, Connect LiDAR; port and Connect servo; the port fields take a detected serial port or a typed `tcp://host:8899` / `tcp://host:8900` for the ESP32-S3 Wi-Fi relay, remember the last value, and baud is disabled for tcp), and the tilt slider (servo degrees within the reported limits, shows φ) with Level (home). Action bar: Disconnect LiDAR / Disconnect servo (only while connected; connecting is done in the column), Level, Snapshot CSV with its rotations select. Advanced: the raw values table with the angle filter, the servo console (numeric tilt φ, raw `?` / `C …` / `L …` lines with the reply and command hints), the connection details (model, serial, firmware, health, port, baud, limits, encoder), the alarms list, and Mount and filters.
+There is no sidebar. The connection, servo, mount and scan-job panels live in the Advanced drawers. A status bar at the bottom of every tab shows the WebSocket state (it reconnects on its own) and a one-line summary of the LiDAR, servo, job and cloud size.
 
-**Sound** (four microphones, `docs/api.md` §5). Numbers: Level (loudest mic, dBFS), Noise floor (mean of the mics used for direction finding), Sources (with detection and noise counts), Calibrated. Main: four stacked waveforms from the kind-5 min/max envelopes (last 5 s at 1 kHz, scale select, a level meter per mic with a noise-floor tick, clipping in red, an excluded mic labelled in its lane) with a marker at each detection (accent, noise grey), and under them the mic-health strip (noise floor per mic, clipping, which mic is excluded and why). Right: **Sources** first (§5.6: one card per active source, tapping first, then by confidence: kind, bearing ± spread, knocks, last heard, rate, confidence bar, candidate regions, "Show on map" which switches to Operator with that wedge highlighted), a compass (sources as wedges, single detections as faint ticks; 0° = lidar cable mark, clockwise), and a collapsible "All detections (N)" with noise hidden unless "show noise" is ticked. Action bar: source tcp / sim, the `tcp://host:8901` port (remembered), Connect / Disconnect audio, Test knock (sim only), Clear events. Advanced: the **clap calibration** wizard (stand at 0°, 90°, 180°, 270° and optionally the 45° steps, 1 m away at mic height, clap once per step; it waits for the next detection that is not noise, shows it, then Compute calls `POST /api/audio/calibrate` and shows the channel-order verdict, residual, yaw and offsets per clap; Apply saves them, and the core marks the array calibrated only if the order is confirmed and the residual is under 6 µs; "Simulate a clap here" with the sim source), the per-pair time differences of the selected detection, the trigger threshold and dead time, and the mic geometry editor with a top-down sketch. The array gives a direction only: nothing draws a point or a distance for a sound. On the Operator tab every active source is one wedge from the scanner (bearing ± max(spread, σ), stronger and thicker with confidence, labelled like "tapping 9° · 6 knocks"), its candidate regions are outlined in the accent colour, the fourth number is the strongest source ("Tapping 112° ± 6°", grey when confidence < 0.4), and "What we have" has one sentence per active source ("Repeated tapping from 112° ± 6°: 6 knocks in 40 s …"; single or weak sounds say so). Against a core without sources the Operator falls back to the raw detections of the last minute.
+Tabs can be linked directly: `#ops`, `#live`, `#sound`, `#cloud`, `#room`, `#sessions`, `#log`.
 
-**Point cloud and height map**. Numbers: Points, Coverage (from `/api/metrics`, with the filled cell count), Floor RMS (metrics floor fit), Session (name or "live"). Left: the react-three-fiber cloud (default camera looking down from above at about 60°, grid at z=0, axes, reticle at the tilt axis, surface mesh from the grid). Right: the top-down 2.5D height map (NaN transparent, hover shows x/y/z, legend) with the one-line metrics under it. Action bar: Scan (progress inline), Fit (camera back to the default view), Surface on/off, PNG (height map), PLY (the loaded session's export), Clear. Advanced: 3D view settings (point size, colour z range with Fit colours, surface max step, grid and axes), the height map query (cell, layer, z min / max, Apply = PUT `/api/config` + GET `/api/grid`, fit colours, surface in 3D), the Scan job form (name, φ start / end / step, rotations, settle, start / stop, progress) and Mount and filters.
+## The tabs
 
-**Sessions**: numbers Sessions, Total points, Loaded; the `/api/sessions` table with load, grid, PLY / CSV export and delete; a sentence column; Refresh. **Log**: numbers Errors, Warnings, Entries; the last 200 log messages; the latest error and warning; Clear. The status bar at the bottom shows the WebSocket state with auto-reconnect and a one-line summary of lidar, servo, job and cloud size on every tab.
+### Operator (`#ops`, the default)
 
-## Layout of the code
+For the person at the deployment point.
 
-- `src/api/types.ts`, `src/api/frames.ts`: the contract types and the little-endian binary codec (shared with the mock and the check script).
-- `src/api/ws.ts`: WebSocket client with exponential backoff; parses frames off the render path and throttles scan pushes to 10 Hz.
-- `src/store/store.ts`: zustand store (server state, live data, the shared scan job form, view settings). `src/store/actions.ts`: the server calls shared by action bars, side columns and drawers (sweeps, connect / disconnect, servo, height map query). `src/store/metrics.ts`: refetches `/api/metrics` whenever a new grid arrives. `src/store/cloud.ts`: the point buffer, kept outside React; the 3D view uploads only the new slice each frame.
-- `src/components/Shell.tsx`: the tab shell (numbers, main + side, action bar, Advanced drawer with `useAdvancedFlag`). `src/components/*Tab.tsx`, `SessionsPanel.tsx`, `LogPanel.tsx`: one file per tab; the rest are the pieces they place (`LiveSensor`, `ConnectionPanel` = `LidarConnect` / `ServoConnect` / `ConnectionDetails`, `ServoPanel` = `TiltSlider` / `ServoConsole`, `RawValues`, `MountPanel`, `JobPanel`, `HeightMapPanel` + `HeightMapControls`, `CloudView`, `MetricsLine`). `src/styles.css`: the only stylesheet (dark, neutral grey, one accent).
-- `src/store/ops.ts`: state for the Operator tab (parameters, findings, layers, situation report, route, selection, Advanced flag) and the sweep-aware refresh. `src/store/actions.ts`: sweep start/stop shared by the job panel and the operator action bar. `src/components/Ops*.tsx`: the tab (`OpsTab`), the map (`OpsMap`), "What we have" (`OpsSummary`), the Advanced panel (`OpsAdvanced`) and its pieces (`OpsFindings`, `OpsAssistant`).
-- `mock/server.ts`, `mock/world.ts`: Bun mock of the core with a fake room that is ray-cast at the current tilt. `mock/ops.ts`: a port of the core's `analysis.py` (floor fit, classes, obstacles, voids, shadows, blind stripe, A* route) over the mock cloud, plus canned `/api/ai/*` answers built from the findings. `MOCK_AI=off bun run mock` behaves like a core without an API key (status unavailable, template sitrep, 503 on ask and triage). `mock/audio.ts`: the simulated array: noise floor per mic (mic 3 ~14 dB noisier, so it is excluded; `MOCK_NOISY_MIC=off` to disable), a burst of 6 knocks from the first void's direction every 45 s (a tapping source), single knocks from random directions with occasional echoes, scattered noise detections, kind-5 frames at 20 Hz, source tracking per §5.6, a clap calibration fit, and `/api/audio/*` including `sources` and `calibrate`.
-- `scripts/check.ts`: headless contract check, including the kind-4 codec round trip, `/api/ops/*` and `/api/ai/*`.
+- **Numbers:** Seen (coverage %), Possible voids, Next (for example "1.3 m toward 206°" or "rotate scanner 90°"), and the strongest sound source (for example "Tapping 112° ± 6°", grey when its confidence is under 0.4).
+- **Map:** top-down, with a 1 m grid; drag to pan, wheel to zoom, Fit. Green is walkable (lighter where marginal), red is blocked, and one hatch covers everything not seen yet. Voids (V1, V2, …) are outlined and labelled, and an arrow shows the next station. Each sound source is a wedge from the scanner, with its candidate regions outlined. Hovering shows x, y and the class.
+- **What we have:** the situation report from `POST /api/ai/sitrep`, fetched after every analysis. A model-written report says "assistant summary" with its cost; without a key the core answers with a template. Below it is an Ask box (`POST /api/ai/ask`); a route answer is drawn on the map.
+- **Actions:** Scan (shows "scanning… step 12 of 61"), Route (click a start, then a goal: "4.2 m, passable" or "no passable route: …"), Report (map PNG + findings JSON).
+- **Advanced:** layer toggles, cell size and max step, Refresh analysis, Stop sweep, the Scan job form, the full situation block, route details, the finding lists (click to highlight and pan), and the assistant ranking (`POST /api/ai/triage`). With Advanced open, the map also labels obstacles, depressions and shadows.
 
-Tabs are deep-linkable: `#ops`, `#live`, `#sound`, `#cloud`, `#sessions`, `#log`.
+Analysis never refreshes during a sweep. It refreshes on mount, on Refresh, and when a sweep's grid arrives after the job stops. Until then the previous analysis stays up and the numbers turn grey.
+
+### Live scan (`#live`)
+
+Is the hardware alive, and which way is it pointing?
+
+- **Numbers:** Scan rate, Points per scan, Range (min–max), Health.
+- **Main:** the polar plot (range rings, native clockwise angle, points coloured by quality).
+- **Sensor column:** status in sentences, for example "RPLIDAR S3 on tcp://192.168.4.1:8899, healthy, 10.0 Hz, 2,860 points per scan." The connect controls appear here while something is not connected. Port fields take a serial port or `tcp://host:8899` / `tcp://host:8900` for the rig's Wi-Fi relay, and remember the last value. Also here: the tilt slider and Level.
+- **Actions:** Disconnect LiDAR / servo, Level, Snapshot CSV.
+- **Advanced:** the raw values table, the servo console (send `?`, `T …`, `L …`, `C …` and see the reply), connection details, alarms, and **Mount and filters** (the calibration from [../docs/bringup.md](../docs/bringup.md#3-calibrate-the-mount)).
+
+### Sound (`#sound`)
+
+Four microphones, [../docs/api.md](../docs/api.md) section 5.
+
+- **Numbers:** Level (loudest mic, dBFS), Noise floor, Sources, Calibrated.
+- **Main:** four stacked waveforms (the last 5 s), a level meter per mic, clipping in red, a marker at each detection. Under them, a mic-health strip shows which mic is excluded as too noisy, and why.
+- **Side:** Sources first (one card per active source: kind, bearing ± spread, knocks, last heard, confidence, "Show on map"), then a compass with sources as wedges, red dots for calls for help, and a "Heard" panel with the transcribed speech.
+- **Actions:** source (`tcp` or `sim`), port `tcp://host:8901`, Connect / Disconnect, Test knock (sim only), Clear events.
+- **Advanced:** the **clap calibration** wizard (clap once at 0°, 90°, 180° and 270°, 1 m away at mic height, then Compute and Apply), the per-pair time differences, trigger threshold and dead time, and the mic geometry editor.
+
+The array gives a direction only, never a distance, so nothing draws a sound as a point.
+
+### Point cloud and height map (`#cloud`)
+
+- **Numbers:** Points, Coverage, Floor RMS, Session ("live" or the loaded session's name).
+- **Main:** the 3D point cloud (react-three-fiber), with a grid at floor level, axes, a surface mesh from the height grid, and the room map as a 3D layer.
+- **Side:** the top-down 2.5D height map (hover shows x, y, z) with a metrics line under it.
+- **Actions:** Scan, Fit, Surface on/off, PNG, PLY, Clear.
+- **Advanced:** 3D view settings, the height-map query (cell size, layer, z range), the Scan job form (φ start, end and step, rotations, settle) and Mount and filters.
+
+### Room map (`#room`)
+
+A floor plan built from the level LiDAR ([../docs/api.md](../docs/api.md) section 3.5).
+
+- **Handheld:** Start walking map, then carry the scanner slowly; each rotation is matched to the map so far. If it says "Lost track", move back to an area already on the map.
+- **Station sprint:** Start station sprint (6), then set the scanner down still and level at each spot and press Add station. The next suggested spot shows as an amber ring.
+- **Actions:** Stop, and PNG of the floor plan. The same map also appears as a 3D layer on the Point cloud tab.
+
+### Sessions (`#sessions`) and Log (`#log`)
+
+- **Sessions:** every saved sweep, with load, grid, PLY / CSV export and delete.
+- **Log:** the last 200 messages from the server and the dashboard, with the latest error and warning on top.
+
+## The mock backend
+
+`bun run mock` runs a fake core, so the dashboard works with no hardware and no Python.
+
+- `mock/server.ts`, `mock/world.ts`: a fake room ray-cast at the current tilt.
+- `mock/ops.ts`: a TypeScript port of the core's `analysis.py` (floor, classes, obstacles, voids, shadows, blind stripe, A\* route) plus canned AI answers. `MOCK_AI=off bun run mock` behaves like a core without API keys.
+- `mock/audio.ts`: a simulated array. Mic 3 is about 14 dB noisier, so it gets excluded (`MOCK_NOISY_MIC=off` to disable). A burst of six knocks comes from the first void's direction every 45 s, plus single knocks, echoes and noise.
+- The mock also simulates speech and the room map.
+
+## Code layout
+
+| Path | What it holds |
+|---|---|
+| `src/api/types.ts`, `src/api/frames.ts` | contract types and the little-endian binary codec (shared with the mock and the check script) |
+| `src/api/ws.ts` | WebSocket client with backoff; parses frames off the render path, throttles scan pushes to 10 Hz |
+| `src/store/store.ts` | zustand store: server state, live data, the shared scan-job form, view settings |
+| `src/store/actions.ts` | server calls shared by action bars and drawers (sweeps, connect, servo, height-map query) |
+| `src/store/ops.ts` | Operator tab state and the sweep-aware analysis refresh |
+| `src/store/audio.ts` | microphone state: waveform ring buffers (outside React), events, levels |
+| `src/store/room.ts` | room-map state: the latest status and occupancy grid, start / stop |
+| `src/store/metrics.ts` | refetches `/api/metrics` when a new grid arrives |
+| `src/store/hooks.ts` | throttled store subscriptions for 10 Hz panels |
+| `src/store/cloud.ts` | the point buffer, kept outside React; the 3D view uploads only the new slice each frame |
+| `src/components/Shell.tsx` | the shared tab layout |
+| `src/components/*Tab.tsx` | one file per tab; the other components are the pieces they place |
+| `src/components/Ops*.tsx` | the Operator map, summary, findings, assistant and Advanced panel |
+| `src/styles.css` | the only stylesheet: dark, neutral grey, one accent colour |
+| `mock/` | the fake core (above) |
+| `scripts/check.ts` | the headless contract check |
