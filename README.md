@@ -1,4 +1,4 @@
-# major-project: On-board SLAM for GPS-Denied Indoor Search
+# obslam: On-board SLAM for GPS-Denied Indoor Search
 
 Bench tool for On-board SLAM, a search-and-rescue payload: an RPLIDAR S3 on a servo-tilted cradle and a 4-mic array on an ESP32-S3, streamed over Wi-Fi to a laptop that maps the room, finds sound directions, flags spoken calls for help and shows it all on a dashboard.
 
@@ -26,7 +26,7 @@ sessions/  captured sweeps (gitignored)
 ## Quick start
 
 ```bash
-git clone --recursive https://github.com/sxivansx/major-project.git && cd major-project
+git clone --recursive https://github.com/sxivansx/obslam.git && cd obslam
 make setup                       # driver + python venv + web deps (needs Xcode CLT, uv, bun)
 cp core/.env.example core/.env   # then paste the API keys
 # power the rig, join Wi-Fi SLAM-Test (password SLAMtest24)

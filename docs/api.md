@@ -1,4 +1,4 @@
-# major-project: contracts
+# obslam: contracts
 
 Four processes, three contracts. Everything is little-endian.
 

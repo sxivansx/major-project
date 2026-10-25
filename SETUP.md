@@ -15,12 +15,9 @@ Check: `clang --version`, `uv --version`, `bun --version` all print a version.
 
 ## 2. Get the code
 
-The repo is private, so sign in to GitHub first (once per Mac):
-
 ```bash
-brew install gh && gh auth login                       # GitHub.com → HTTPS → log in with a browser
-git clone --recursive https://github.com/sxivansx/major-project.git
-cd major-project
+git clone --recursive https://github.com/sxivansx/obslam.git
+cd obslam
 ```
 
 Already cloned without `--recursive`? Run `git submodule update --init` (the Slamtec SDK lives in `driver/rplidar_sdk`).

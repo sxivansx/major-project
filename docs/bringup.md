@@ -5,7 +5,7 @@ Do these in order. Each step has a pass condition; don't move on until it passes
 ## 0. Before plugging anything in
 
 ```bash
-cd ~/majorproj/major-project
+cd obslam
 make setup          # builds driver/build/s2bridge, python venv, web deps
 make sim            # open http://localhost:5173, confirm the dashboard works on the simulator
 ```
