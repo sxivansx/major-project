@@ -1,12 +1,17 @@
 # obslam: contracts
 
-Four processes, three contracts. Everything is little-endian.
+Every link between the rig, the bridge, the core and the dashboard, in one place. If code and this file disagree, one of them is a bug. Binary data is little-endian.
 
 ```
-ESP32 (firmware/) ──USB serial, ASCII lines──┐
-                                             ├── core server (Python, :8000) ──REST + WS──> web dashboard
-RPLIDAR S3 ──USB 1 Mbaud──> s2bridge (C++) ─┘   stdout binary frames
+                         ESP32-S3 rig (Wi-Fi AP SLAM-Test, 192.168.4.1)
+RPLIDAR S3 ──UART 1 Mbaud──> relay ──TCP 8899──> s2bridge (C++) ──stdout frames (§1)──┐
+servo + encoder <────────── tilt protocol, TCP 8900 (§2) ────────────────────────────┤
+4 × INMP441 ──I2S──> audio ──TCP 8901 / UDP 8902 (§5.2)──────────────────────────────┤
+                                                                                      ▼
+                                          core server (Python, :8000) ──REST + WS (§3)──> web dashboard
 ```
+
+The same links also work over USB: the LiDAR through Slamtec's adapter (`--serial`), the tilt protocol on the ESP32's UART socket. Sections: 1 bridge frames, 2 tilt protocol, 3 REST and WebSocket (3.5 room map), 4 sessions on disk, 5 acoustics (5.7 calls for help).
 
 ## 1. s2bridge (driver/bridge) → core: stdout frames
 
@@ -14,7 +19,8 @@ Binary executable `driver/build/s2bridge`.
 
 ```
 s2bridge --serial <port> [--baud 1000000]      stream frames to stdout until SIGTERM / stdin closes
-s2bridge --serial <port> --info                print one JSON line, exit 0
+s2bridge --tcp <host:port>                     same, from the ESP32's LiDAR relay (e.g. 192.168.4.1:8899)
+s2bridge (--serial <port> | --tcp <host:port>) --info    print one JSON line, exit 0
 ```
 
 `--info` JSON line:
@@ -43,7 +49,7 @@ Logs go to stderr only. stdout is frames only.
 
 ## 2. Firmware ↔ core: servo serial protocol
 
-115200 8N1, `\n`-terminated ASCII, one reply line per command. Angles are **servo degrees** `0..RANGE` (RANGE = 180 or 270). The mapping servo-deg → tilt φ lives in the core config, not in firmware.
+USB serial at 115200 8N1, or TCP 8900 over Wi-Fi. `\n`-terminated ASCII, one reply line per command. Angles are **servo degrees** `0..RANGE` (RANGE = 180 or 270). The mapping servo-deg → tilt φ lives in the core config, not in firmware.
 
 | Command | Reply | Notes |
 |---|---|---|
@@ -55,10 +61,10 @@ Logs go to stderr only. stdout is frames only.
 | `S <deg> <ms>` | `OK <deg>` | ease to angle over ms, reply when done |
 | `H` | `OK <deg>` | go to RANGE/2 |
 | `L <min> <max>` | `OK` | soft limits, persisted in NVS |
-| `C <us_min> <us_max> <range>` | `OK` | pulse calibration (default 500 2500 270), persisted in NVS |
+| `C <us_min> <us_max> <range>` | `OK` | pulse calibration (default 500 2500 180), persisted in NVS |
 | anything else | `ERR <msg>` | |
 
-Defaults: GS2010MG 180° servo, signal on **GPIO 13**, 50 Hz, 500–2500 µs, range 180 (home 90). Servo power is a separate 5–6 V supply, GND shared with the ESP32. Never from the ESP32 5 V pin. AS5600 encoder on I2C (ESP32-S3: SDA 8 / SCL 9; ESP32: 21 / 22), optional: without it `meas=nan`, `enc=none`, and the core falls back to the commanded angle after `settle_ms`.
+Defaults: GS2010MG 180° servo, signal on **GPIO 17** on the ESP32-S3 (GPIO 13 on a plain ESP32), 50 Hz, 500–2500 µs, range 180 (home 90). Servo power is a separate 5–6 V supply, GND shared with the ESP32. Never from the ESP32 5 V pin. AS5600 encoder on I2C (ESP32-S3: SDA 11 / SCL 12, shared with the IMU; ESP32: 21 / 22), optional: without it `meas=nan`, `enc=none`, and the core falls back to the commanded angle after `settle_ms`.
 
 ## 3. core ↔ web: REST + WebSocket
 
@@ -232,7 +238,7 @@ Points are derived on load from the mount config in `meta.json`, using `phi_meas
 
 Goal: detect impulsive sounds (knocks, shouts, tapping) and estimate their **direction** from the scanner, with a confidence, then intersect that bearing with the LiDAR findings to list where a person could be. The array is 2–4 cm across, so it gives **direction only, never distance**; a position needs bearings from two scanner stations.
 
-### 5.1 Hardware (pin_connection.md §3)
+### 5.1 Hardware (ESP32-S3 pins)
 
 | Signal | GPIO | Notes |
 |---|---|---|
