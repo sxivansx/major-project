@@ -2,6 +2,9 @@
 
 How the hardware teammate's plan maps onto this repo, what already exists, what differs, and what needs a decision.
 
+> [!NOTE]
+> This is a snapshot from 22 Oct 2026 and parts of it are out of date. Option A below was chosen: the ESP32-S3 relays the LiDAR over Wi-Fi (TCP 8899). The microphones, direction finding and Sound tab have since been built, and the pins moved to the carrier board's map (servo GPIO 17, I2C 11/12). For the current state, see [Progress in the README](../README.md#progress).
+
 ## Already built here (plan → repo)
 
 | Plan item | Where it lives | State |
