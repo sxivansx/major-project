@@ -108,7 +108,7 @@ class AIClient:
         }
 
     def _post(self, url: str, body: dict, token: str, who: str) -> dict:
-        headers = {"Authorization": f"Bearer {token}", "HTTP-Referer": "https://github.com/sxivansx/major-project", "X-Title": "major-project"}
+        headers = {"Authorization": f"Bearer {token}", "HTTP-Referer": "https://github.com/sxivansx/obslam", "X-Title": "obslam"}
         try:
             r = self._http.post(url, json=body, headers=headers)
         except httpx.HTTPError as e:
